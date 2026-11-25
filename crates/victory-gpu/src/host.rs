@@ -1841,6 +1841,25 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Clears all per-recording entries while keeping container capacities so
+    /// repeated `HostList::reset` calls do not churn heap allocations.
+    fn clear(&mut self) {
+        if !self.uploads.is_empty() {
+            ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+            self.uploads.clear();
+            self.upload_bytes = 0;
+        }
+        self.copies.clear();
+        self.kept.clear();
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.budget_zeroed = false;
+    }
 }
 
 impl Drop for Deferred {
@@ -5087,7 +5106,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5771,7 +5790,12 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut wrote_pending: Vec<(usize, usize)> = Vec::new();
         for step in &self.deferred().copies {
+            if !matches!(step, Step::Copy(..)) && !wrote_pending.is_empty() {
+                crate::watch::wrote_many(&wrote_pending);
+                wrote_pending.clear();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5782,8 +5806,11 @@ impl HostList {
                     }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    // With the submission's one asking: batch consecutive copy
+                    // notifications so thousands of small copies take one journal lock.
+                    if len > 0 {
+                        wrote_pending.push((dst, len));
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -5865,6 +5892,9 @@ impl HostList {
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        if !wrote_pending.is_empty() {
+            crate::watch::wrote_many(&wrote_pending);
         }
     }
 }
@@ -5971,6 +6001,9 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        if self.refreshes.is_empty() && !self.textures_beside.busy() && self.textures.is_empty() {
+            return;
+        }
         self.flush();
         self.textures.clear();
     }
