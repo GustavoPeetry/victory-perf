@@ -1574,6 +1574,114 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn word_merge_matches_scalar_byte_for_byte() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        for len in (0..=40).chain([63, 64, 65, 4095, 4096, 65536]) {
+            for mode in 0..4 {
+                let old: Vec<u8> = (0..len).map(|_| next(&mut rng) as u8).collect();
+                let mut title_s = old.clone();
+                let mut host_s = old.clone();
+                for j in 0..len {
+                    let r = next(&mut rng);
+                    if mode == 1 || (mode != 0 && r.is_multiple_of(17)) {
+                        host_s[j] ^= ((r >> 8) as u8) | 1;
+                    }
+                    if mode == 2 || (mode != 0 && (r >> 3).is_multiple_of(13)) {
+                        title_s[j] ^= (r >> 16) as u8;
+                    }
+                }
+                let mut title_w = title_s.clone();
+                let mut host_w = host_s.clone();
+                let changed_s = super::merge_gpu_writes_scalar(&mut title_s, &mut host_s, &old);
+                let changed_w = super::merge_gpu_writes_words(&mut title_w, &mut host_w, &old);
+                assert_eq!(changed_w, changed_s, "len={len} mode={mode}");
+                assert_eq!(title_w, title_s, "title mismatch len={len} mode={mode}");
+                assert_eq!(host_w, host_s, "host mismatch len={len} mode={mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_back_word_merge_preserves_concurrent_title_writes_and_aliases() {
+        let old = vec![0x11u8; 64];
+        let mut title = old.clone();
+        let mut host = old.clone();
+        // Simulate concurrent CPU writes across word boundaries `[5..10)` and `[31..35)`.
+        title[5..10].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+        title[31..35].copy_from_slice(&[0x22, 0x33, 0x44, 0x55]);
+        // Simulate GPU UAV write at `[16..20)` plus a single-byte overlap at index `9`.
+        host[16..20].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        host[9] = 0x77;
+
+        let mut title_ref = title.clone();
+        let mut host_ref = host.clone();
+        assert!(super::merge_gpu_writes_words(&mut title, &mut host, &old));
+        assert!(super::merge_gpu_writes_scalar(&mut title_ref, &mut host_ref, &old));
+        assert_eq!(title, title_ref);
+        assert_eq!(host, host_ref);
+        // Untouched title write bytes survive; GPU-written bytes win and sync host.
+        assert_eq!(&title[5..9], &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(title[9], 0x77);
+        assert_eq!(&title[16..20], &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(&title[31..35], &[0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(host, title);
+    }
+}
+
+fn copy_back_word_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_BACK_WORD_MERGE").is_none_or(|v| v != "0"))
+}
+
+/// Scalar byte-by-byte merge of GPU writes (`host != old`) over `title`.
+/// Returns whether `title` changed anywhere.
+fn merge_gpu_writes_scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut differs = 0u8;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+        let gpu = if *h != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !gpu) | (*h & gpu);
+        differs |= merged ^ *t;
+        *t = merged;
+        *h = merged;
+    }
+    differs != 0
+}
+
+/// Word-accelerated merge matching [`merge_gpu_writes_scalar`] byte for byte:
+/// skips per-byte masking across 8-byte words where `host == old`.
+fn merge_gpu_writes_words(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let n = title.len().min(host.len()).min(old.len());
+    let mut i = 0usize;
+    let mut differs = false;
+    while i + 8 <= n {
+        let h = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let o = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        if h == o {
+            let t = u64::from_ne_bytes(title[i..i + 8].try_into().unwrap());
+            if t != h {
+                host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+            }
+        } else {
+            differs |= merge_gpu_writes_scalar(
+                &mut title[i..i + 8],
+                &mut host[i..i + 8],
+                &old[i..i + 8],
+            );
+        }
+        i += 8;
+    }
+    if i < n {
+        differs |= merge_gpu_writes_scalar(&mut title[i..n], &mut host[i..n], &old[i..n]);
+    }
+    differs
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -2174,15 +2282,12 @@ impl Shadow {
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                let differs = if copy_back_word_merge() {
+                    merge_gpu_writes_words(title, host, old)
+                } else {
+                    merge_gpu_writes_scalar(title, host, old)
+                };
+                if differs {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
