@@ -604,6 +604,32 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+static OOB_ACCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OOB_FOR_DRAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OOB_MIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static OOB_MAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn record_oob_access(index: u32, for_draw: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    OOB_ACCESSES.fetch_add(1, Relaxed);
+    if for_draw {
+        OOB_FOR_DRAW.fetch_add(1, Relaxed);
+    }
+    OOB_MIN.fetch_min(index, Relaxed);
+    OOB_MAX.fetch_max(index, Relaxed);
+}
+
+/// Returns and resets `(total, for_draw, min_index, max_index)` for descriptor
+/// slots mirrored past `self.count`.
+pub(crate) fn take_oob_stats() -> (u64, u64, u32, u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total = OOB_ACCESSES.swap(0, Relaxed);
+    let draw = OOB_FOR_DRAW.swap(0, Relaxed);
+    let min = OOB_MIN.swap(u32::MAX, Relaxed);
+    let max = OOB_MAX.swap(0, Relaxed);
+    (total, draw, if total == 0 { 0 } else { min }, max)
+}
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -1951,6 +1977,7 @@ impl HostHeap {
     ) -> Option<(u64, View, Option<BufferCopy>)> {
         use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
         if index >= self.count {
+            record_oob_access(index, for_draw);
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3691,5 +3718,17 @@ mod tests {
         assert_eq!(heap.flush_unmake(), 1);
         assert_eq!(heap.flush_unmake(), 0);
         assert_eq!(heap.made[2].load(std::sync::atomic::Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn oob_access_counters_track_and_reset_bounds() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let _ = take_oob_stats();
+        assert!(heap.mirror(10, 0, true).is_none());
+        assert!(heap.mirror(7, 0, false).is_none());
+        assert_eq!(take_oob_stats(), (2, 1, 7, 10));
+        assert_eq!(take_oob_stats(), (0, 0, 0, 0));
     }
 }

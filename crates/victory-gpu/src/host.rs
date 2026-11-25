@@ -352,6 +352,34 @@ fn indirect_line(frames: f64) {
     );
 }
 
+fn p2_diag_line() {
+    let unimpl = crate::device::take_unimplemented_pipeline_calls();
+    let (oob_total, oob_draw, oob_min, oob_max) = crate::descriptor::host::take_oob_stats();
+    let (drop_null, drop_pending, drop_failed) = crate::draw::take_drop_breakdown();
+    if unimpl.iter().all(|&c| c == 0)
+        && oob_total == 0
+        && drop_null == 0
+        && drop_pending == 0
+        && drop_failed == 0
+    {
+        return;
+    }
+    tracing::info!(
+        "p2 diag: unimpl_pso(0x1c8={}, 0x218={}, other={}), oob_desc(total={}, draw={}, min={}, max={}), \
+         drop_cause(null={}, pending={}, failed={})",
+        unimpl[0],
+        unimpl[1],
+        unimpl[2],
+        oob_total,
+        oob_draw,
+        oob_min,
+        oob_max,
+        drop_null,
+        drop_pending,
+        drop_failed,
+    );
+}
+
 fn pipeline_telemetry_line() {
     use std::sync::atomic::AtomicU64;
     static PREV_LIB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -7030,6 +7058,7 @@ impl Meter {
             barrier_line(logged_frames);
             indirect_line(logged_frames);
             pipeline_telemetry_line();
+            p2_diag_line();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

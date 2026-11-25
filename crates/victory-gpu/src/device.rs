@@ -346,14 +346,29 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Counts calls to unimplemented pipeline creation methods (`[0]` = `0x1c8`,
+/// `[1]` = `0x218`, `[2]` = other) since the last telemetry window.
+pub(crate) static UNIMPLEMENTED_PIPELINE_CALLS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Returns and resets `[0x1c8, 0x218, other]` call counts since the last log line.
+pub(crate) fn take_unimplemented_pipeline_calls() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        UNIMPLEMENTED_PIPELINE_CALLS[0].swap(0, Relaxed),
+        UNIMPLEMENTED_PIPELINE_CALLS[1].swap(0, Relaxed),
+        UNIMPLEMENTED_PIPELINE_CALLS[2].swap(0, Relaxed),
+    ]
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
 /// pipeline, silently. What the descriptions hold is not known: the calls
 /// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// description's words, what its first word points at, and decoded GFX10
+/// machine code at words 5/6 & 17/18 (`realblastex/flamingo@63d976b9`, GPL-3.0-or-later).
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -364,35 +379,73 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let slot_idx = match SLOT {
+        0x1c8 => 0,
+        0x218 => 1,
+        _ => 2,
+    };
+    UNIMPLEMENTED_PIPELINE_CALLS[slot_idx].fetch_add(1, Ordering::Relaxed);
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
     if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
+        // Up to thirty-two 64-bit words at `at` (256 bytes, covering words 5/6 and 17/18),
+        // read safely via kernel copy because neither pointer is known mapped.
         #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+        let read_words = |at: usize, limit: usize| -> Option<Vec<u64>> {
+            let mut bytes = [0u8; 256];
+            let slice = &mut bytes[..limit.min(256)];
+            (at != 0 && crate::host::read_into(at as *const u8, slice)).then(|| {
+                slice
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| c.iter().rev().fold(0u64, |v, &b| (v << 8) | u64::from(b)))
                     .collect()
             })
         };
         #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
+        let read_words = |_: usize, _: usize| None::<Vec<u64>>;
+        let description = read_words(desc as usize, 256);
+        let first = description.as_ref().and_then(|w| read_words(w[0] as usize, 128));
+        #[cfg(windows)]
+        let code: Vec<String> = description
+            .iter()
+            .flat_map(|w| [(w.get(5), w.get(6)), (w.get(17), w.get(18))])
+            .filter_map(|(at, len)| {
+                let (at, len) = (*at? as usize, *len? as usize);
+                if at == 0 || len == 0 || len > (1 << 16) {
+                    return None;
+                }
+                let mut bytes = vec![0u8; len];
+                if !crate::host::read_into(at as *const u8, &mut bytes) {
+                    return None;
+                }
+                let names: Vec<&str> = victory_shader::gfx10::decode(&bytes)
+                    .map(|v| v.iter().filter_map(|i| i.name()).collect())
+                    .unwrap_or_default();
+                let exports: Vec<&str> = names
+                    .iter()
+                    .copied()
+                    .filter(|n| n.starts_with("exp") || n.contains("store") || n.contains("image_"))
+                    .collect();
+                Some(format!(
+                    "{len:#x} bytes, {} instructions, effects {exports:?}, first {:?}",
+                    names.len(),
+                    &names[..names.len().min(24)]
+                ))
+            })
+            .collect();
+        #[cfg(not(windows))]
+        let code: Vec<String> = Vec::new();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            code = format_args!("{code:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
@@ -583,5 +636,28 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn unknown_pipeline_slots_fail_safely_with_null_out_and_count_calls() {
+        let _ = take_unimplemented_pipeline_calls();
+        let iid = [0u8; 16];
+        let mut out = 0xDEAD_BEEFusize as This;
+        assert_eq!(
+            unknown_pipeline::<0x1c8>(std::ptr::null(), std::ptr::null(), &iid, &mut out),
+            E_NOTIMPL
+        );
+        assert!(out.is_null(), "unimplemented 0x1c8 must null-initialize out");
+
+        let mut out2 = 0xDEAD_BEEFusize as This;
+        assert_eq!(
+            unknown_pipeline::<0x218>(std::ptr::null(), std::ptr::null(), &iid, &mut out2),
+            E_NOTIMPL
+        );
+        assert!(out2.is_null(), "unimplemented 0x218 must null-initialize out");
+
+        let counts = take_unimplemented_pipeline_calls();
+        assert_eq!(counts, [1, 1, 0]);
+        assert_eq!(take_unimplemented_pipeline_calls(), [0, 0, 0]);
     }
 }

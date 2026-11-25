@@ -548,6 +548,34 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static DROPPED_NULL_PSO: AtomicU64 = AtomicU64::new(0);
+static DROPPED_PENDING_PSO: AtomicU64 = AtomicU64::new(0);
+static DROPPED_FAILED_PSO: AtomicU64 = AtomicU64::new(0);
+
+fn record_drop(pipeline: usize) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    match crate::pipeline::classify_miss(pipeline as This) {
+        crate::pipeline::PipelineMiss::Null => {
+            DROPPED_NULL_PSO.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::pipeline::PipelineMiss::Pending => {
+            DROPPED_PENDING_PSO.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::pipeline::PipelineMiss::Failed => {
+            DROPPED_FAILED_PSO.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::pipeline::PipelineMiss::Other => {}
+    }
+}
+
+/// Returns and resets `(null, pending, failed)` PSO drop breakdown counters.
+pub(crate) fn take_drop_breakdown() -> (u64, u64, u64) {
+    (
+        DROPPED_NULL_PSO.swap(0, Ordering::Relaxed),
+        DROPPED_PENDING_PSO.swap(0, Ordering::Relaxed),
+        DROPPED_FAILED_PSO.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -2335,13 +2363,13 @@ impl State {
         list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -2354,7 +2382,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -2367,7 +2395,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2741,7 +2769,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3141,7 +3169,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3246,7 +3274,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -3270,10 +3298,12 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            record_drop(self.pipeline);
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            record_drop(self.pipeline);
             return false;
         }
         const DRAW: u32 = 0;
@@ -3285,6 +3315,7 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            record_drop(self.pipeline);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -3972,5 +4003,20 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_drop_tracks_and_resets_null_pso_breakdown() {
+        let _ = take_drop_breakdown();
+        let before = DROPPED.load(Ordering::Relaxed);
+        record_drop(0);
+        assert_eq!(DROPPED.load(Ordering::Relaxed), before + 1);
+        assert_eq!(take_drop_breakdown(), (1, 0, 0));
+        assert_eq!(take_drop_breakdown(), (0, 0, 0));
     }
 }

@@ -411,6 +411,29 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Reason a draw or dispatch could not obtain a host pipeline.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineMiss {
+    Null,
+    Pending,
+    Failed,
+    Other,
+}
+
+/// Classifies why `this` has no usable host pipeline without blocking.
+#[cfg(windows)]
+pub(crate) fn classify_miss(this: This) -> PipelineMiss {
+    if this.is_null() {
+        return PipelineMiss::Null;
+    }
+    match pipeline(this).host.made.get() {
+        None => PipelineMiss::Pending,
+        Some(None) => PipelineMiss::Failed,
+        Some(Some(_)) => PipelineMiss::Other,
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -885,5 +908,11 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_miss_distinguishes_null_and_pending() {
+        assert_eq!(classify_miss(std::ptr::null()), PipelineMiss::Null);
     }
 }
