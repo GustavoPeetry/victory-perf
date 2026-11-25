@@ -249,6 +249,35 @@ pub(crate) fn batch_line(frames: f64) {
     );
 }
 
+/// Opt-in (`VICTORY_INDIRECT_GATHER=1` or `alt`, default off): scatter-gather
+/// single indirect records that miss a window into a list scratch buffer and
+/// clamp all of them in one pass in `HostList::prelude`
+/// (`fxceless/victory-fork@465b94f5`, GPL-3.0-or-later).
+fn gathers() -> bool {
+    // 0: off, 1: on, 2: alternating 20s slices.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20).is_multiple_of(2);
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "scattered single indirect records gathered in prelude (VICTORY_INDIRECT_GATHER=alt): {}",
+                    if on { "ON" } else { "off" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// Indirect calls held back to be joined into one host call, and the scratch
 /// buffer they read.
 struct Held {
@@ -2292,10 +2321,18 @@ impl State {
         });
     }
 
+    /// Whether the currently bound pipeline (or an unknown one) can store to
+    /// buffers, meaning subsequent indirect draws may see modified arguments.
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.end_window(list);
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2652,6 +2689,7 @@ impl State {
             // list's and holds the window clamped in `INDIRECT_ARGUMENT`.
             unsafe { list.list.ExecuteIndirect(&signature, count, &scratch, at, None, 0) };
             BATCH.recorded(count);
+            crate::indirect::INDIRECT_HOST_CALLS.fetch_add(1, Ordering::Relaxed);
             self.note_writes(list);
         }
         if run.first.kind == MESH {
@@ -2680,6 +2718,9 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.end_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3072,6 +3113,9 @@ impl State {
         first_instance: u32,
     ) {
         self.end_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3178,6 +3222,9 @@ impl State {
         first_instance: u32,
     ) {
         self.end_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3324,6 +3371,12 @@ impl State {
             self.flush_held(list);
             self.end_window(list);
         }
+        if !windowed {
+            // A dispatch, count buffer, multi-record call, or storing shader may
+            // alter arguments from here on: stop gathering on this list.
+            list.gather_close();
+        }
+        crate::indirect::INDIRECT_OPS.fetch_add(1, Ordering::Relaxed);
         // Joined to the calls held back, or those recorded first.
         let joining = merge() && windowed && parts.is_none() && max == 1 && count.is_none();
         let (pipeline, epoch) = (self.pipeline, self.epoch);
@@ -3357,10 +3410,24 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        // A single scattered record that misses its window: gather into a slot
+        // filled by the list's prelude when `VICTORY_INDIRECT_GATHER=1`.
+        let gathered = if hit.is_none() && windowed && gathers() {
+            crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride))
+        } else {
+            None
+        };
         let mut hoisted = false;
-        let (bounded, at) = match hit {
-            Some(hit) => hit,
-            None => {
+        let mut is_gathered = false;
+        let (bounded, at) = match (hit, gathered) {
+            (Some(hit), _) => hit,
+            (None, Some((scratch, at))) => {
+                args.refresh(list, arguments, len);
+                is_gathered = true;
+                crate::indirect::INDIRECT_GATHERED.fetch_add(1, Ordering::Relaxed);
+                (scratch, at)
+            }
+            (None, None) => {
                 // Draws of a run: clamped in the list before, which the run's
                 // first draw opened (`crate::list`), so nothing of ours comes
                 // between the draws.
@@ -3392,6 +3459,7 @@ impl State {
                     )
                 });
                 if let Some(b) = before {
+                    crate::indirect::INDIRECT_CLAMPS.fetch_add(1, Ordering::Relaxed);
                     hoisted = true;
                     b
                 } else {
@@ -3443,6 +3511,7 @@ impl State {
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");
                         return false;
                     };
+                    crate::indirect::INDIRECT_CLAMPS.fetch_add(1, Ordering::Relaxed);
                     // The clamp pass replaced the pipeline state and compute root
                     // signature; a draw's graphics roots stay intact.
                     let before = self.host_pipeline;
@@ -3474,7 +3543,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if !hoisted && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
+            if !hoisted && !is_gathered && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3489,7 +3558,7 @@ impl State {
         }
         // A run that later calls may join: held back with the scratch
         // buffer it reads.
-        if joining && !hoisted {
+        if joining && !hoisted && !is_gathered {
             let run = self
                 .window
                 .as_ref()
@@ -3533,11 +3602,15 @@ impl State {
             }
         };
         BATCH.recorded(1);
+        crate::indirect::INDIRECT_HOST_CALLS.fetch_add(
+            if parts.is_some() { u64::from(crate::indirect::SPLIT) } else { 1 },
+            Ordering::Relaxed,
+        );
         self.note_writes(list);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        if !hoisted && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
+        if !hoisted && !is_gathered && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {

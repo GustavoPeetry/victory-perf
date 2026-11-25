@@ -326,6 +326,32 @@ fn barrier_line(frames: f64) {
     );
 }
 
+fn indirect_line(frames: f64) {
+    if frames <= 0.0 {
+        return;
+    }
+    let (ops, clamps, gathered, host_calls) = crate::indirect::take_indirect_stats();
+    let none = [0, 1, 2, 3, 4].map(|i| {
+        crate::indirect::GATHER_NONE[i].swap(0, Ordering::Relaxed)
+    });
+    if ops == 0 && clamps == 0 && gathered == 0 && host_calls == 0 && none.iter().all(|&n| n == 0) {
+        return;
+    }
+    tracing::info!(
+        "indirect execution per frame: ops {:.0}, clamp passes {:.0}, gathered {:.0}, host ExecuteIndirect {:.0}; \
+         gather misses (layout {:.0}, closed {:.0}, sets {:.0}, full {:.0}, no_buf {:.0})",
+        ops as f64 / frames,
+        clamps as f64 / frames,
+        gathered as f64 / frames,
+        host_calls as f64 / frames,
+        none[0] as f64 / frames,
+        none[1] as f64 / frames,
+        none[2] as f64 / frames,
+        none[3] as f64 / frames,
+        none[4] as f64 / frames,
+    );
+}
+
 fn pipeline_telemetry_line() {
     use std::sync::atomic::AtomicU64;
     static PREV_LIB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -921,6 +947,9 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Records its draws read from slots filled in one pass by the list's
+    /// prelude (`crate::indirect::gather`, `fxceless/victory-fork@465b94f5`).
+    gather: Mutex<Gather>,
     /// Whether unordered shader writes may be pending in this list since its
     /// last global UAV barrier (`barrier_merge`). Starts `true` after reset so
     /// the first barrier in a list stays conservative across list boundaries.
@@ -956,6 +985,23 @@ struct ClampChunks {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
+#[derive(Default)]
+struct Gather {
+    /// Something recorded in the list may write indirect arguments: stop gathering
+    /// from here on (earlier gathered records run in the prelude before the list).
+    closed: bool,
+    /// One set per argument buffer, kind and stride.
+    sets: Vec<crate::indirect::GatherSet>,
+    /// Budget buffer charged by gathered clamp passes in `prelude`.
+    budget: Option<ID3D12Resource>,
+    /// Scratch buffers retained across resets for reuse.
+    spare: Vec<ID3D12Resource>,
+}
+
+/// Maximum number of distinct `(buffer, kind, stride)` sets gathered per list.
+const GATHER_SETS: usize = 8;
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3304,6 +3350,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 clamp_chunks: Mutex::default(),
+                gather: Mutex::default(),
                 uav_pending: std::sync::atomic::AtomicBool::new(true),
                 uav_synced: Mutex::default(),
                 uav_synced_any: std::sync::atomic::AtomicBool::new(false),
@@ -5202,6 +5249,23 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        for set in self
+            .gather
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sets
+            .iter()
+            .filter(|s| s.records() > 0)
+        {
+            // SAFETY: open list and live buffer left in `INDIRECT_ARGUMENT` by prelude.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &set.scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5268,6 +5332,16 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather { closed, sets, spare, .. } = &mut *gather;
+            *closed = false;
+            for set in sets.drain(..) {
+                if spare.len() < GATHER_SETS {
+                    spare.push(set.into_scratch());
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5576,7 +5650,9 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let gathered = gather.sets.iter().any(|s| s.records() > 0);
+        if barriers.is_empty() && syncs.is_empty() && !gathered {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5600,6 +5676,17 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                if gathered {
+                    let filled = match &gather.budget {
+                        Some(budget) => crate::indirect::record_gathers(list, &gather.sets, budget),
+                        None => false,
+                    };
+                    if !filled {
+                        fail(format_args!(
+                            "a list's gathered indirect records could not be clamped in its prelude"
+                        ));
+                    }
+                }
                 list.Close()
             })
         };
@@ -5607,6 +5694,85 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// Stops gathering scattered indirect records on this list because a
+    /// subsequent command may overwrite indirect arguments (`fxceless/victory-fork@465b94f5`).
+    pub(crate) fn gather_close(&self) {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+    }
+
+    /// Reserves or reuses a slot for the indirect record at `offset` in `src`
+    /// inside a scratch buffer populated in `prelude` (`crate::indirect::gather`).
+    pub(crate) fn gather_slot(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u32,
+        (kind, stride): (u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        let none = |why: usize| {
+            crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.closed {
+            return none(1);
+        }
+        let found = gather.sets.iter().position(|s| {
+            s.src_id == src_id && s.kind == kind && s.stride == stride && s.src.as_raw() == src.as_raw()
+        });
+        let at = match found {
+            Some(at) => at,
+            None => {
+                if gather.sets.len() >= GATHER_SETS {
+                    return none(2);
+                }
+                if self.list.cast::<ID3D12GraphicsCommandList2>().is_err() {
+                    return none(4);
+                }
+                let Some(host) = host() else {
+                    return none(4);
+                };
+                if gather.budget.is_none() {
+                    let Some(budget) = host.uav_buffer(256) else {
+                        return none(4);
+                    };
+                    name(&budget, || "indirect budget of gathered records".to_owned());
+                    gather.budget = Some(budget);
+                }
+                let scratch = match gather.spare.pop() {
+                    Some(scratch) => scratch,
+                    None => {
+                        let Some(scratch) = host.uav_buffer(
+                            u64::from(crate::indirect::GATHER_MOST)
+                                * u64::from(crate::indirect::GATHER_STRIDE),
+                        ) else {
+                            return none(4);
+                        };
+                        name(&scratch, || "indirect arguments, gathered".to_owned());
+                        scratch
+                    }
+                };
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                    gather.spare.push(scratch);
+                    return none(4);
+                };
+                gather.sets.push(crate::indirect::GatherSet::new(
+                    src.clone(),
+                    src_id,
+                    (kind, stride),
+                    scratch,
+                    table,
+                ));
+                gather.sets.len() - 1
+            }
+        };
+        let set = &mut gather.sets[at];
+        let Some(slot) = set.slot(offset) else {
+            return none(3);
+        };
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -5657,6 +5823,7 @@ impl HostList {
     /// Counts a dispatch or a copy: what may write indirect arguments.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
+        self.gather_close();
     }
 
     /// Dispatches and copies since the reset.
@@ -6861,6 +7028,7 @@ impl Meter {
             crate::shadow::card_telemetry_line(logged_frames);
             crate::memcopy::log(logged_frames);
             barrier_line(logged_frames);
+            indirect_line(logged_frames);
             pipeline_telemetry_line();
             #[cfg(feature = "diagnostics")]
             {
