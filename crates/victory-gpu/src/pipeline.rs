@@ -417,6 +417,19 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Library hits, driver compiles, early-started count, driver compile us,
+/// `E_INVALIDARG` errors, and other PSO creation errors.
+#[cfg(windows)]
+pub(crate) fn library_telemetry() -> [u64; 6] {
+    library::telemetry()
+}
+
+/// Pipeline wait count, wait us, wait timeouts, and pending-PSO draw drops.
+#[cfg(windows)]
+pub(crate) fn wait_telemetry() -> [u64; 4] {
+    make::telemetry()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

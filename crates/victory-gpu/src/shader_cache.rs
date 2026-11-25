@@ -21,6 +21,9 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TRANSLATED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TRANSLATE_FAILED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TRANSLATE_US: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -35,6 +38,17 @@ pub fn use_shader_cache(dir: PathBuf) {
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+}
+
+/// Shader cache hits, fresh translations, translation failures, and
+/// cumulative translation time in microseconds since the start.
+pub(crate) fn telemetry() -> [u64; 4] {
+    [
+        HITS.load(Ordering::Relaxed),
+        TRANSLATED.load(Ordering::Relaxed),
+        TRANSLATE_FAILED.load(Ordering::Relaxed),
+        TRANSLATE_US.load(Ordering::Relaxed),
+    ]
 }
 
 /// What identifies this translator: the BLAKE3 of its sources, of this
@@ -110,7 +124,20 @@ pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool),
     if let Some(s) = stand_in(container) {
         return Ok((s, false));
     }
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let started = std::time::Instant::now();
+        let res = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        TRANSLATE_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        match &res {
+            Ok(_) => {
+                TRANSLATED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                TRANSLATE_FAILED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        res
+    };
     let r = match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container).map(|shader| (shader, false)),

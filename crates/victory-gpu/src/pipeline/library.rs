@@ -67,6 +67,22 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DRIVER_COMPILE_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PSO_INVALID_ARG: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PSO_OTHER_ERR: AtomicU64 = AtomicU64::new(0);
+
+/// Library hits, driver compiles, early-started count, cumulative driver
+/// compile microseconds, `E_INVALIDARG` errors, and other PSO errors.
+pub(crate) fn telemetry() -> [u64; 6] {
+    [
+        LOADED.load(Ordering::Relaxed),
+        MADE.load(Ordering::Relaxed),
+        EARLY.load(Ordering::Relaxed),
+        DRIVER_COMPILE_US.load(Ordering::Relaxed),
+        PSO_INVALID_ARG.load(Ordering::Relaxed),
+        PSO_OTHER_ERR.load(Ordering::Relaxed),
+    ]
+}
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -475,6 +491,9 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// A library the driver refused, preserved under this name instead of being
+/// overwritten by the next empty-library save (`fxceless@79cfdd96`).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
@@ -482,6 +501,24 @@ const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+
+/// Moves a rejected [`LIBRARY_FILE`] in `dir` out of the way so a subsequent
+/// save of an empty library does not destroy compiled pipelines from an earlier
+/// session. Returns the path written if a file existed and was preserved.
+fn preserve_rejected(dir: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let src = dir.join(LIBRARY_FILE);
+    if !src.exists() {
+        return Ok(None);
+    }
+    let primary = dir.join(REJECTED_FILE);
+    let dst = if !primary.exists() {
+        primary
+    } else {
+        dir.join(format!("host-pipelines.rejected.{}.bin", std::process::id()))
+    };
+    std::fs::rename(&src, &dst)?;
+    Ok(Some(dst))
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -509,6 +546,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 .cast()
         }
     };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -532,7 +570,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 });
             }
             Err(e) => {
-                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
+                rejected = true;
+                tracing::warn!(
+                    error = %e,
+                    hresult = format_args!("{:#x}", e.code().0),
+                    "host pipeline library rejected; starting an empty one"
+                );
             }
         }
     } else {
@@ -541,6 +584,17 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    if rejected && let Some(dir) = DIR.get() {
+        match preserve_rejected(dir) {
+            Ok(Some(path)) => {
+                tracing::warn!(path = %path.display(), "preserved rejected host pipeline library");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to preserve rejected host pipeline library");
+            }
+        }
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -575,6 +629,28 @@ pub(crate) fn pipeline(
     pipeline_with_status(name, load, create).map(|(pso, _)| pso)
 }
 
+fn create_counted(
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let compile_started = std::time::Instant::now();
+    let res = create();
+    DRIVER_COMPILE_US.fetch_add(compile_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    match res {
+        Ok(pso) => {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            Ok(pso)
+        }
+        Err(e) => {
+            if e.code() == windows::core::HRESULT(crate::object::E_INVALIDARG) {
+                PSO_INVALID_ARG.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PSO_OTHER_ERR.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Like [`pipeline`], also reporting whether the pipeline was loaded from the
 /// library (`true`) or freshly compiled and stored (`false`).
 pub(crate) fn pipeline_with_status(
@@ -584,8 +660,7 @@ pub(crate) fn pipeline_with_status(
 ) -> windows::core::Result<(ID3D12PipelineState, bool)> {
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
-        MADE.fetch_add(1, Ordering::Relaxed);
-        return create().map(|pso| (pso, false));
+        return create_counted(create).map(|pso| (pso, false));
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -614,9 +689,8 @@ pub(crate) fn pipeline_with_status(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        create_counted(create)?
     };
-    MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -846,6 +920,25 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    #[test]
+    fn preserve_rejected_moves_refused_library_without_losing_prior_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join(LIBRARY_FILE);
+        let rejected = dir.path().join(REJECTED_FILE);
+        std::fs::write(&lib, b"bad-lib-1").unwrap();
+        let first = preserve_rejected(dir.path()).unwrap().expect("preserved primary");
+        assert_eq!(first, rejected);
+        assert!(!lib.exists());
+        assert_eq!(std::fs::read(&rejected).unwrap(), b"bad-lib-1");
+        // Second rejection preserves without overwriting the first backup.
+        std::fs::write(&lib, b"bad-lib-2").unwrap();
+        let second = preserve_rejected(dir.path()).unwrap().expect("preserved secondary");
+        assert_ne!(second, rejected);
+        assert!(!lib.exists());
+        assert_eq!(std::fs::read(&rejected).unwrap(), b"bad-lib-1");
+        assert_eq!(std::fs::read(&second).unwrap(), b"bad-lib-2");
     }
 
     /// A mapped file reads as the file's bytes, a file written through a

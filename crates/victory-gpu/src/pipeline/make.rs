@@ -257,10 +257,25 @@ fn held_too_long(held: Duration, compute: bool, base: Duration) -> bool {
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WAIT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WAIT_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WAIT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PENDING_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// Wait count, cumulative wait microseconds, timed-out waits, and draws
+/// dropped because a pipeline was still pending.
+pub(crate) fn telemetry() -> [u64; 4] {
+    [
+        WAIT_COUNT.load(Ordering::Relaxed),
+        WAIT_US.load(Ordering::Relaxed),
+        WAIT_TIMEOUTS.load(Ordering::Relaxed),
+        PENDING_DROPS.load(Ordering::Relaxed),
+    ]
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
@@ -278,7 +293,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    match p.made.get() {
+        Some(made) => made.as_ref(),
+        None => {
+            PENDING_DROPS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -426,8 +447,10 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
     if left.is_zero() {
+        WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.slow() {
@@ -440,7 +463,12 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    let waited = started.elapsed().min(left);
+    let elapsed = started.elapsed();
+    let waited = elapsed.min(left);
+    WAIT_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    if p.made.get().is_none() {
+        WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
     past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
     frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
     #[cfg(feature = "diagnostics")]

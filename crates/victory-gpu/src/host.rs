@@ -321,6 +321,49 @@ fn barrier_line(frames: f64) {
     );
 }
 
+fn pipeline_telemetry_line() {
+    use std::sync::atomic::AtomicU64;
+    static PREV_LIB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static PREV_SHADER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static PREV_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    fn take_deltas<const N: usize>(prev: &[AtomicU64; N], cur: [u64; N]) -> ([u64; N], [u64; N]) {
+        let mut delta = [0u64; N];
+        for i in 0..N {
+            let old = prev[i].swap(cur[i], Ordering::Relaxed);
+            delta[i] = cur[i].saturating_sub(old);
+        }
+        (delta, cur)
+    }
+
+    let (d_lib, t_lib) = take_deltas(&PREV_LIB, crate::pipeline::library_telemetry());
+    let (d_sh, t_sh) = take_deltas(&PREV_SHADER, crate::shader_cache::telemetry());
+    let (d_w, t_w) = take_deltas(&PREV_WAIT, crate::pipeline::wait_telemetry());
+    let queued = crate::pipeline::making();
+    if queued == 0 && d_lib.iter().all(|&v| v == 0) && d_sh.iter().all(|&v| v == 0) && d_w.iter().all(|&v| v == 0) {
+        return;
+    }
+    tracing::info!(
+        "pipeline telemetry (window / total): lib_loaded {}/{}, driver_compiled {}/{} ({:.1}/{:.1} ms, inval {}, err {}), early {}; \
+         shader_cache hit {}/{}, translated {}/{} ({:.1}/{:.1} ms, fail {}); \
+         wait_n {}/{}, wait_ms {:.1}/{:.1}, timeouts {}/{}, pending_drops {}/{}, queued {}",
+        d_lib[0], t_lib[0],
+        d_lib[1], t_lib[1],
+        d_lib[3] as f64 / 1e3, t_lib[3] as f64 / 1e3,
+        t_lib[4], t_lib[5],
+        t_lib[2],
+        d_sh[0], t_sh[0],
+        d_sh[1], t_sh[1],
+        d_sh[3] as f64 / 1e3, t_sh[3] as f64 / 1e3,
+        t_sh[2],
+        d_w[0], t_w[0],
+        d_w[1] as f64 / 1e3, t_w[1] as f64 / 1e3,
+        d_w[2], t_w[2],
+        d_w[3], t_w[3],
+        queued,
+    );
+}
+
 fn trail_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TRAIL").is_none_or(|v| v != "0"))
@@ -6775,6 +6818,7 @@ impl Meter {
             crate::shadow::card_telemetry_line(logged_frames);
             crate::memcopy::log(logged_frames);
             barrier_line(logged_frames);
+            pipeline_telemetry_line();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
