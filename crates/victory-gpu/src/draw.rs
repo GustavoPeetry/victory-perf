@@ -1697,7 +1697,7 @@ impl State {
                 .get(&index)
                 .filter(|(_, s, _, _)| !s.in_place())
                 .map_or(0, |(k, _, _, _)| *k);
-            let (key, view) = match host.mirror_buffer(index, handle, cached_key) {
+            let (key, view, resolved) = match host.mirror_buffer(index, handle, cached_key) {
                 crate::descriptor::host::BufferMirror::Unchanged => continue,
                 crate::descriptor::host::BufferMirror::Empty => {
                     if cache.buckets[b].remove(&index).is_some() {
@@ -1705,8 +1705,10 @@ impl State {
                     }
                     continue;
                 }
-                crate::descriptor::host::BufferMirror::Changed(key, view) => (key, view),
+                crate::descriptor::host::BufferMirror::Changed(key, view, resolved) => (key, view, resolved),
             };
+            #[cfg(feature = "diagnostics")]
+            let made = resolved.is_some();
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1722,20 +1724,35 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            // The copy the slot shows (`buffer_copy`), preferring the copy
+            // `make` just resolved so we don't look it up twice.
+            let Some((shadow, address, len)) = resolved.or_else(|| crate::descriptor::host::buffer_copy(&view)) else {
                 if cache.buckets[b].remove(&index).is_some() {
                     dirty_buckets |= 1u64 << b;
                 }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
+            if !made && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            cache.buckets[b].insert(index, (key, shadow, address, address + len));
-            dirty_buckets |= 1u64 << b;
+            match cache.buckets[b].entry(index) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let entry = e.get_mut();
+                    if entry.0 != key
+                        || !std::sync::Arc::ptr_eq(&entry.1, &shadow)
+                        || entry.2 != address
+                        || entry.3 != address + len
+                    {
+                        *entry = (key, shadow, address, address + len);
+                        dirty_buckets |= 1u64 << b;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((key, shadow, address, address + len));
+                    dirty_buckets |= 1u64 << b;
+                }
+            }
         }
         let mut mask = dirty_buckets;
         while mask != 0 {
