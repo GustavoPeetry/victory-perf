@@ -276,6 +276,21 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_code(container, None)
 }
 
+thread_local! {
+    /// Thread-local override for [`with_wave_wide`].
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wave-wide lowering of wave64 compute programs on 32-lane
+/// hosts enabled (`VICTORY_WAVE_WIDE=1`) on the calling thread
+/// (`fxceless/victory-fork#823`, GPL-3.0-or-later).
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
 /// [`translate`] with `code` in place of the program's own when given.
 fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
@@ -386,7 +401,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on =
+            std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -1924,5 +1940,18 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn with_wave_wide_restores_previous_scope() {
+        assert!(!WAVE_WIDE_HERE.get());
+        with_wave_wide(true, || {
+            assert!(WAVE_WIDE_HERE.get());
+            with_wave_wide(false, || {
+                assert!(!WAVE_WIDE_HERE.get());
+            });
+            assert!(WAVE_WIDE_HERE.get());
+        });
+        assert!(!WAVE_WIDE_HERE.get());
     }
 }

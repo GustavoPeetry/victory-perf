@@ -96,6 +96,7 @@ fn build() -> &'static [u8; 32] {
         // the translations an earlier run had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_ONLY",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_F16_NEAREST",
@@ -107,8 +108,45 @@ fn build() -> &'static [u8; 32] {
             }
             hash.update(&[0]);
         }
+        hash.update(b"wave_wide_v1\0");
         *hash.finalize().as_bytes()
     })
+}
+
+/// Container hashes (16-digit prefixes) whose wave64 compute program may take
+/// the wave-wide form on a 32-lane host (`fxceless/victory-fork#823`, GPL-3.0-or-later):
+/// water transmission volumetrics, particle visibility, and SSR tiling.
+/// Set `VICTORY_WAVE_WIDE_ONLY=none` or `0` to disable all four.
+const WAVE_WIDE_DEFAULT: [&str; 4] = [
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+];
+
+fn parse_wave_wide_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty() && h != "none" && h != "0")
+        .collect()
+}
+
+fn wave_wide_listed(hash: &str) -> bool {
+    static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
+    let list = WAVE_WIDE.get_or_init(|| match std::env::var("VICTORY_WAVE_WIDE_ONLY") {
+        Ok(v) => parse_wave_wide_list(&v),
+        Err(_) => WAVE_WIDE_DEFAULT.iter().map(|h| (*h).to_owned()).collect(),
+    });
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
+#[cfg(windows)]
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    let hash = blake3::hash(c).to_hex();
+    victory_shader::emit::with_wave_wide(wave_wide_listed(&hash), || {
+        victory_shader::emit::translate(c)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// The translation of a console shader container, from the cache when
@@ -126,7 +164,7 @@ pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool),
     }
     let translate = |c: &[u8]| {
         let started = std::time::Instant::now();
-        let res = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        let res = translate_listed(c);
         TRANSLATE_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         match &res {
             Ok(_) => {
@@ -563,5 +601,21 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn wave_wide_list_parses_defaults_and_rollback_tokens() {
+        assert_eq!(WAVE_WIDE_DEFAULT.len(), 4);
+        assert!(parse_wave_wide_list("none").is_empty());
+        assert!(parse_wave_wide_list("0").is_empty());
+        assert!(parse_wave_wide_list("  , NONE , 0 ").is_empty());
+        assert_eq!(
+            parse_wave_wide_list("5DC3B25986622949, 369cbe906ea72764 "),
+            vec!["5dc3b25986622949".to_owned(), "369cbe906ea72764".to_owned()]
+        );
+        for hash in WAVE_WIDE_DEFAULT {
+            assert!(wave_wide_listed(hash), "missing default wave-wide hash {hash}");
+        }
+        assert!(!wave_wide_listed("0000000000000000"));
     }
 }
