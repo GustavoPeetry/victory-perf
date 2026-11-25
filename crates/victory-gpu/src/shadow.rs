@@ -3114,7 +3114,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// A host copy in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
 /// `crate::rebar`), if enabled, supported and within budget.
 fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
-    let cpu_read = crate::readback::tagged_in(start, len);
+    // Small title buffers (`Kind::Buffer`) are snapshotted and diffed on the
+    // CPU after shader writes whenever `VICTORY_COPY_BACK_ONLY_READBACK` is
+    // off. Reading write-combined GPU upload memory over PCIe from the CPU
+    // stalls copy-back severely (~80 ms/frame for 17 MB), so keep small
+    // buffers in system RAM unless readback filtering is active.
+    let cpu_read = crate::readback::tagged_in(start, len)
+        || (kind == crate::rebar::Kind::Buffer && !crate::readback::enabled());
+    if cpu_read && kind == crate::rebar::Kind::Buffer && !crate::readback::enabled() && crate::rebar::level() >= 2 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                "Resizable BAR: keeping small title buffers in system RAM because VICTORY_COPY_BACK_ONLY_READBACK=0 (avoids uncached PCIe CPU readback stalls)"
+            );
+        });
+    }
     if !crate::rebar::reserve(kind, size, cpu_read) {
         return None;
     }

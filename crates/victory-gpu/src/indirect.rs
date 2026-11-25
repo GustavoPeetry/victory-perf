@@ -631,7 +631,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (c, (budget, budget_res)) = (clamp()?, clamps.budget_with_resource()?);
     // SAFETY: live buffers.
     let (src_base, count_base) = unsafe {
         (
@@ -673,10 +673,10 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        // Mode 7: one clamp after another, so that the budget is charged in
-        // the order of the draws as it is when each clamp precedes its draw.
+        // Mode 7: order budget updates across consecutive clamps without a
+        // full-GPU global UAV drain (destination offsets are disjoint).
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier()]);
+            l.ResourceBarrier(&[uav_barrier_on(budget_res)]);
         }
     }
     Some((dst, at))
