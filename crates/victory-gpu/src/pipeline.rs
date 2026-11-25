@@ -179,14 +179,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).unwrap_or_default();
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let writes = stores || programs.iter().any(image_stores);
@@ -580,8 +577,24 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let shader = copy("compute", &desc.stage);
+    // A container of another compiler's code only (`ACCC`, used for a title's
+    // upscaler passes): `VICTORY_ACCC=0` refuses them so the title falls back.
+    #[cfg(windows)]
+    if let Some(s) = &shader
+        && victory_shader::Container::parse(&s.container)
+            .is_ok_and(|c| c.part(victory_shader::FourCC::DXIL).is_none())
+        && std::env::var("VICTORY_ACCC").as_deref() == Ok("0")
+    {
+        tracing::warn!(hash = %s.hash, "a compute pipeline without DXIL is not made");
+        if !out.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { *out = std::ptr::null() };
+        }
+        return crate::object::E_NOTIMPL;
+    }
     hand_out(
-        copy("compute", &desc.stage).into_iter().collect(),
+        shader.into_iter().collect(),
         #[cfg(windows)]
         None,
         iid,

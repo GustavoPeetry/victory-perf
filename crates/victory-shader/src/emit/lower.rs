@@ -287,6 +287,8 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Values of whole-wave sections holding one lane's, the one read after.
+    one_lane: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1569,6 +1571,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            one_lane: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1772,10 +1775,23 @@ impl<'a> Lower<'a> {
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
-        let inst = &self.x.p.blocks[b].insts[i];
-        for &(_, w) in &inst.writes {
+        let end = self.sections[&b][&start].end;
+        let writes: Vec<Value> = self.x.p.blocks[b].insts[i]
+            .writes
+            .iter()
+            .map(|&(_, w)| w)
+            .collect();
+        for w in writes {
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
+                let mut shape = self.sections[&b][&start].shapes.get(&w).copied();
+                // Lanes that do not agree, of which one is read after.
+                if shape.is_none()
+                    && let Some(lane) = self.lane_read(w, b, start, end)
+                    && let Some(sh) = self.sections[&b][&start].lane_shape(w, lane)
+                {
+                    shape = Some(sh);
+                    self.one_lane.insert(w);
+                }
                 let own = self.own_bits.totals.contains(&w);
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh, own)) {
                     Ok(x) => Val::I32(x),
@@ -1786,6 +1802,34 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+    }
+
+    /// The one lane of `w` read outside the section from `start` to `end` of
+    /// block `b`, if nothing else reads it there.
+    fn lane_read(&self, w: Value, b: usize, start: usize, end: usize) -> Option<u32> {
+        let mut found = None;
+        for (ob, block) in self.x.p.blocks.iter().enumerate() {
+            if block.phis.iter().any(|phi| phi.args.contains(&w)) {
+                return None;
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if ob == b && i > start && i < end || !inst.reads.iter().any(|r| r.1 == w) {
+                    continue;
+                }
+                let Fields::Valu(v) = &inst.fields else {
+                    return None;
+                };
+                let lane = match (inst.name(), v.src.get(1)) {
+                    ("v_readlane_b32", Some(&Operand::Const(c))) => crate::resource::inline(c)?,
+                    _ => return None,
+                };
+                if found.is_some_and(|f| f != lane) {
+                    return None;
+                }
+                found = Some(lane);
+            }
+        }
+        found
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -3148,6 +3192,13 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // SCC as a number.
+            Operand::Const(253) => {
+                let bit = self.scc_in(inst)?;
+                let c = self.cur;
+                let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+                Ok(self.s.m.select(c, bit, one, zero))
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4290,6 +4341,36 @@ impl<'a> Lower<'a> {
         (self.s.m.select(c, any, at, first), any)
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always. At a triangle's edge the quad's
+    /// other pixels are helpers (and so are discarded ones), which only quad
+    /// reads see: wave reads give 0 from them on AMD, so a derivative taken
+    /// by hand (`quad_perm`) was the whole value there, the texture read
+    /// that used it took its smallest level, and the triangles' edges showed
+    /// as lines on car paint, glass and skin.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream 0601955).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop serves helper lanes too. On the host, wave operations
+    /// leave helper lanes out: once only helper lanes are left in such a
+    /// loop, `WaveReadLaneFirst` reads no lane and the loop runs to its
+    /// limit. With its own value a helper lane matches in the first pass.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -4380,7 +4461,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6614,7 +6695,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -6662,6 +6743,9 @@ impl<'a> Lower<'a> {
         let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
+        }
+        if name == "v_pk_fmac_f16" {
+            return self.packed_fmac(inst, guard);
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
@@ -7373,6 +7457,14 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_readlane_b32"
+                if matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                    if inst.read(Reg::V(reg)).is_some_and(|r| self.one_lane.contains(&r))) =>
+            {
+                // Made from that lane's value already.
+                let r = s(self, 0)?;
+                int(self, r)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -7508,6 +7600,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -8264,6 +8357,56 @@ impl<'a> Lower<'a> {
         };
         let m = self.s.m.i32(0xFFFF);
         Ok(self.s.m.bin(c, Bin::And, x, m))
+    }
+
+    /// `v_pk_fmac_f16`: each half of the destination plus the product of the
+    /// sources' halves.
+    // shortcut: FMad in f32, as v_fma_f16 (a second rounding).
+    fn packed_fmac(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a packed half FMA's destination");
+        };
+        if v.src
+            .iter()
+            .any(|o| matches!(o, Operand::Const(_) | Operand::Literal(_)))
+            || v.sdwa.is_some()
+            || v.dpp.is_some()
+        {
+            return Err("a packed half FMA of constants");
+        }
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let old = inst.read(Reg::V(reg)).ok_or("an unread destination")?;
+        let words = [
+            self.operand(inst, &v.src[0])?,
+            self.operand(inst, &v.src[1])?,
+            self.i32_of(old)?,
+        ];
+        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+        let mut halves = Vec::new();
+        for high in [false, true] {
+            let xs: Vec<V> = words
+                .iter()
+                .map(|&w| {
+                    let w = if high {
+                        self.s.m.bin(c, Bin::LShr, w, k16)
+                    } else {
+                        w
+                    };
+                    let w = self.s.m.bin(c, Bin::And, w, low);
+                    self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[w])
+                })
+                .collect();
+            let f = self.fmad(xs[0], xs[1], xs[2]);
+            halves.push(self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]));
+        }
+        let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+        let lo = self.s.m.bin(c, Bin::And, halves[0], low);
+        let x = self.s.m.bin(c, Bin::Or, lo, hi);
+        self.write_i(inst, x, guard)
     }
 
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
@@ -9335,7 +9478,7 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.

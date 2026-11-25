@@ -404,13 +404,25 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+#[cfg(test)]
+pub(crate) fn joined_piece_runs(runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_within(runs, 0)
+}
+
+/// Joins piece runs that touch or are separated by at most `max_gap` 64 KiB
+/// pieces. Re-hashing a few unchanged pieces in parallel inside one compute
+/// dispatch costs the same GPU wall-clock as hashing a single piece while
+/// cutting hundreds of small `Dispatch` launches per frame.
+pub(crate) fn joined_piece_runs_within(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            Some(last)
+                if run.first <= last.first.saturating_add(last.pieces).saturating_add(max_gap) =>
+            {
+                let end = (last.first + last.pieces).max(run.first + run.pieces);
+                last.pieces = end - last.first;
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),
@@ -3114,7 +3126,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// A host copy in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
 /// `crate::rebar`), if enabled, supported and within budget.
 fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
-    let cpu_read = crate::readback::tagged_in(start, len);
+    // Small title buffers (`Kind::Buffer`) are snapshotted and diffed on the
+    // CPU after shader writes whenever `VICTORY_COPY_BACK_ONLY_READBACK` is
+    // off. Reading write-combined GPU upload memory over PCIe from the CPU
+    // stalls copy-back severely (~80 ms/frame for 17 MB), so keep small
+    // buffers in system RAM unless readback filtering is active.
+    let cpu_read = crate::readback::tagged_in(start, len)
+        || (kind == crate::rebar::Kind::Buffer && !crate::readback::enabled());
+    if cpu_read && kind == crate::rebar::Kind::Buffer && !crate::readback::enabled() && crate::rebar::level() >= 2 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                "Resizable BAR: keeping small title buffers in system RAM because VICTORY_COPY_BACK_ONLY_READBACK=0 (avoids uncached PCIe CPU readback stalls)"
+            );
+        });
+    }
     if !crate::rebar::reserve(kind, size, cpu_read) {
         return None;
     }

@@ -256,9 +256,21 @@ struct Held {
     scratch: ID3D12Resource,
 }
 
+/// Where the clamps of a run of indirect draws go: the list `clamps`, open,
+/// that runs before the host list at `into`, as long as that one has
+/// `writes` dispatches and copies (a later one may write the arguments).
+pub(crate) struct Hoist {
+    pub(crate) clamps: HostList,
+    pub(crate) into: usize,
+    pub(crate) writes: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The list before the host list recorded into that holds the clamps of
+    /// its indirect draws (`crate::indirect::hoisting`), still open.
+    hoist: Option<Hoist>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -572,8 +584,36 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        self.end_hoist();
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`.
+    pub(crate) fn hoist(&mut self, clamps: HostList, into: &HostList) {
+        let _ = self.end_hoist();
+        self.hoist = Some(Hoist {
+            clamps,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+        });
+    }
+
+    /// Ends and closes the list of hoisted clamps, if any, returning it so the
+    /// caller can place it in the submission immediately before its draw list.
+    pub(crate) fn end_hoist(&mut self) -> Option<HostList> {
+        let h = self.hoist.take()?;
+        h.clamps.clamp_end();
+        h.clamps.close();
+        Some(h.clamps)
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1591,7 +1631,18 @@ impl State {
         // rewrites a slot with the same descriptor key (or mirrors already
         // refreshed it), `mirror_buffer` returns `Unchanged` in O(1) without
         // re-resolving `buffer_copy`.
-        let slots: Vec<u32> = if cache.passes == 0 {
+        // Warm up the 64 buckets progressively (default 8 buckets/frame,
+        // overridable via `VICTORY_HEAP_WARMUP_BUCKETS`) instead of scanning
+        // all 80,000+ slots in a single 750 ms frame-0 spike.
+        static WARMUP_BUCKETS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let warmup_step = (*WARMUP_BUCKETS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_WARMUP_BUCKETS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(8)
+        }))
+        .clamp(1, 64);
+        let slots: Vec<u32> = if cache.passes == 0 && warmup_step >= 64 {
             for b in 0..64 {
                 cache.buckets[b].clear();
                 cache.bucket_spans[b].clear();
@@ -1599,7 +1650,6 @@ impl State {
             dirty_buckets = u64::MAX;
             host.buffer_slots()
         } else {
-            let bucket = (cache.passes & 63) as usize;
             let mut batch: Vec<u32> = Vec::with_capacity(changed.len() + 2048);
             let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(changed.len());
             for index in changed {
@@ -1607,16 +1657,25 @@ impl State {
                     batch.push(index);
                 }
             }
-            let rolling = host.buffer_slots_bucket(bucket as u32);
-            let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
-            let before_len = cache.buckets[bucket].len();
-            cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
-            if cache.buckets[bucket].len() != before_len {
-                dirty_buckets |= 1u64 << bucket;
-            }
-            for index in rolling {
-                if seen.insert(index) {
-                    batch.push(index);
+            let buckets_this_pass = if (cache.passes as usize) * warmup_step < 64 {
+                let start = (cache.passes as usize) * warmup_step;
+                start..(start + warmup_step).min(64)
+            } else {
+                let b = (cache.passes & 63) as usize;
+                b..(b + 1)
+            };
+            for bucket in buckets_this_pass {
+                let rolling = host.buffer_slots_bucket(bucket as u32);
+                let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
+                let before_len = cache.buckets[bucket].len();
+                cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
+                if cache.buckets[bucket].len() != before_len {
+                    dirty_buckets |= 1u64 << bucket;
+                }
+                for index in rolling {
+                    if seen.insert(index) {
+                        batch.push(index);
+                    }
                 }
             }
             batch
@@ -1922,7 +1981,7 @@ impl State {
         // textures (a scene's first minutes) then drains in fewer frames.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -1989,14 +2048,14 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10)
         }));
         // A long queue (the world's first minutes) gets a bounded catch-up
         // budget (`catching_up`, `VICTORY_TEXTURE_GATE_S`, 60 s) capped at
-        // 80 ms/pass so streaming never causes multi-second frame freezes.
+        // 24 ms/pass so streaming never causes multi-hundred-ms frame freezes.
         // `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
-        const PER_FRAME_CATCHING_UP: u64 = 128 << 20;
-        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(80);
+        const PER_FRAME_CATCHING_UP: u64 = 64 << 20;
+        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(24);
         const LONG: u64 = 2_000;
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
@@ -2283,6 +2342,7 @@ impl State {
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
         self.note_writes(list);
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2547,9 +2607,10 @@ impl State {
 
     /// Before closing or cutting a host list: flushes any held indirect run
     /// and transitions an active window's scratch buffer back to `COMMON`.
-    pub(crate) fn finish_list(&mut self, list: &HostList) {
+    pub(crate) fn finish_list(&mut self, list: &HostList) -> Option<HostList> {
         self.flush_held(list);
         self.end_window(list);
+        self.end_hoist()
     }
 
     /// Transitions the active window's scratch buffer back from
@@ -3279,78 +3340,114 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let mut hoisted = false;
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
-                // A record a short step after the last window's last one
-                // (the same step as that window's, if it had one): the
-                // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(window_most()) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
+                // Draws of a run: clamped in the list before, which the run's
+                // first draw opened (`crate::list`), so nothing of ours comes
+                // between the draws.
+                let before = (kind != DISPATCH
+                    && parts.is_none()
+                    && match crate::indirect::hoist_mode() {
+                        0 | 6 => false,
+                        3 => kind == MESH,
+                        4 => kind != MESH,
+                        _ => true,
                     }
-                    _ => (stride, max),
-                };
-                // Transition the previous window's scratch buffer back to
-                // `COMMON` before the next clamp pass transitions it to `UAV`.
-                self.end_window(list);
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
-                }
-                // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
-                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                // Dedicated buffers (not placed over title memory that other
-                // buffers alias): the clamp may wait on them alone.
-                let own = !args.in_place() && counter.as_ref().is_none_or(|(s, _)| !s.in_place());
-                // More than the record asked for: a window clamped ahead,
-                // whose unfilled slots must not spend the list's budget.
-                let bounded = if parts.is_some() {
-                    crate::indirect::bound_split(list, (&args.buffer, offset), own)
-                } else if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own)
-                } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own)
-                };
-                let Some(bounded) = bounded else {
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
-                };
-                // The clamp pass replaced the pipeline state and compute root
-                // signature; a draw's graphics roots stay intact.
-                let before = self.host_pipeline;
-                self.host_roots[1] = 0;
-                self.host_pipeline = 0;
-                if light_restore() && kind != DISPATCH && before == p.pso.as_raw() as usize {
-                    // SAFETY: an open list and the pipeline the list had bound
-                    // before the clamp pass.
-                    unsafe { list.list.SetPipelineState(&p.pso) };
-                    self.host_pipeline = before;
-                }
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
+                    && !(matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES)
+                    && self.hoists_into(list))
+                .then(|| self.hoist.as_ref().map(|h| &h.clamps))
+                .flatten()
+                .and_then(|clamps| {
+                    args.refresh(clamps, arguments, len);
+                    if let Some((s, at)) = &counter {
+                        s.refresh(clamps, *at, 4);
+                    }
+                    let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                    #[cfg(feature = "diagnostics")]
+                    clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+                    crate::indirect::bound_before(
+                        clamps,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, stride, max),
+                    )
                 });
-                (bounded, 0)
+                if let Some(b) = before {
+                    hoisted = true;
+                    b
+                } else {
+                    // A record a short step after the last window's last one
+                    // (the same step as that window's, if it had one): the
+                    // title walks the buffer, so the ones that step apart
+                    // after it are clamped with it.
+                    let (step, records) = match &self.window {
+                        Some(w) if windowed && same(w) => {
+                            let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                            let step = offset.saturating_sub(last);
+                            let walks = step >= u64::from(stride)
+                                && step <= 256
+                                && step % 4 == 0
+                                && (w.records == 1 || step == u64::from(w.step));
+                            if walks {
+                                let fit = (args.left(arguments) / step).min(window_most()) as u32;
+                                (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            } else {
+                                (stride, max)
+                            }
+                        }
+                        _ => (stride, max),
+                    };
+                    // Transition the previous window's scratch buffer back to
+                    // `COMMON` before the next clamp pass transitions it to `UAV`.
+                    self.end_window(list);
+                    args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                    if let Some((s, at)) = &counter {
+                        s.refresh(list, *at, 4);
+                    }
+                    // Bounded first: the clamp binds a compute pipeline of its
+                    // own and copies clamped active records into a scratch
+                    // buffer at offset 0.
+                    let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                    // Dedicated buffers (not placed over title memory that other
+                    // buffers alias): the clamp may wait on them alone.
+                    let own = !args.in_place() && counter.as_ref().is_none_or(|(s, _)| !s.in_place());
+                    // More than the record asked for: a window clamped ahead,
+                    // whose unfilled slots must not spend the list's budget.
+                    let bounded = if parts.is_some() {
+                        crate::indirect::bound_split(list, (&args.buffer, offset), own)
+                    } else if windowed && records > 1 {
+                        crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own)
+                    } else {
+                        crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own)
+                    };
+                    let Some(bounded) = bounded else {
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    // The clamp pass replaced the pipeline state and compute root
+                    // signature; a draw's graphics roots stay intact.
+                    let before = self.host_pipeline;
+                    self.host_roots[1] = 0;
+                    self.host_pipeline = 0;
+                    if light_restore() && kind != DISPATCH && before == p.pso.as_raw() as usize {
+                        // SAFETY: an open list and the pipeline the list had bound
+                        // before the clamp pass.
+                        unsafe { list.list.SetPipelineState(&p.pso) };
+                        self.host_pipeline = before;
+                    }
+                    self.window = windowed.then(|| Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                    });
+                    (bounded, 0)
+                }
             }
         };
         let ran = match kind {
@@ -3360,7 +3457,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
+            if !hoisted && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3375,7 +3472,7 @@ impl State {
         }
         // A run that later calls may join: held back with the scratch
         // buffer it reads.
-        if joining {
+        if joining && !hoisted {
             let run = self
                 .window
                 .as_ref()
@@ -3388,6 +3485,14 @@ impl State {
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
+        }
+        if hoisted && crate::indirect::hoist_mode() == 2 {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -3415,10 +3520,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        if self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
+        if !hoisted && self.window.as_ref().is_none_or(|w| w.scratch != bounded) {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

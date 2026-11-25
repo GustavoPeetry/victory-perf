@@ -913,8 +913,20 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
+        // Releases arrive continually and reset `too_long`: cap failed full
+        // ring walks per frame so heavy frames do not stall under `next`.
+        static FAILED: [std::sync::atomic::AtomicU64; 2] = [
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ];
+        const WALKS: u64 = 8;
+        let frame = crate::queue::presented();
+        if FAILED[0].swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+            FAILED[1].store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed)
+            && FAILED[1].load(std::sync::atomic::Ordering::Relaxed) < WALKS;
         let n = n as usize;
         // Search from `next` on, then from the start.
         let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
@@ -936,6 +948,7 @@ impl HostHeap {
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                FAILED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
