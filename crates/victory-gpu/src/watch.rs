@@ -473,6 +473,72 @@ struct Guards {
     /// `VirtualQuery` page-table walks when block 0 was opened by a write
     /// without ever skipping `is_view()` on unverified or remapped ranges.
     known_views: BTreeSet<usize>,
+    /// Per-frame memo of `uncommitted_end` answers for absent blocks.
+    uncommitted: Uncommitted,
+}
+
+/// Cached `uncommitted_end` answers (`start_block -> end_block`, half-open
+/// disjoint runs) valid for the current `crate::queue::presented()` frame
+/// and invalidated immediately on remaps, `writing`, or `views_mapped`.
+/// `VICTORY_UNCOMMITTED_MEMO=0` disables memoization and queries Windows directly.
+struct Uncommitted {
+    frame: u64,
+    runs: BTreeMap<usize, usize>,
+}
+
+impl Uncommitted {
+    fn memo_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_UNCOMMITTED_MEMO").is_none_or(|v| v != "0"))
+    }
+
+    /// Drops memoized uncommitted runs overlapping `[at, end)` bytes.
+    fn forget(&mut self, at: usize, end: usize) {
+        if self.runs.is_empty() || at >= end {
+            return;
+        }
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        self.runs.retain(|&from, &mut to| to <= first || from >= last);
+    }
+
+    /// Returns whether any memoized uncommitted run overlaps `[at, end)` bytes.
+    fn overlaps(&self, at: usize, end: usize) -> bool {
+        if self.runs.is_empty() || at >= end {
+            return false;
+        }
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        self.runs
+            .range(..=first)
+            .next_back()
+            .is_some_and(|(_, &to)| to > first)
+            || self.runs.range(first..last).next().is_some()
+    }
+
+    fn end(&mut self, block: usize) -> usize {
+        if !Self::memo_on() {
+            return uncommitted_end(block);
+        }
+        let frame = crate::queue::presented();
+        if frame != self.frame {
+            self.frame = frame;
+            self.runs.clear();
+        }
+        if let Some((_, &end)) = self.runs.range(..=block).next_back()
+            && end > block
+        {
+            return end;
+        }
+        let end = uncommitted_end(block);
+        if end > block {
+            let mut to = end;
+            while let Some((&s, &e)) = self.runs.range(block..=to).next() {
+                self.runs.remove(&s);
+                to = to.max(e);
+            }
+            self.runs.insert(block, to);
+        }
+        end
+    }
 }
 
 /// Disjoint, non-touching half-open runs `[start, end)` of clean blocks.
@@ -555,6 +621,10 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     known_views: BTreeSet::new(),
+    uncommitted: Uncommitted {
+        frame: 0,
+        runs: BTreeMap::new(),
+    },
 });
 
 fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
@@ -611,7 +681,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // Ordinary commits need no runtime mapping notification. Reuse
                 // this asking's query for the following blocks in the same region.
                 if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
+                    uncommitted_until = g.uncommitted.end(block);
                 }
                 open = block >= uncommitted_until;
                 if open {
@@ -908,10 +978,13 @@ pub fn writing(at: usize, len: usize) {
             let g = guards_read();
             g.protected.range(range.clone()).next().is_some()
                 || g.aliased.range(range).next().is_some()
+                || g.uncommitted.overlaps(at, end)
         };
         if needs_open {
             // The length is the title's (`fread`'s size times count, saturated).
-            open(&mut guards_write(), at, end);
+            let mut g = guards_write();
+            g.uncommitted.forget(at, end);
+            open(&mut g, at, end);
         }
     }
     // A placed texture there changes with no descriptor written.
@@ -933,7 +1006,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let mut g = guards_write();
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+        let end = at.saturating_add(n);
+        g.uncommitted.forget(at, end);
+        if open_here(&mut g, at, end) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1001,6 +1076,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards_write();
+    // A mapping commits or unmaps what was a placeholder: the memoized runs over it are dropped.
+    g.uncommitted.forget(at, at.saturating_add(len));
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -1148,6 +1225,62 @@ mod tests {
     }
 
     #[test]
+    fn uncommitted_runs_are_kept_until_their_memory_is_remapped() {
+        // SAFETY: a fresh reservation of four blocks, released at the end.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) }
+                as usize;
+        assert_ne!(base, 0);
+        let first = base / BLOCK;
+        let mut memo = Uncommitted {
+            frame: crate::queue::presented(),
+            runs: BTreeMap::new(),
+        };
+        assert_eq!(memo.end(first + 1), first + 4);
+        assert!(memo.overlaps(base + BLOCK, base + 2 * BLOCK));
+        // SAFETY: inside the reservation.
+        assert!(!unsafe {
+            VirtualAlloc((base + BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE)
+        }
+        .is_null());
+        // Kept while no mapping or write invalidation was told of.
+        assert_eq!(memo.end(first + 1), first + 4);
+        // Invalidated when `title_memory_remapped` / `writing` drops overlapping runs.
+        memo.forget(base + BLOCK, base + 2 * BLOCK);
+        assert!(!memo.overlaps(base + BLOCK, base + 2 * BLOCK));
+        assert_eq!(memo.end(first + 1), first + 1, "a committed block is not uncommitted");
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn uncommitted_memo_invalidated_by_remap_and_write() {
+        let _serial = lock_guards();
+        // SAFETY: a fresh reservation of 4 blocks, freed at the end.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) }
+                as usize;
+        assert_ne!(base, 0);
+        let first = base / BLOCK;
+        {
+            let mut g = guards_write();
+            assert_eq!(g.uncommitted.end(first + 1), first + 4);
+            assert!(g.uncommitted.overlaps(base + BLOCK, base + 2 * BLOCK));
+        }
+        // `writing` on a non-protected but memoized block must take the write lock and invalidate it.
+        writing(base + 2 * BLOCK, BLOCK);
+        assert!(!guards_read().uncommitted.overlaps(base + 2 * BLOCK, base + 3 * BLOCK));
+        {
+            let mut g = guards_write();
+            assert_eq!(g.uncommitted.end(first), first + 4);
+        }
+        title_memory_remapped(base, 4 * BLOCK);
+        assert!(!guards_read().uncommitted.overlaps(base, base + 4 * BLOCK));
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -1291,6 +1424,8 @@ mod tests {
         assert!(!refresh().contains(&(late / PAGE)));
 
         commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        // Seen from the next frame on (the kernel's answers are kept for one).
+        guards_write().uncommitted.frame = u64::MAX;
         for at in [early, late] {
             assert!(writable(at));
             // SAFETY: each address is inside its committed read-write page.
