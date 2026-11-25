@@ -1103,6 +1103,9 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
+    /// This resource owns one registration of its exact read-back range.
+    #[cfg(windows)]
+    readback_tagged: bool,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet. With, for a depth texture the title also writes as unordered
     /// access, the colour texture shaders write instead ([`Twin`]).
@@ -2087,6 +2090,12 @@ impl Resource {
             Backing::Address(at) => at,
         }
     }
+
+    #[cfg(windows)]
+    fn tag_readback(&mut self) {
+        crate::readback::tag(self.data() as u64, self.desc.width);
+        self.readback_tagged = true;
+    }
 }
 
 fn resource<'a>(this: This) -> &'a Resource {
@@ -2115,6 +2124,8 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
+        readback_tagged: false,
+        #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
             state,
@@ -2127,6 +2138,8 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    #[cfg(windows)]
+    let mut resource = resource;
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -2147,7 +2160,7 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
         if crate::readback::creating_readback() {
-            crate::readback::tag(resource.data() as u64, desc.width);
+            resource.tag_readback();
         }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
@@ -2167,8 +2180,8 @@ impl Drop for Resource {
                     targets.remove(&at);
                 }
             }
-        } else {
-            crate::readback::untag(self.data() as u64);
+        } else if self.readback_tagged {
+            crate::readback::untag(self.data() as u64, self.desc.width);
         }
         let made = self
             .host
@@ -2721,6 +2734,166 @@ mod tests {
             layout: 1,
             flags: 0,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readback_registrations_follow_resource_lifetimes() {
+        const CHILD: &str = "VICTORY_TEST_READBACK_RESOURCE_CHILD";
+        const PASSED: &str = "read-back resource lifetime assertions passed";
+        if std::env::var_os(CHILD).is_none() {
+            // Configuration is cached in OnceLock, so each mode needs a
+            // fresh process. These buffers need no host device or game data.
+            for (copy_back, rebar) in [
+                ("0", "0"),
+                ("0", "1"),
+                ("0", "2"),
+                ("1", "0"),
+                ("1", "1"),
+                ("1", "2"),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "resource::tests::readback_registrations_follow_resource_lifetimes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("VICTORY_COPY_BACK_ONLY_READBACK", copy_back)
+                    .env("VICTORY_REBAR", rebar)
+                    .output()
+                    .expect("run resource lifetime test in a fresh process");
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains(PASSED),
+                    "copy_back={copy_back}, rebar={rebar}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        }
+
+        fn make(address: u64, len: u64, tagged: bool) -> This {
+            let mut out = std::ptr::null();
+            assert_eq!(
+                create_at_address(
+                    std::ptr::null(),
+                    address,
+                    &buffer(len),
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                S_OK
+            );
+            // SAFETY: the newly created Resource has just this reference.
+            let resource = unsafe { &mut *out.cast_mut().cast::<Resource>() };
+            assert!(!resource.readback_tagged, "the test is not the title's creator");
+            if tagged {
+                // Exercise the same registration as creation, without
+                // depending on a particular game's stack or executable.
+                resource.tag_readback();
+            }
+            out
+        }
+        fn release(this: This) {
+            assert_eq!(slot::<Release>(this, 0x10)(this), 0);
+        }
+        fn tagged(address: u64, len: u64, expected: bool) {
+            assert_eq!(crate::readback::tagged_in(address, len), expected);
+            if crate::readback::enabled() {
+                assert_eq!(crate::readback::copy_back(address, len), expected);
+            }
+        }
+
+        const LEN: u64 = 0x1000;
+        let memory = vec![0u8; 4 * LEN as usize];
+        let start = memory.as_ptr() as u64;
+        if !crate::readback::enabled() && crate::rebar::level() < 2 {
+            let first = make(start, LEN, false);
+            let second = make(start, LEN, false);
+            release(second);
+            tagged(start, LEN, false);
+            release(first);
+            assert!(crate::readback::copy_back(start, LEN));
+            println!("{PASSED}");
+            return;
+        }
+
+        // An untagged alias must not remove a live owner's registration.
+        let owner = make(start, LEN, true);
+        let alias = make(start, LEN, false);
+        release(alias);
+        tagged(start, LEN, true);
+        release(owner);
+        tagged(start, LEN, false);
+
+        // Nor may an untagged alias keep a released owner's range alive.
+        let owner = make(start, LEN, true);
+        let alias = make(start, LEN, false);
+        release(owner);
+        tagged(start, LEN, false);
+        release(alias);
+
+        // Same-start buffers of different sizes work in both release orders.
+        for long_first in [true, false] {
+            let short = make(start, LEN, true);
+            let long = make(start, 3 * LEN, true);
+            release(if long_first { long } else { short });
+            tagged(start, LEN, true);
+            tagged(start + LEN, 2 * LEN, !long_first);
+            release(if long_first { short } else { long });
+            tagged(start, 3 * LEN, false);
+        }
+
+        // Identical ranges each own a reference, as do overlapping ranges.
+        let first = make(start, LEN, true);
+        let second = make(start, LEN, true);
+        release(first);
+        tagged(start, LEN, true);
+        release(second);
+        tagged(start, LEN, false);
+        let first = make(start, 2 * LEN, true);
+        let second = make(start + LEN, 2 * LEN, true);
+        release(first);
+        tagged(start, LEN, false);
+        tagged(start + LEN, 2 * LEN, true);
+        release(second);
+        tagged(start, 3 * LEN, false);
+
+        // Cleanup belongs to the final COM release, not every Release call.
+        let owner = make(start, LEN, true);
+        assert_eq!(slot::<Release>(owner, 0x08)(owner), 2);
+        assert_eq!(slot::<Release>(owner, 0x10)(owner), 1);
+        tagged(start, LEN, true);
+        release(owner);
+        tagged(start, LEN, false);
+
+        // Failed or query-only creation drops an untagged temporary alias.
+        let owner = make(start, LEN, true);
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(), start, &buffer(LEN), 0,
+                std::ptr::null(), &[0; 16], &mut out,
+            ),
+            object::E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        tagged(start, LEN, true);
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(), start, &buffer(LEN), 0,
+                std::ptr::null(), &RESOURCE_IIDS[0], std::ptr::null_mut(),
+            ),
+            object::S_FALSE
+        );
+        tagged(start, LEN, true);
+        release(owner);
+        tagged(start, LEN, false);
+        println!("{PASSED}");
     }
 
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {

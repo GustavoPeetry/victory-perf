@@ -247,13 +247,6 @@ impl RangeSet {
         }
     }
 
-    /// Takes one count of the range starting at `start` out, whatever its
-    /// end (a buffer let go knows where it starts); false if none.
-    pub(crate) fn remove_at(&mut self, start: u64) -> bool {
-        let found = self.ranges.range((start, 0)..=(start, u64::MAX)).next().map(|(&k, _)| k);
-        found.is_some_and(|(s, e)| self.remove(s, e))
-    }
-
     /// Whether a held range meets `[start, end)`.
     pub(crate) fn overlaps(&self, start: u64, end: u64) -> bool {
         if start >= end {
@@ -444,12 +437,16 @@ mod tests {
         s.insert(100, 200);
         s.insert(100, 150);
         assert_eq!(s.len(), 2);
-        assert!(s.remove_at(100));
-        assert!(s.remove_at(100));
-        assert!(s.overlaps(120, 130), "one count of one range is left");
-        assert!(s.remove_at(100));
+        assert!(s.remove(100, 200));
+        assert!(s.overlaps(150, 200), "the second long range is still held");
+        assert!(s.remove(100, 200));
+        assert!(s.overlaps(120, 130), "the short range is still held");
+        assert!(!s.overlaps(150, 200), "the long range's tail was released");
+        assert!(!s.remove(100, 200), "an absent range leaves its alias alone");
+        assert_eq!(s.len(), 1);
+        assert!(s.remove(100, 150));
         assert!(!s.overlaps(0, 1000));
-        assert!(!s.remove_at(100));
+        assert!(!s.remove(100, 150));
         assert!(!s.remove(1, 2));
         s.insert(7, 7);
         assert_eq!(s.len(), 0, "empty ranges are not held");

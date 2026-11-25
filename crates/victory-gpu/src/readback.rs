@@ -115,7 +115,11 @@ pub(crate) fn creating_readback() -> bool {
                 // A caller outside the executable (a title DLL): ask again later.
                 return false;
             };
-            tracing::warn!(begin = format_args!("{:#x}", c.0), end = format_args!("{:#x}", c.1), "read-back creator found");
+            tracing::warn!(
+                begin = format_args!("{:#x}", c.0),
+                end = format_args!("{:#x}", c.1),
+                "read-back creator found"
+            );
             *CREATOR.get_or_init(|| Some(c))
         }
     };
@@ -145,7 +149,12 @@ pub(crate) fn tag(start: u64, len: u64) {
     t.insert(start, start + len);
     let n = t.len();
     if n.is_power_of_two() {
-        tracing::warn!(n, start = format_args!("{start:#x}"), len, "read-back buffers tagged");
+        tracing::warn!(
+            n,
+            start = format_args!("{start:#x}"),
+            len,
+            "read-back buffers tagged"
+        );
     }
 }
 
@@ -177,11 +186,15 @@ pub(crate) fn copy_back(start: u64, len: u64) -> bool {
     back
 }
 
-/// A buffer starting at `start` is let go: if it was a read-back buffer,
-/// it is one no more.
-pub(crate) fn untag(start: u64) {
-    if enabled() {
-        TAGGED.lock().unwrap_or_else(|e| e.into_inner()).remove_at(start);
+/// Removes one registration owned by a read-back buffer being let go.
+/// Its exact range matters: aliases may share a start but differ in size.
+pub(crate) fn untag(start: u64, len: u64) {
+    // Level 2 also tags read-back buffers when copy-back filtering is off.
+    if enabled() || crate::rebar::level() >= 2 {
+        TAGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(start, start + len);
     }
 }
 
@@ -193,6 +206,66 @@ pub(crate) fn tagged() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untag_releases_buffers_in_all_tracking_modes() {
+        const CHILD: &str = "VICTORY_TEST_READBACK_LIFETIME_CHILD";
+        const PASSED: &str = "read-back lifetime assertions passed";
+        if std::env::var_os(CHILD).is_none() {
+            // Each configuration needs its own process: enabled() and level()
+            // cache their environment variables in OnceLock.
+            for (copy_back, rebar) in [("0", "2"), ("1", "0"), ("1", "1"), ("1", "2")] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "readback::tests::untag_releases_buffers_in_all_tracking_modes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("VICTORY_COPY_BACK_ONLY_READBACK", copy_back)
+                    .env("VICTORY_REBAR", rebar)
+                    .output()
+                    .expect("run read-back lifetime test in a fresh process");
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains(PASSED),
+                    "copy_back={copy_back}, rebar={rebar}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        }
+
+        assert!(enabled() || crate::rebar::level() >= 2);
+        // Synthetic addresses only: tag() records ranges without dereferencing
+        // title memory or invoking the Windows stack-based creator detector.
+        const START: u64 = 0x1000_0000;
+        const LEN: u64 = 0x1000;
+        const OTHER: u64 = START + 2 * LEN;
+        assert!(!tagged_in(START, LEN));
+        tag(START, LEN);
+        tag(OTHER, LEN);
+        assert!(tagged_in(START, LEN));
+
+        untag(START, LEN);
+        assert!(
+            !tagged_in(START, LEN),
+            "released memory must lose its read-back tag"
+        );
+        assert!(
+            tagged_in(OTHER, LEN),
+            "another live buffer must stay tagged"
+        );
+
+        // A range that is no longer registered is harmless to remove.
+        untag(START, LEN);
+        assert!(!tagged_in(START, LEN));
+        assert!(tagged_in(OTHER, LEN));
+        untag(OTHER, LEN);
+        assert!(!tagged_in(OTHER, LEN));
+        println!("{PASSED}");
+    }
 
     #[test]
     fn this_test_binary_has_its_own_functions_in_its_table() {
