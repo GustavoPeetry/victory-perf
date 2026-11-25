@@ -111,6 +111,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
+pub use container::MESH_OUTPUT_LIMIT;
 pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
@@ -276,23 +277,49 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_code(container, None)
 }
 
-thread_local! {
-    /// Thread-local override for [`with_wave_wide`].
-    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Combined vertex + primitive output byte size of an emitted mesh shader
+/// DXIL container (`None` for non-mesh containers or malformed headers)
+/// (`Belobug/VIctory-Belobug-AMD#138`, GPL-3.0-or-later).
+pub fn mesh_output_bytes(dxil: &[u8]) -> Option<u64> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    // RuntimeInfo v2 header: 4-byte size prefix (>= 48), then 48-byte info block
+    // with stage at +24 (13 = mesh), max_vertices at +12, max_primitives at +14.
+    if crate::dxbc::u32_at(psv, 0).ok()? < 48 || *psv.get(4 + 24)? != 13 {
+        return None;
+    }
+    let u16_at = |off: usize| -> Option<u32> {
+        let b: [u8; 2] = psv.get(off..off + 2)?.try_into().ok()?;
+        Some(u32::from(u16::from_le_bytes(b)))
+    };
+    let max_vertices = u16_at(4 + 12)?;
+    let max_primitives = u16_at(4 + 14)?;
+    let outputs = c
+        .part(FourCC::OSG1)
+        .and_then(|p| signature(p.data).ok())
+        .unwrap_or_default();
+    let prims = c
+        .part(FourCC::PSG1)
+        .and_then(|p| signature(p.data).ok())
+        .unwrap_or_default();
+    Some(container::mesh_output_bytes(
+        &outputs,
+        &prims,
+        max_vertices,
+        max_primitives,
+    ))
 }
 
-/// Runs `f` with the wave-wide lowering of wave64 compute programs on 32-lane
-/// hosts enabled (`VICTORY_WAVE_WIDE=1`) on the calling thread
-/// (`fxceless/victory-fork#823`, GPL-3.0-or-later).
-pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let before = WAVE_WIDE_HERE.replace(on);
-    let out = f();
-    WAVE_WIDE_HERE.set(before);
-    out
+struct Prepared<'a> {
+    c: Container<'a>,
+    native: NativeProgram,
+    p: ir::Program,
+    st: structure::Structured,
+    io: io::Io,
+    res: resource::Resources,
 }
 
-/// [`translate`] with `code` in place of the program's own when given.
-fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
+fn prepare(container: &[u8], code: Option<Vec<u8>>) -> Result<Prepared<'_>, ShaderError> {
     let c = Container::parse(container)?;
     let mut native = crate::container_programs(&c)?
         .into_iter()
@@ -316,7 +343,116 @@ fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader,
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    Ok(Prepared {
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+    })
+}
+
+/// Arbitrary (`kind == 0`) input channels read by an emitted pixel shader,
+/// keyed by `(UPPERCASE_NAME, semantic_index)` -> 4-bit absolute channel mask.
+fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(lower::KeptOutputs::new());
+    };
+    let mut reads = lower::KeptOutputs::new();
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for i in 0..count {
+        let at = base + 32 * i;
+        // System value at +12: 0 is arbitrary (non-SV).
+        if crate::dxbc::u32_at(part.data, at + 12)? != 0 {
+            continue;
+        }
+        let name_at = crate::dxbc::u32_at(part.data, at + 4)? as usize;
+        let name = part
+            .data
+            .get(name_at..)
+            .and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let index = crate::dxbc::u32_at(part.data, at + 8)?;
+        let rw = *part
+            .data
+            .get(at + 25)
+            .ok_or(ShaderError::Malformed("truncated"))?;
+        if rw != 0 {
+            let key = (String::from_utf8_lossy(name).to_ascii_uppercase(), index);
+            *reads.entry(key).or_insert(0) |= rw;
+        }
+    }
+    Ok(reads)
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (or `None`
+/// for depth-only draws), pruning arbitrary mesh outputs the pixel shader never
+/// reads so the mesh shader fits under [`MESH_OUTPUT_LIMIT`] (32 KiB) with
+/// matching stage signatures (`Belobug/VIctory-Belobug-AMD#138`, GPL-3.0-or-later).
+pub fn translate_linked(
+    mesh: &[u8],
+    pixel: Option<&[u8]>,
+) -> Result<(HostShader, Option<HostShader>), ShaderError> {
+    let mp = prepare(mesh, None)?;
+    let Some(ps_bytes) = pixel else {
+        let empty = lower::KeptOutputs::new();
+        let linked_ms = emit_pruned(
+            &mp.c,
+            &mp.native,
+            &mp.p,
+            &mp.st,
+            &mp.io,
+            &mp.res,
+            Some(&empty),
+        )?;
+        return Ok((linked_ms, None));
+    };
+    let pp = prepare(ps_bytes, None)?;
+    let full_ps = emit_pruned(&pp.c, &pp.native, &pp.p, &pp.st, &pp.io, &pp.res, None)?;
+    let reads = pixel_input_reads(&full_ps.dxil)?;
+    let linked_ms = emit_pruned(
+        &mp.c,
+        &mp.native,
+        &mp.p,
+        &mp.st,
+        &mp.io,
+        &mp.res,
+        Some(&reads),
+    )?;
+    let linked_ps = emit_pruned(
+        &pp.c,
+        &pp.native,
+        &pp.p,
+        &pp.st,
+        &pp.io,
+        &pp.res,
+        Some(&reads),
+    )?;
+    Ok((linked_ms, Some(linked_ps)))
+}
+
+thread_local! {
+    /// Thread-local override for [`with_wave_wide`].
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wave-wide lowering of wave64 compute programs on 32-lane
+/// hosts enabled (`VICTORY_WAVE_WIDE=1`) on the calling thread
+/// (`fxceless/victory-fork#823`, GPL-3.0-or-later).
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
+/// [`translate`] with `code` in place of the program's own when given.
+fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
+    let prep = prepare(container, code)?;
+    emit(&prep.c, &prep.native, &prep.p, &prep.st, &prep.io, &prep.res)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -328,9 +464,21 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_pruned(c, native, p, st, io, res, None)
+}
+
+fn emit_pruned(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    keep: Option<&lower::KeptOutputs>,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let original = emit_program_pruned(c, native, p, st, io, res, keep);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -344,7 +492,12 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if keep.is_none()
+        && stuck
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -516,7 +669,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program_pruned(c, native, &p, &st, &io, &res, keep).map(|(shader, _)| shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -591,6 +744,18 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_program_pruned(c, native, p, st, io, res, None)
+}
+
+fn emit_program_pruned(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    keep: Option<&lower::KeptOutputs>,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -648,17 +813,20 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let l = lower::lower_pruned(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        keep,
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1585,6 +1753,336 @@ mod tests {
                 out[0][6]
             );
         }
+    }
+
+    fn wide_mesh_parts(
+        threads: u32,
+        max_vertices: u32,
+        max_primitives: u32,
+    ) -> (Vec<u8>, NativeProgram) {
+        let mut words = vec![
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E10_02FF, // v_mov_b32 v8, 0.25
+            0.25f32.to_bits(),
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0x7E14_0280, // v_mov_b32 v10, 0.0
+        ];
+        // param0 = (1.0, 0.5, 0.0, 0.0)
+        words.extend([0xF800_000F | (32 << 4), 0x0A0A_0607]);
+        // param1..14 = (0.0, 0.0, 0.0, 0.0)
+        for k in 1..15u32 {
+            words.extend([0xF800_000F | ((32 + k) << 4), 0x0A0A_0A0A]);
+        }
+        // param15 = (0.0, 0.0, 0.25, 1.0)
+        words.extend([0xF800_000F | ((32 + 15) << 4), 0x0708_0A0A]);
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let outputs: Vec<crate::native::VsOutput> = (0..16u8)
+            .map(|k| crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                param: k,
+                fp16: false,
+                pack2: false,
+            })
+            .collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                max_vertices,
+                max_primitives,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        }];
+        for k in 0..16u32 {
+            sig.push(SigElement {
+                name: "TEXCOORD".into(),
+                index: k,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(k + 1),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            });
+        }
+        let osg1 = container::signature(&sig, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        (bytes, native)
+    }
+
+    #[test]
+    fn mesh_exceeding_32k_tightens_counts_to_group_threads() {
+        let (bytes, native) = wide_mesh_parts(64, 128, 128);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(mesh_output_bytes(&ms.dxil), Some(68 * 4 * 64));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ms.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn linked_mesh_and_pixel_prune_unused_outputs_under_32k_and_draw() {
+        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128);
+        let mc = Container::parse(&ms_bytes).unwrap();
+        let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+        let mst = structure::structure(&mp).unwrap();
+        let mres = resource::track(&mp, &ms_native.layout, ms_native.stage, Some(&mst)).unwrap();
+        let mio = io::raise(&mp, &ms_native).unwrap();
+
+        let standalone = emit_pruned(&mc, &ms_native, &mp, &mst, &mio, &mres, None).unwrap();
+        assert_eq!(mesh_output_bytes(&standalone.dxil), Some(34_816));
+        assert!(mesh_output_bytes(&standalone.dxil).unwrap() > MESH_OUTPUT_LIMIT);
+
+        let empty = lower::KeptOutputs::new();
+        let depth_ms =
+            emit_pruned(&mc, &ms_native, &mp, &mst, &mio, &mres, Some(&empty)).unwrap();
+        assert_eq!(mesh_output_bytes(&depth_ms.dxil), Some(4 * 4 * 128));
+
+        let p1 = |vdst: u32, attr: u32, ch: u32| {
+            0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let p2 = |vdst: u32, attr: u32, ch: u32| {
+            0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let ps_words = [
+            p1(2, 0, 0),
+            p2(2, 0, 0),
+            p1(3, 0, 1),
+            p2(3, 0, 1),
+            p1(4, 15, 2),
+            p2(4, 15, 2),
+            p1(5, 15, 3),
+            p2(5, 15, 3),
+            0xF800_180F,
+            0x0504_0302,
+            0xBF81_0000,
+        ];
+        let ps_inputs: Vec<crate::native::PsInput> = (0..16u8)
+            .map(|k| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                mask: 0xF,
+                attr: k,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: ps_inputs,
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut ps_sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        for k in 0..16u32 {
+            ps_sig.push(SigElement {
+                name: "TEXCOORD".into(),
+                index: k,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(k + 1),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+        }
+        let isg1 = container::signature(&ps_sig, true);
+        let osg1 = container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            false,
+        );
+        let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let full_ps = emit_pruned(&pc, &ps_native, &pp, &pst, &pio, &pres, None).unwrap();
+        let reads = pixel_input_reads(&full_ps.dxil).unwrap();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
+        assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
+
+        let linked_ms =
+            emit_pruned(&mc, &ms_native, &mp, &mst, &mio, &mres, Some(&reads)).unwrap();
+        let linked_ps =
+            emit_pruned(&pc, &ps_native, &pp, &pst, &pio, &pres, Some(&reads)).unwrap();
+        assert_eq!(mesh_output_bytes(&linked_ms.dxil), Some(8 * 4 * 128));
+        assert!(!linked_ps.dxil.is_empty());
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut depth_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes the structure of the given size.
+                let queried = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                if queried.is_err()
+                    || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                {
+                    eprintln!("no mesh shaders on the {label} device; skipped");
+                    continue;
+                }
+                let root = host
+                    .root_signature_for(&[
+                        (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                        (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![
+                                (0, Root::Constants(vec![0])),
+                                (1, Root::Constants(vec![0])),
+                            ],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}: unexpected pixel {:?}",
+                    texels.first()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_mbcnt_all_ones_does_not_declare_wave_ops() {
+        let (bytes, native) = wide_mesh_parts(64, 64, 64);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let dxil = Container::parse(&ms.dxil).unwrap();
+        let sfi0 = dxil.part(FourCC::SFI0).expect("SFI0 part").data;
+        let flags = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+        assert_eq!(
+            flags & 0x80000,
+            0,
+            "mesh shader without wave ops should not declare WAVE_OPS (SFI0={flags:#x})"
+        );
     }
 }
 

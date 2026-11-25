@@ -116,7 +116,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
 }
 
 /// The most a mesh shader's outputs may take, in bytes (D3D12).
-pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+pub const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
 
 /// A mesh shader's output size as the DXIL validator measures it against
 /// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
@@ -127,7 +127,12 @@ pub(crate) fn mesh_output_bytes(
     max_vertices: u32,
     max_primitives: u32,
 ) -> u64 {
-    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let scalars = |els: &[SigElement]| {
+        els.iter()
+            .filter(|e| e.row.is_some())
+            .map(|e| u64::from(e.cols))
+            .sum::<u64>()
+    };
     let align = |n: u32| u64::from(n).next_multiple_of(32);
     4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
 }
@@ -415,5 +420,39 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn mesh_output_bytes_matches_dxil_budget() {
+        let el = |row: u32, cols: u8| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        // 16 float4 rows = 64 components; at 128 vertices that is exactly 32 KiB.
+        let v16: Vec<SigElement> = (0..16).map(|r| el(r, 4)).collect();
+        assert_eq!(mesh_output_bytes(&v16, &[], 128, 128), MESH_OUTPUT_LIMIT);
+        let mut v17 = v16.clone();
+        v17.push(el(16, 1));
+        assert_eq!(mesh_output_bytes(&v17, &[], 128, 128), 33_280);
+        // Maxima round up to multiples of 32; unallocated rows (`row: None`) excluded.
+        let prim = [
+            el(0, 2),
+            SigElement {
+                row: None,
+                ..el(1, 4)
+            },
+        ];
+        assert_eq!(
+            mesh_output_bytes(&v16[..1], &prim, 33, 1),
+            4 * 4 * 64 + 2 * 4 * 32
+        );
     }
 }

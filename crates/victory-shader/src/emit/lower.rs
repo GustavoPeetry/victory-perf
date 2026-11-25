@@ -86,10 +86,47 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
+/// arbitrary (`kind == 0`) inputs read by the paired pixel shader
+/// (`Belobug/VIctory-Belobug-AMD#138`, GPL-3.0-or-later).
+pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
+
+/// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
+/// least one channel read in `keep`, trimming unread leading and trailing channels.
+fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        if e.kind != 0 {
+            return true;
+        }
+        if e.row.is_none() {
+            return false;
+        }
+        let key = (e.name.to_ascii_uppercase(), e.index);
+        let used = keep.get(&key).copied().unwrap_or(0);
+        let rel = (used >> e.col) & ((1u8 << e.cols) - 1);
+        if rel == 0 {
+            return false;
+        }
+        let first = rel.trailing_zeros() as u8;
+        let last = 7 - rel.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+        true
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_pruned(parts, None)
+}
+
+pub(crate) fn lower_pruned(
+    parts: &Parts,
+    keep: Option<&KeptOutputs>,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, keep).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -229,6 +266,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Whether arbitrary outputs/inputs were pruned against a paired pixel shader.
+    pruned: bool,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
     /// branch lies between the entry and the block, or the program has a
     /// loop a lane can be cut out of): the barrier there keeps its fences
@@ -1233,7 +1272,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1244,6 +1283,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let Some(keep) = keep {
+            if x.native.stage == HwStage::Ps {
+                prune_signature(&mut s.inputs, keep);
+            } else if x.native.stage == HwStage::Ms {
+                prune_signature(&mut s.outputs, keep);
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1427,6 +1473,9 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            if let Some(keep) = keep {
+                prune_signature(&mut s.prims, keep);
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -1546,6 +1595,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             flat: None,
             no_barrier,
+            pruned: keep.is_some(),
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -4199,9 +4249,11 @@ impl<'a> Lower<'a> {
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
             // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
+            // refuse them here if one hangs or if pruned outputs still exceed 32 KiB.
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
+            if !fits(mesh)
+                && (self.pruned || std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some())
+            {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -4277,6 +4329,7 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        self.s.flags |= flags::WAVE_OPS;
         self.s.op(
             self.cur,
             "waveGetLaneIndex",
@@ -9197,7 +9250,7 @@ impl<'a> Lower<'a> {
                 .find(|i| i.row == attribute.row && i.fp16)
                 .map(|i| {
                     let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
+                        input_packs(&self.x.native.io, &self.x.inputs)
                     } else {
                         Vec::new()
                     };
@@ -9226,7 +9279,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(&l.x.inputs, &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -10737,8 +10790,9 @@ impl<'a> Lower<'a> {
                 };
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
+                    let orig_outputs = if primitive { &self.x.prims } else { &self.x.outputs };
                     let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
+                        packed_half(orig_outputs, &packs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -10981,7 +11035,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)

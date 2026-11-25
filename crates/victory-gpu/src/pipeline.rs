@@ -358,6 +358,131 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+fn parse_mesh_link_prune(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether mesh shaders exceeding 32 KiB of outputs are re-translated together
+/// with their paired pixel shader to prune unread outputs (`VICTORY_MESH_LINK_PRUNE=0`
+/// disables; `Belobug/VIctory-Belobug-AMD#138`, GPL-3.0-or-later).
+#[cfg(windows)]
+pub(crate) fn mesh_link_prune() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_mesh_link_prune(std::env::var_os("VICTORY_MESH_LINK_PRUNE").as_deref());
+        if !on {
+            tracing::info!("mesh/pixel linked output pruning off (VICTORY_MESH_LINK_PRUNE=0)");
+        }
+        on
+    })
+}
+
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn from_translated(source: &Shader, translated: Translated) -> Arc<Shader> {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Arc::new(Shader {
+            stage: source.stage,
+            hash: source.hash.clone(),
+            container: source.container.clone(),
+            translated: cell,
+        })
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// D3D12's 32 KiB mesh output limit (`victory_shader::emit::MESH_OUTPUT_LIMIT`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key: LinkedKey = (
+        *blake3::hash(&ms.container).as_bytes(),
+        ps.map(|p| *blake3::hash(&p.container).as_bytes()),
+    );
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    let result = match victory_shader::emit::translate_linked(
+        &ms.container,
+        ps.map(|p| p.container.as_slice()),
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_output_bytes(&ms_host.dxil);
+            let ms_orig = ms.translated()?;
+            let mesh = Shader::from_translated(
+                ms,
+                Translated {
+                    host: ms_host,
+                    used: ms_orig.used.clone(),
+                    stores: ms_orig.stores,
+                    writes: ms_orig.writes,
+                },
+            );
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => {
+                    let ps_orig = p.translated()?;
+                    Some(Shader::from_translated(
+                        p,
+                        Translated {
+                            host,
+                            used: ps_orig.used.clone(),
+                            stores: ps_orig.stores,
+                            writes: ps_orig.writes,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            tracing::info!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                bytes = ms_bytes,
+                "mesh and pixel linked under 32 KiB output budget"
+            );
+            Some(LinkedPair { mesh, pixel })
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed; standalone exceeded 32 KiB"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -914,5 +1039,13 @@ mod tests {
     #[test]
     fn classify_miss_distinguishes_null_and_pending() {
         assert_eq!(classify_miss(std::ptr::null()), PipelineMiss::Null);
+    }
+
+    #[test]
+    fn mesh_link_prune_parses_default_and_rollback() {
+        use std::ffi::OsStr;
+        assert!(parse_mesh_link_prune(None));
+        assert!(parse_mesh_link_prune(Some(OsStr::new("1"))));
+        assert!(!parse_mesh_link_prune(Some(OsStr::new("0"))));
     }
 }
