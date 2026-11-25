@@ -5126,6 +5126,11 @@ impl HostList {
     /// being read by a clamp pass, marking it synced until the next UAV write
     /// or list reset.
     pub(crate) fn take_uav_barrier_for(&self, resource: &ID3D12Resource) -> bool {
+        // `VICTORY_CLAMP_DEDUP=0`: every scoped clamp waits, as before.
+        static DEDUP: OnceLock<bool> = OnceLock::new();
+        if !*DEDUP.get_or_init(|| std::env::var_os("VICTORY_CLAMP_DEDUP").is_none_or(|v| v != "0")) {
+            return true;
+        }
         if !self.uav_pending() {
             return false;
         }

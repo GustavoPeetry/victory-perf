@@ -273,18 +273,11 @@ fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Give larger shader-written buffers (>= 1 MiB / >= 4 MiB) higher VRAM
-    // priority than textures so transient loading spikes never permanently
-    // banish multi-megabyte compute/skinning buffers onto PCIe shared memory.
-    let vram_pct = if len >= 4 << 20 {
-        card_vram_percent().max(96)
-    } else if len >= 1 << 20 {
-        card_vram_percent().max(95)
-    } else {
-        card_vram_percent()
-    };
+    // Only while the card has room under `card_vram_percent()` (default 88%,
+    // above textures' 75% cap so hot compute buffers like skinning stay in
+    // local VRAM instead of spilling onto PCIe).
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * vram_pct
+        && used + size > budget / 100 * card_vram_percent()
     {
         return None;
     }
@@ -318,7 +311,7 @@ fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
     })
 }
 
@@ -337,7 +330,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * 68
+        && used + size > budget / 100 * 72
     {
         return None;
     }
