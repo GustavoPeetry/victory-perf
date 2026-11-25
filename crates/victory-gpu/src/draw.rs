@@ -1631,7 +1631,18 @@ impl State {
         // rewrites a slot with the same descriptor key (or mirrors already
         // refreshed it), `mirror_buffer` returns `Unchanged` in O(1) without
         // re-resolving `buffer_copy`.
-        let slots: Vec<u32> = if cache.passes == 0 {
+        // Warm up the 64 buckets progressively (default 8 buckets/frame,
+        // overridable via `VICTORY_HEAP_WARMUP_BUCKETS`) instead of scanning
+        // all 80,000+ slots in a single 750 ms frame-0 spike.
+        static WARMUP_BUCKETS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let warmup_step = (*WARMUP_BUCKETS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_WARMUP_BUCKETS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(8)
+        }))
+        .clamp(1, 64);
+        let slots: Vec<u32> = if cache.passes == 0 && warmup_step >= 64 {
             for b in 0..64 {
                 cache.buckets[b].clear();
                 cache.bucket_spans[b].clear();
@@ -1639,7 +1650,6 @@ impl State {
             dirty_buckets = u64::MAX;
             host.buffer_slots()
         } else {
-            let bucket = (cache.passes & 63) as usize;
             let mut batch: Vec<u32> = Vec::with_capacity(changed.len() + 2048);
             let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(changed.len());
             for index in changed {
@@ -1647,16 +1657,25 @@ impl State {
                     batch.push(index);
                 }
             }
-            let rolling = host.buffer_slots_bucket(bucket as u32);
-            let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
-            let before_len = cache.buckets[bucket].len();
-            cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
-            if cache.buckets[bucket].len() != before_len {
-                dirty_buckets |= 1u64 << bucket;
-            }
-            for index in rolling {
-                if seen.insert(index) {
-                    batch.push(index);
+            let buckets_this_pass = if (cache.passes as usize) * warmup_step < 64 {
+                let start = (cache.passes as usize) * warmup_step;
+                start..(start + warmup_step).min(64)
+            } else {
+                let b = (cache.passes & 63) as usize;
+                b..(b + 1)
+            };
+            for bucket in buckets_this_pass {
+                let rolling = host.buffer_slots_bucket(bucket as u32);
+                let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
+                let before_len = cache.buckets[bucket].len();
+                cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
+                if cache.buckets[bucket].len() != before_len {
+                    dirty_buckets |= 1u64 << bucket;
+                }
+                for index in rolling {
+                    if seen.insert(index) {
+                        batch.push(index);
+                    }
                 }
             }
             batch
@@ -1962,7 +1981,7 @@ impl State {
         // textures (a scene's first minutes) then drains in fewer frames.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -2029,14 +2048,14 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10)
         }));
         // A long queue (the world's first minutes) gets a bounded catch-up
         // budget (`catching_up`, `VICTORY_TEXTURE_GATE_S`, 60 s) capped at
-        // 80 ms/pass so streaming never causes multi-second frame freezes.
+        // 24 ms/pass so streaming never causes multi-hundred-ms frame freezes.
         // `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
-        const PER_FRAME_CATCHING_UP: u64 = 128 << 20;
-        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(80);
+        const PER_FRAME_CATCHING_UP: u64 = 64 << 20;
+        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(24);
         const LONG: u64 = 2_000;
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
