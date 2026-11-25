@@ -871,6 +871,12 @@ pub(crate) struct HostList {
     /// last global UAV barrier (`barrier_merge`). Starts `true` after reset so
     /// the first barrier in a list stays conservative across list boundaries.
     uav_pending: std::sync::atomic::AtomicBool,
+    /// Raw COM pointers of dedicated buffers that already received a scoped UAV
+    /// barrier since the last `set_uav_pending` change, avoiding redundant
+    /// per-resource UAV stalls across consecutive indirect clamps.
+    uav_synced: Mutex<std::collections::HashSet<usize>>,
+    /// Fast-path flag so `set_uav_pending` avoids locking `uav_synced` when empty.
+    uav_synced_any: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2319,6 +2325,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                            if n < 4 || n.is_multiple_of(500) {
+                                tracing::info!(
+                                    src = format_args!("{src:#x}"),
+                                    len,
+                                    count = n + 1,
+                                    "late settle triggered by Step::Fill overlapping shader writes"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -3183,6 +3199,8 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 uav_pending: std::sync::atomic::AtomicBool::new(true),
+                uav_synced: Mutex::default(),
+                uav_synced_any: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5099,10 +5117,28 @@ impl HostList {
 
     pub(crate) fn set_uav_pending(&self, pending: bool) {
         self.uav_pending.store(pending, Ordering::Relaxed);
+        if self.uav_synced_any.swap(false, Ordering::Relaxed) {
+            self.uav_synced.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    /// Returns `true` if `resource` still needs a scoped UAV barrier before
+    /// being read by a clamp pass, marking it synced until the next UAV write
+    /// or list reset.
+    pub(crate) fn take_uav_barrier_for(&self, resource: &ID3D12Resource) -> bool {
+        if !self.uav_pending() {
+            return false;
+        }
+        let mut synced = self.uav_synced.lock().unwrap_or_else(|e| e.into_inner());
+        let needed = synced.insert(resource.as_raw() as usize);
+        if needed {
+            self.uav_synced_any.store(true, Ordering::Relaxed);
+        }
+        needed
     }
 
     pub(crate) fn reset(&self) {
-        self.uav_pending.store(true, Ordering::Relaxed);
+        self.set_uav_pending(true);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();

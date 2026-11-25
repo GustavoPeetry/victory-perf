@@ -1401,7 +1401,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(82, |percent| percent.clamp(50, 97))
+            .map_or(75, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -1720,11 +1720,11 @@ fn evict_under_vram_pressure(idle_ms: u64) {
     let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
         return;
     };
-    let cap = budget / 100 * room_percent().max(90);
+    let cap = budget / 100 * room_percent().max(85);
     if budget == 0 || used < cap {
         return;
     }
-    let goal = budget / 100 * room_percent().max(90).saturating_sub(6);
+    let goal = budget / 100 * room_percent().max(85).saturating_sub(6);
     let target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
 
     // Pass 1: gather LRU candidates under `TEXTURES` lock, then drop it before

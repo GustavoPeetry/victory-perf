@@ -276,11 +276,12 @@ pub(crate) fn clamp_scoped() -> bool {
 }
 
 /// The waits around a clamp pass ([`clamp_waits`]): for earlier shader writes
-/// before it and after it, and whether the wait before is scoped to the
-/// argument and count buffers only.
+/// before it (global or per-buffer when `scoped`) and after it.
 #[derive(Clone, Copy)]
 struct Waits {
     before: bool,
+    before_src: bool,
+    before_count: bool,
     after: bool,
     scoped: bool,
 }
@@ -290,24 +291,50 @@ impl Waits {
     #[cfg(test)]
     const ALL: Waits = Waits {
         before: true,
+        before_src: true,
+        before_count: true,
         after: true,
         scoped: false,
     };
 }
 
-fn clamp_waits(list: &HostList, own: bool) -> Waits {
+fn clamp_waits(
+    list: &HostList,
+    src: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
+    own: bool,
+) -> Waits {
     let scoped = own && clamp_scoped();
     if !crate::host::barrier_merge() {
         return Waits {
             before: true,
+            before_src: true,
+            before_count: count.is_some(),
             after: !scoped,
             scoped,
         };
     }
-    Waits {
-        before: list.uav_pending(),
-        after: false,
-        scoped,
+    if scoped {
+        let before_src = list.take_uav_barrier_for(src);
+        let before_count = count
+            .filter(|&buf| buf != src)
+            .is_some_and(|buf| list.take_uav_barrier_for(buf));
+        Waits {
+            before: before_src || before_count,
+            before_src,
+            before_count,
+            after: false,
+            scoped: true,
+        }
+    } else {
+        let before = list.uav_pending();
+        Waits {
+            before,
+            before_src: before,
+            before_count: before && count.is_some(),
+            after: false,
+            scoped: false,
+        }
     }
 }
 
@@ -342,7 +369,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let waits = clamp_waits(list, own);
+    let waits = clamp_waits(list, src.0, count.map(|(b, _)| b), own);
     let recorded = record_clamp_waits(c, &list.list, &dst, budget, src, count, spec, 0, waits);
     clamp_recorded(list, waits, recorded);
     recorded.then_some(dst)
@@ -366,7 +393,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let waits = clamp_waits(list, own);
+    let waits = clamp_waits(list, src.0, None, own);
     let recorded = record_clamp_waits(c, &list.list, &dst, budget, src, None, spec, AHEAD, waits);
     clamp_recorded(list, waits, recorded);
     recorded.then_some(dst)
@@ -395,7 +422,7 @@ pub(crate) fn bound_split(
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    let waits = clamp_waits(list, own);
+    let waits = clamp_waits(list, src.0, None, own);
     let recorded = record_clamp_waits(c, &list.list, &dst, budget, src, None, spec, IN_PARTS, waits);
     clamp_recorded(list, waits, recorded);
     recorded.then_some(dst)
@@ -445,7 +472,13 @@ fn record_clamp_waits(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     how: u32,
-    Waits { before, after, scoped }: Waits,
+    Waits {
+        before,
+        before_src,
+        before_count,
+        after,
+        scoped,
+    }: Waits,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -509,9 +542,13 @@ fn record_clamp_waits(
     let mut first_len = 0usize;
     if waits && before {
         if scoped {
-            first_buf[first_len].write(uav_barrier_on(src));
-            first_len += 1;
-            if let Some((buf, _)) = count.filter(|(buf, _)| *buf != src) {
+            if before_src {
+                first_buf[first_len].write(uav_barrier_on(src));
+                first_len += 1;
+            }
+            if before_count
+                && let Some((buf, _)) = count.filter(|(buf, _)| *buf != src)
+            {
                 first_buf[first_len].write(uav_barrier_on(buf));
                 first_len += 1;
             }
@@ -1557,6 +1594,8 @@ void main() {
             0,
             Waits {
                 before: true,
+                before_src: true,
+                before_count: false,
                 after: false,
                 scoped: true,
             },
