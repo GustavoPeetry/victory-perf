@@ -152,6 +152,17 @@ static PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// The next multiple of 64 MiB of placed bytes at which a line is written.
 static NEXT_LINE: AtomicU64 = AtomicU64::new(64 << 20);
 
+/// Reserves bytes against the current count, so concurrent callers cannot
+/// both spend the same remaining budget. Returns the new total.
+fn reserve_bytes(placed: &AtomicU64, size: u64, most: u64) -> Option<u64> {
+    placed
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(size).filter(|&next| next <= most)
+        })
+        .ok()
+        .map(|before| before + size)
+}
+
 /// At the host's start: whether the device has GPU upload heaps, and the
 /// line that says so.
 pub(crate) fn probe(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, card_budget: Option<u64>) {
@@ -207,17 +218,17 @@ pub(crate) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> bool {
         most: most(),
         card,
     };
-    match decide(&ask) {
-        Decision::Rebar => {}
-        Decision::OverBudget | Decision::CardFull => {
-            if PLACED[2].fetch_add(1, Ordering::Relaxed) == 0 {
-                tracing::warn!(?kind, size, "Resizable BAR: a copy stays in the PC's memory (budget or card full)");
-            }
-            return false;
-        }
+    let reserved = match decide(&ask) {
+        Decision::Rebar => reserve_bytes(&PLACED[0], size, ask.most),
+        Decision::OverBudget | Decision::CardFull => None,
         _ => return false,
-    }
-    let now = PLACED[0].fetch_add(size, Ordering::Relaxed) + size;
+    };
+    let Some(now) = reserved else {
+        if PLACED[2].fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(?kind, size, "Resizable BAR: a copy stays in the PC's memory (budget or card full)");
+        }
+        return false;
+    };
     PLACED[1].fetch_add(1, Ordering::Relaxed);
     let line = NEXT_LINE.load(Ordering::Relaxed);
     if now >= line && NEXT_LINE.compare_exchange(line, now / (64 << 20) * (64 << 20) + (64 << 20), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
@@ -301,6 +312,47 @@ mod tests {
         assert_eq!(decide(&a), Decision::OverBudget);
         a.placed = u64::MAX;
         assert_eq!(decide(&a), Decision::OverBudget);
+    }
+
+    #[test]
+    fn reserved_bytes_stop_at_the_cap_and_can_be_returned() {
+        let placed = AtomicU64::new(4 * MIB);
+        assert_eq!(reserve_bytes(&placed, 4 * MIB, 8 * MIB), Some(8 * MIB));
+        assert_eq!(reserve_bytes(&placed, 1, 8 * MIB), None);
+        assert_eq!(placed.load(Ordering::Relaxed), 8 * MIB);
+        // Allocation failure and teardown return the successful reservation.
+        placed.fetch_sub(4 * MIB, Ordering::Relaxed);
+        assert_eq!(reserve_bytes(&placed, 4 * MIB, 8 * MIB), Some(8 * MIB));
+    }
+
+    #[test]
+    fn reserved_bytes_do_not_wrap() {
+        let placed = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_bytes(&placed, 2, u64::MAX), None);
+        assert_eq!(placed.load(Ordering::Relaxed), u64::MAX - 1);
+        assert_eq!(reserve_bytes(&placed, 1, u64::MAX), Some(u64::MAX));
+    }
+
+    #[test]
+    fn concurrent_reservations_share_one_budget() {
+        let placed = AtomicU64::new(0);
+        let gate = std::sync::Barrier::new(8);
+        let accepted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        reserve_bytes(&placed, 4 * MIB, 4 * MIB)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .count()
+        });
+        assert_eq!(accepted, 1);
+        assert_eq!(placed.load(Ordering::Relaxed), 4 * MIB);
     }
 
     #[test]
