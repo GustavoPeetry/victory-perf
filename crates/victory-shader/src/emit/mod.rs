@@ -279,10 +279,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// [`translate`] with `code` in place of the program's own when given.
 fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let mut native = crate::native_programs(dxil.data)?
+    let mut native = crate::container_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(
