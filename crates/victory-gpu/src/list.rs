@@ -1816,6 +1816,8 @@ pub(crate) struct ValueWait {
     wide: bool,
 }
 
+// Recording a wait is portable; evaluating it uses the Windows host.
+#[cfg(windows)]
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
@@ -1904,6 +1906,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// buffer and nothing was lit).
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
+#[cfg(windows)]
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
@@ -1944,7 +1947,9 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         reference,
         wide,
     };
+    #[cfg(windows)]
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(windows)]
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
         tracing::info!(
             address = format_args!("{address:#x}"),
