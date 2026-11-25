@@ -120,6 +120,8 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     /// Bytes reserved in `crate::rebar` (0 if not placed in GPU upload heap).
     rebar: u64,
+    /// Live-byte telemetry bucket (`0..=4` in [`LIVE_CLASS`]; `u8::MAX` if uncounted).
+    live_class: u8,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -257,6 +259,48 @@ fn card_vram_percent() -> u64 {
     })
 }
 
+/// Rejection reason in [`card_for`]: `[count, bytes]` pairs in [`CARD_REJECTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardReject {
+    Threshold = 0,
+    DxgiBudget = 1,
+    CumulativeCap = 2,
+    CreateFailed = 3,
+}
+
+/// Cumulative count and bytes rejected by [`card_for`], indexed by `reason as usize * 2`.
+static CARD_REJECTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn note_card_reject(reason: CardReject, size: u64) {
+    let idx = (reason as usize) * 2;
+    CARD_REJECTS[idx].fetch_add(1, Ordering::Relaxed);
+    CARD_REJECTS[idx + 1].fetch_add(size, Ordering::Relaxed);
+}
+
+/// Pure admission predicate for [`card_for`] before attempting resource creation.
+fn check_card_admission(
+    len: u64,
+    size: u64,
+    least: u64,
+    most: u64,
+    vram_percent: u64,
+    video_memory: Option<[u64; 4]>,
+    card_bytes_used: u64,
+) -> Result<(), CardReject> {
+    if len < least || size >= 1 << 30 {
+        return Err(CardReject::Threshold);
+    }
+    if let Some([budget, used, ..]) = video_memory
+        && used.saturating_add(size) > budget / 100 * vram_percent
+    {
+        return Err(CardReject::DxgiBudget);
+    }
+    if card_bytes_used.saturating_add(size) > most {
+        return Err(CardReject::CumulativeCap);
+    }
+    Ok(())
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
@@ -266,28 +310,38 @@ fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let (least, most) = card_limits();
-    if len < least || size >= 1 << 30 {
+    if let Err(reason) = check_card_admission(len, size, least, most, card_vram_percent(), None, 0) {
+        note_card_reject(reason, size);
         return None;
     }
     let host = host()?;
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room under `card_vram_percent()` (default 88%,
-    // above textures' 75% cap so hot compute buffers like skinning stay in
+    // Only while the card has room under `card_vram_percent()` (default 92%,
+    // above textures' cap so hot compute buffers like skinning stay in
     // local VRAM instead of spilling onto PCIe).
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * card_vram_percent()
-    {
+    if let Err(reason) = check_card_admission(
+        len,
+        size,
+        least,
+        most,
+        card_vram_percent(),
+        host.video_memory(),
+        CARD_BYTES[0].load(Ordering::Relaxed),
+    ) {
+        note_card_reject(reason, size);
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed).saturating_add(size) > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        note_card_reject(CardReject::CumulativeCap, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        note_card_reject(CardReject::CreateFailed, size);
     }
     buffer
 }
@@ -1147,7 +1201,9 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
+    let began = std::time::Instant::now();
     wide(copy_jobs(snaps));
+    BACK_TIMING_US[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -1190,6 +1246,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    let began = std::time::Instant::now();
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -1202,7 +1259,9 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    let found = find_pieces(scans);
+    BACK_TIMING_US[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1294,6 +1353,54 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// windows, in buffers' copies, and of those in copies of 1 MiB or more;
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Live shadow bytes by class: `0` card buffers, `1` CPU buffers `>= least`,
+/// `2` CPU buffers `< least`, `3` card windows, `4` CPU windows.
+static LIVE_CLASS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Effective CPU microseconds per interval in snapshot (`0`), compare (`1`),
+/// and merge (`2`).
+static BACK_TIMING_US: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Snapshot of [`crate::resource::KINDS`] from the previous telemetry line.
+static LAST_TEX_KINDS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn card_telemetry_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TELEMETRY").is_none_or(|v| v != "0"))
+}
+
+/// P0 VRAM, `card_for` rejection, shadow-class, texture-churn, and
+/// copy-back phase telemetry (`VICTORY_CARD_TELEMETRY=0` disables).
+pub(crate) fn card_telemetry_line(frames: f64) {
+    if !card_telemetry_enabled() || frames <= 0.0 {
+        return;
+    }
+    let mb = |b: u64| b >> 20;
+    let r = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| CARD_REJECTS[i].load(Ordering::Relaxed));
+    let cls = [0, 1, 2, 3, 4].map(|i| LIVE_CLASS[i].load(Ordering::Relaxed));
+    let [snap_ms, cmp_ms, merge_ms] =
+        [0, 1, 2].map(|i| BACK_TIMING_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+    let vm = host().and_then(|h| h.video_memory());
+    let [lb_mb, lu_mb, nlb_mb, nlu_mb] = vm.map_or([0; 4], |v| v.map(mb));
+    let [tex_alive, tex_alive_bytes, tex_let_go, tex_let_go_bytes, tex_remade, tex_remade_bytes, tex_made] =
+        crate::resource::KINDS.each_ref().map(|k| k.load(Ordering::Relaxed));
+    let d_let_go = tex_let_go.saturating_sub(LAST_TEX_KINDS[0].swap(tex_let_go, Ordering::Relaxed));
+    let d_let_go_b = tex_let_go_bytes.saturating_sub(LAST_TEX_KINDS[1].swap(tex_let_go_bytes, Ordering::Relaxed));
+    let d_remade = tex_remade.saturating_sub(LAST_TEX_KINDS[2].swap(tex_remade, Ordering::Relaxed));
+    let d_remade_b = tex_remade_bytes.saturating_sub(LAST_TEX_KINDS[3].swap(tex_remade_bytes, Ordering::Relaxed));
+    let d_made = tex_made.saturating_sub(LAST_TEX_KINDS[4].swap(tex_made, Ordering::Relaxed));
+    tracing::info!(
+        "card telemetry (P0): card_for rejected: threshold={} ({} MB), dxgi_budget={} ({} MB), cap={} ({} MB), create={} ({} MB); \
+         live shadows: card_buf={} MB, cpu_buf_ge_min={} MB, cpu_buf_lt_min={} MB, card_win={} MB, cpu_win={} MB; \
+         vram local={}/{} MB, non_local={}/{} MB; tex churn: alive={} ({} MB), +made={}, +let_go={} ({} MB), +remade={} ({} MB); \
+         cpu_back per frame: snapshot={snap_ms:.2} ms, compare={cmp_ms:.2} ms, merge={merge_ms:.2} ms",
+        r[0], mb(r[1]), r[2], mb(r[3]), r[4], mb(r[5]), r[6], mb(r[7]),
+        mb(cls[0]), mb(cls[1]), mb(cls[2]), mb(cls[3]), mb(cls[4]),
+        lu_mb, lb_mb, nlu_mb, nlb_mb,
+        tex_alive, mb(tex_alive_bytes), d_made, d_let_go, mb(d_let_go_b), d_remade, mb(d_remade_b),
+    );
+}
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
@@ -1482,6 +1589,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if let Some(slot) = LIVE_CLASS.get(self.live_class as usize) {
+            slot.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.rebar != 0 {
             crate::rebar::released(self.rebar);
         }
@@ -1826,6 +1936,14 @@ impl Shadow {
             window: false,
             place: None,
             rebar: 0,
+            live_class: u8::MAX,
+        }
+    }
+
+    fn set_live_class(&mut self, class: u8) {
+        if (class as usize) < LIVE_CLASS.len() && self.live_class == u8::MAX {
+            self.live_class = class;
+            LIVE_CLASS[class as usize].fetch_add(self.len, Ordering::Relaxed);
         }
     }
 
@@ -1919,6 +2037,7 @@ impl Shadow {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
+            let began = std::time::Instant::now();
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
             // piece it holds partly only the part's bytes are taken, as
@@ -1947,6 +2066,7 @@ impl Shadow {
                     kept.0[piece] = whole;
                 }
             }
+            BACK_TIMING_US[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return;
         }
         if wide_back() {
@@ -1960,6 +2080,7 @@ impl Shadow {
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
+        let began = std::time::Instant::now();
         for (from, to) in parts {
             if from < to {
                 // SAFETY: the copy's mapping and the snapshot's allocation
@@ -1969,6 +2090,7 @@ impl Shadow {
                 }
             }
         }
+        BACK_TIMING_US[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -2005,19 +2127,22 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
-            #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
-                None => self.differing(from, to, before),
+                None => {
+                    let res = self.differing(from, to, before);
+                    BACK_TIMING_US[1].fetch_add(scanning.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    res
+                }
             };
+            let syncing = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
-            let syncing = {
+            {
                 use crate::copystat::{C, add};
                 add(C::BackScanUs, scanning.elapsed().as_micros() as u64);
                 add(C::BackDiffer, differing.len() as u64);
-                std::time::Instant::now()
-            };
+            }
             // Where the copy changes (the GPU wrote, and below the title's
             // bytes come in), a kept snapshot is no longer current.
             for &(at, n) in &differing {
@@ -2068,8 +2193,10 @@ impl Shadow {
             // frame). Asking about the whole range here, to note them
             // current, cost more: 19-31 askings a frame over 110-174 MB of
             // view memory, each a walk of its guards.
+            let sync_us = syncing.elapsed().as_micros() as u64;
+            BACK_TIMING_US[2].fetch_add(sync_us, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::BackSyncUs, sync_us);
         }
         written
     }
@@ -2113,6 +2240,7 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
+        let began = std::time::Instant::now();
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
@@ -2132,6 +2260,7 @@ impl Shadow {
         // without the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
         let Some(first) = first_difference(now, held) else {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         };
         let last = last_difference(now, held).unwrap_or(first);
@@ -2142,13 +2271,16 @@ impl Shadow {
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         }
         if !merge_piece(now, held, title) {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         n
     }
 
@@ -2795,10 +2927,12 @@ impl Shadow {
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
+        let began = std::time::Instant::now();
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
@@ -2830,6 +2964,7 @@ impl Shadow {
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
+        BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         written
     }
 
@@ -2859,6 +2994,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let began = std::time::Instant::now();
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
@@ -2866,6 +3002,7 @@ impl Shadow {
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
@@ -2892,10 +3029,12 @@ impl Shadow {
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {
+            BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return 0;
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        BACK_TIMING_US[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         n
     }
 }
@@ -3113,6 +3252,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        shadow.set_live_class(if card.is_some() {
+            0
+        } else if len >= card_limits().0 {
+            1
+        } else {
+            2
+        });
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
@@ -3159,6 +3305,13 @@ fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window:
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = window;
     shadow.rebar = size;
+    shadow.set_live_class(if window {
+        4
+    } else if len >= card_limits().0 {
+        1
+    } else {
+        2
+    });
     Some(Arc::new(shadow))
 }
 
@@ -3379,6 +3532,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.set_live_class(if card.is_some() { 3 } else { 4 });
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
@@ -3513,6 +3667,71 @@ mod window_tests {
         pages.set(1, 0);
         assert!(!pages.all_copied());
         assert_eq!(pages.copied_count(), 3);
+    }
+
+    #[test]
+    fn card_admission_classifies_all_rejection_reasons() {
+        use super::{CARD_REJECTS, CardReject, check_card_admission, note_card_reject};
+        let least = 256 << 10;
+        let most = 1024 << 20;
+        let vram_pct = 92;
+        let vm = Some([7000 << 20, 6000 << 20, 8000 << 20, 100 << 20]);
+
+        assert_eq!(
+            check_card_admission(64 << 10, 64 << 10, least, most, vram_pct, vm, 0),
+            Err(CardReject::Threshold)
+        );
+        assert_eq!(
+            check_card_admission(1 << 30, 1 << 30, least, most, vram_pct, vm, 0),
+            Err(CardReject::Threshold)
+        );
+        assert_eq!(
+            check_card_admission(500 << 20, 500 << 20, least, most, vram_pct, vm, 0),
+            Err(CardReject::DxgiBudget)
+        );
+        assert_eq!(
+            check_card_admission(200 << 20, 200 << 20, least, most, vram_pct, vm, 900 << 20),
+            Err(CardReject::CumulativeCap)
+        );
+        assert_eq!(
+            check_card_admission(200 << 20, 200 << 20, least, most, vram_pct, vm, 500 << 20),
+            Ok(())
+        );
+
+        let before = CARD_REJECTS[2].load(std::sync::atomic::Ordering::Relaxed);
+        let before_b = CARD_REJECTS[3].load(std::sync::atomic::Ordering::Relaxed);
+        note_card_reject(CardReject::DxgiBudget, 4096);
+        assert_eq!(
+            CARD_REJECTS[2].load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        assert_eq!(
+            CARD_REJECTS[3].load(std::sync::atomic::Ordering::Relaxed),
+            before_b + 4096
+        );
+    }
+
+    #[test]
+    fn live_class_accounting_matches_shadow_lifetime() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some((buffer, data)) = host.shared_buffer(64 << 10) else {
+            return;
+        };
+        let base = super::LIVE_CLASS[2].load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut s = super::Shadow::new(buffer, data, 0, 0x1000, 12_345);
+            s.set_live_class(2);
+            assert_eq!(
+                super::LIVE_CLASS[2].load(std::sync::atomic::Ordering::Relaxed),
+                base + 12_345
+            );
+        }
+        assert_eq!(
+            super::LIVE_CLASS[2].load(std::sync::atomic::Ordering::Relaxed),
+            base
+        );
     }
 }
 

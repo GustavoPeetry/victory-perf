@@ -6772,6 +6772,7 @@ impl Meter {
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
             let logged_frames = std::mem::take(&mut self.logged_frames).max(1) as f64;
+            crate::shadow::card_telemetry_line(logged_frames);
             crate::memcopy::log(logged_frames);
             barrier_line(logged_frames);
             #[cfg(feature = "diagnostics")]
