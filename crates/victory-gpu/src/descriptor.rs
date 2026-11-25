@@ -175,6 +175,20 @@ pub(crate) fn evict_kept_resources(victims: &std::collections::HashSet<usize>) -
     cleared
 }
 
+/// Flushes deferred descriptor unmakings on every live shader-visible view heap
+/// once no GPU submission is in flight (`Itsbatt/victory-unified@768735ad`).
+#[cfg(windows)]
+pub(crate) fn flush_idle_heaps() {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, h) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed in `Drop for Heap` under
+        // the same `SHADER_HEAPS` lock).
+        if let Some(Some(host)) = unsafe { &*(h as *const Heap) }.host.get() {
+            host.flush_unmake();
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

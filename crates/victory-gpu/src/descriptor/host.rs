@@ -37,6 +37,13 @@ fn heap_slot_flags() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SLOT_FLAGS").is_none_or(|v| v != "0"))
 }
 
+/// Whether live descriptor unmakings are deferred while GPU submissions are in
+/// flight (`VICTORY_DEFER_UNMAKE=0` unmakes immediately as before).
+fn defer_unmake() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEFER_UNMAKE").is_none_or(|v| v != "0"))
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -54,6 +61,10 @@ pub(crate) struct HostHeap {
     made: Vec<std::sync::atomic::AtomicU64>,
     /// Serializes updates to `made` slots and their host descriptors.
     made_lock: Mutex<()>,
+    /// Placed slots logically cleared while GPU submissions were still in flight,
+    /// deferred until no submission is running so live descriptors are never
+    /// overwritten under executing shader warps (`(index, key)`).
+    pending_unmake: Mutex<Vec<(u32, u64)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -832,6 +843,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             made_lock: Mutex::new(()),
+            pending_unmake: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
@@ -1356,8 +1368,19 @@ impl HostHeap {
         true
     }
 
+    /// Writes a null descriptor for `key` at slot `index` and releases the
+    /// kept resource reference. Caller guarantees no GPU submission reads `index`.
+    fn unmake_key(&self, index: u32, key: u64) {
+        match view_at(key as u32, (key >> 32) as u32) {
+            Some(view) => null_for(&view, self.cpu(index)),
+            None => null_view(self.cpu(index)),
+        }
+        self.keep(index, None);
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Caller holds `self.made_lock`.
+    /// Defers the descriptor write and ref release while GPU submissions are in flight.
     fn unmake(&self, index: u32) {
         let Some(slot) = self.made.get(index as usize) else {
             return;
@@ -1366,11 +1389,39 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+        if defer_unmake() && !self.sampler && crate::host::flying() {
+            self.pending_unmake
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((index, key));
+            return;
         }
-        self.keep(index, None);
+        self.unmake_key(index, key);
+    }
+
+    /// Flushes slots queued by [`unmake`] once nothing is executing on the GPU.
+    /// Slots rewritten with a new view in the meantime are left untouched.
+    pub(crate) fn flush_unmake(&self) -> usize {
+        if crate::host::flying() {
+            return 0;
+        }
+        let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = std::mem::take(&mut *self.pending_unmake.lock().unwrap_or_else(|e| e.into_inner()));
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut flushed = 0;
+        for (index, key) in pending {
+            if self
+                .made
+                .get(index as usize)
+                .is_some_and(|cur| cur.load(std::sync::atomic::Ordering::Relaxed) == 0)
+            {
+                self.unmake_key(index, key);
+                flushed += 1;
+            }
+        }
+        flushed
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -1933,8 +1984,12 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if current != 0 {
-                self.made[index as usize].store(0, Release);
-                self.make_null(index);
+                if self.sampler {
+                    self.made[index as usize].store(0, Release);
+                    self.make_null(index);
+                } else {
+                    self.unmake(index);
+                }
                 let _ = self.note_buffer_inner(index, None, false, record_change);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -3617,5 +3672,24 @@ mod tests {
         assert!(heap.note_buffer(1, None, false).is_empty());
         assert!(!heap.slot_may(1, SLOT_IN_TEXTURES | SLOT_IN_PLACED | SLOT_IN_BUFFERS));
         assert!(!heap.buffer_slots().contains(&1));
+    }
+
+    #[test]
+    fn deferred_unmake_flushes_only_still_cleared_slots() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        {
+            let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+            heap.made[1].store(0, std::sync::atomic::Ordering::Relaxed);
+            heap.made[2].store(42, std::sync::atomic::Ordering::Relaxed);
+        }
+        heap.pending_unmake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([(1, 100), (2, 200)]);
+        assert_eq!(heap.flush_unmake(), 1);
+        assert_eq!(heap.flush_unmake(), 0);
+        assert_eq!(heap.made[2].load(std::sync::atomic::Ordering::Relaxed), 42);
     }
 }
