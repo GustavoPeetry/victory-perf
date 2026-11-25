@@ -328,13 +328,19 @@ if ($CacheMode -eq "cold") {
     New-Item -ItemType Directory -Force -Path $IsolatedCacheDir | Out-Null
 } elseif ($CacheMode -eq "warm-copy") {
     if (Test-Path $DefaultCacheDir) {
+        Write-Output "Copying isolated warm cache (robocopy /MT:16) to: $IsolatedCacheDir ..."
         New-Item -ItemType Directory -Force -Path $IsolatedCacheDir | Out-Null
         foreach ($sub in @("images", "shaders", "pipelines")) {
             $srcSub = Join-Path $DefaultCacheDir $sub
+            $dstSub = Join-Path $IsolatedCacheDir $sub
             if (Test-Path $srcSub) {
-                Copy-Item -Path $srcSub -Destination (Join-Path $IsolatedCacheDir $sub) -Recurse -Force
+                & robocopy.exe $srcSub $dstSub /E /MT:16 /NFL /NDL /NJH /NJS /NP | Out-Null
+                if ($LASTEXITCODE -ge 8) {
+                    throw "robocopy failed for '$srcSub' with exit code $LASTEXITCODE"
+                }
             }
         }
+        Write-Output "Warm cache copy complete."
     } else {
         Write-Warning "Default cache '$DefaultCacheDir' does not exist; starting empty isolated cache."
         New-Item -ItemType Directory -Force -Path $IsolatedCacheDir | Out-Null
@@ -375,7 +381,9 @@ try {
     }
     Push-Location $RepoRoot
     try {
-        & $ExePath @CmdArgs *>&1 | Out-File -FilePath $LogFile -Encoding utf8
+        Write-Output "Launching victory.exe (logging via cmd.exe to $LogFile)..."
+        $CmdLine = "`"$ExePath`" run --console series-s --execute `"$GameExe`" > `"$LogFile`" 2>&1"
+        & cmd.exe /d /s /c "`"$CmdLine`""
         $Rc = $LASTEXITCODE
     } finally {
         Pop-Location
