@@ -2540,6 +2540,33 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     wait.met()
 }
 
+/// Non-settling form of [`late_met`]: returns whether a bottom-of-pipe write
+/// of an already queued or landing flight is known to satisfy `wait`.
+/// False does not rule out writes from running shaders.
+pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
+    let (address, bytes) = wait.place();
+    let line = line();
+    let writes = line
+        .in_hand
+        .iter()
+        .map(|(at, what, n)| (at, what, n))
+        .chain(line.line.iter().filter_map(|item| match item {
+            Late::Write(at, what, n) => Some((at, what, n)),
+            _ => None,
+        }));
+    for (at, what, n) in writes {
+        if let crate::queue::Written::Value(v) = what
+            && *at == address
+            && *n >= bytes
+            && wait.holds_for(*v)
+        {
+            LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
@@ -5841,6 +5868,17 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// Returns whether this list's deferred bottom-of-pipe writes include a
+    /// known constant value at `address` covering at least `bytes` that passes `pred`.
+    pub(crate) fn will_write(&self, address: usize, bytes: usize, pred: impl Fn(u64) -> bool) -> bool {
+        let deferred = self.deferred();
+        deferred.writes.iter().any(|&(at, ref what, n)| {
+            at == address
+                && n >= bytes
+                && matches!(what, crate::queue::Written::Value(v) if pred(*v))
+        })
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

@@ -44,6 +44,10 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
+    /// Marker kept at the head of a queue's line while a part already popped
+    /// from it sits in `Joined`, so concurrent submissions/signals on that
+    /// queue observe `!held.is_empty()` and preserve FIFO order.
+    Running,
     /// The queue waits for the fence (its address) to reach the value.
     Wait(usize, u64),
     /// A list of the next submission waits for a memory value.
@@ -305,6 +309,180 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// where a fence may have moved: after a signal and after a submission (a
 /// list's bottom-of-pipe write may be into a fence), never from inside
 /// one.
+/// Whether ready submission parts in [`release_held`] are coalesced into one
+/// host submission (`VICTORY_JOIN_PARTS=1`, default OFF; adapted from
+/// `fxceless/victory-fork@39731795`).
+#[cfg(windows)]
+fn join_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_JOIN_PARTS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                most_parts = join_most(),
+                most_lists = join_lists(),
+                "joining consecutive ready queue parts into one host submission (VICTORY_JOIN_PARTS=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Maximum number of parts joined into one host submission (`VICTORY_JOIN_MOST`, default 8).
+#[cfg(windows)]
+fn join_most() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_MOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    })
+}
+
+/// Maximum number of host command lists joined into one host submission (`VICTORY_JOIN_LISTS`, default 32).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_LISTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(32)
+    })
+}
+
+/// Parts taken off waiting queues and not yet dispatched to the host, in run order.
+#[cfg(windows)]
+#[derive(Default)]
+struct Joined {
+    lists: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+    parts: usize,
+    /// Signals queued behind taken parts; delivered strictly after dispatch.
+    signals: Vec<(usize, u64)>,
+    /// Queue addresses holding [`Held::Running`] at index 0 while parts are staged here.
+    marked: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl Joined {
+    fn is_empty(&self) -> bool {
+        self.parts == 0
+    }
+
+    fn add(&mut self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        let (lists, order) = join(
+            std::mem::take(&mut self.lists),
+            std::mem::take(&mut self.order),
+            lists,
+            order,
+        );
+        self.lists = lists;
+        self.order = order;
+        self.parts += 1;
+    }
+
+    fn full(&self) -> bool {
+        self.parts >= join_most() || self.order.len() >= join_lists()
+    }
+
+    /// Returns whether any list already staged in `self` records a deferred
+    /// bottom-of-pipe write satisfying `wait`.
+    fn meets(&self, wait: &crate::list::ValueWait) -> bool {
+        let (address, bytes) = wait.place();
+        self.order
+            .iter()
+            .any(|&i| self.lists[i].host().will_write(address, bytes, |v| wait.holds_for(v)))
+    }
+}
+
+#[cfg(windows)]
+fn join<T>(
+    mut lists: Vec<T>,
+    mut order: Vec<usize>,
+    more: Vec<T>,
+    more_order: Vec<usize>,
+) -> (Vec<T>, Vec<usize>) {
+    let base = lists.len();
+    lists.extend(more);
+    order.extend(more_order.into_iter().map(|i| i + base));
+    (lists, order)
+}
+
+/// Parts joined, host submissions sent, total lists, post-submit signals, and
+/// waits satisfied by earlier staged parts (`VICTORY_JOIN_PARTS=1`).
+#[cfg(windows)]
+static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Dispatches `joined` to the host as a single submission, delivers queued
+/// signals strictly afterwards, and removes [`Held::Running`] markers.
+/// Caller must not hold any queue's `held` mutex.
+#[cfg(windows)]
+fn send_joined(joined: &mut Joined) {
+    if joined.parts > 0 {
+        let (lists, order) = (
+            std::mem::take(&mut joined.lists),
+            std::mem::take(&mut joined.order),
+        );
+        JOINED[0].fetch_add(joined.parts as u64, Ordering::Relaxed);
+        let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
+        JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
+        if sent.is_multiple_of(2048) {
+            let n: [u64; 5] = std::array::from_fn(|i| JOINED[i].swap(0, Ordering::Relaxed));
+            tracing::info!(
+                "parts joined (VICTORY_JOIN_PARTS=1): {} parts in {} host submissions ({:.1} parts, {:.1} lists/sub), {} signals delivered after, {} waits met by earlier staged parts",
+                n[0],
+                n[1],
+                n[0] as f64 / n[1].max(1) as f64,
+                n[2] as f64 / n[1].max(1) as f64,
+                n[3],
+                n[4],
+            );
+        }
+        if crate::host::late()
+            && let Some(host) = crate::host::host()
+        {
+            host.execute_late(lists, order);
+        } else {
+            let ran = {
+                let runs: Vec<&crate::host::HostList> =
+                    order.iter().map(|&i| lists[i].host()).collect();
+                match crate::host::host() {
+                    Some(host) => {
+                        host.execute(&runs);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if ran {
+                crate::list::recycle(lists, &order);
+            }
+        }
+        joined.parts = 0;
+    }
+    for (fence, value) in joined.signals.drain(..) {
+        if !crate::host::late_signal(fence, value) {
+            crate::fence::set(fence as This, value);
+        }
+    }
+    for q in joined.marked.drain(..) {
+        // SAFETY: live queue; only removed from `WAITING` below after draining its marker.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let mut held = lock(line);
+        if matches!(held.first(), Some(Held::Running)) {
+            held.remove(0);
+        }
+        if held.is_empty() {
+            lock(&WAITING).retain(|&w| w != q);
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
@@ -313,26 +491,39 @@ pub(crate) fn release_held(all: bool) {
         return;
     }
     let _one = lock(&RELEASING);
+    let joining = !all && crate::host::host().is_some() && join_parts();
+    let mut joined = Joined::default();
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
-                match held.first() {
-                    None => break,
+                let base = usize::from(joined.marked.contains(&q));
+                match held.get(base) {
+                    None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
+                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
+                        let known = wait.met()
+                            || (crate::host::late() && crate::host::late_met_known(wait));
+                        if !known {
+                            if !joined.meets(wait) {
+                                break;
+                            }
+                            JOINED[4].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
-                    Held::Wait(..) => {}
+                match held.remove(base) {
+                    Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -361,13 +552,29 @@ pub(crate) fn release_held(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held.iter().skip(base).take_while(|h| matches!(h, Held::Value(_))).count();
                             if waits > 0
-                                && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && matches!(held.get(base + waits), Some(Held::Run(..)))
+                                && held[base..base + waits]
+                                    .iter()
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
+                        }
+                        if joining {
+                            if !joined.marked.contains(&q) {
+                                held.insert(0, Held::Running);
+                                joined.marked.push(q);
+                            }
+                            joined.add(lists, order);
+                            if joined.full() {
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
+                            moved = true;
+                            continue;
                         }
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
@@ -406,7 +613,9 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
+                        if !joined.is_empty() {
+                            joined.signals.push((fence, value));
+                        } else if !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
@@ -418,7 +627,10 @@ pub(crate) fn release_held(all: bool) {
             }
         }
         if !moved {
-            break;
+            if joined.is_empty() {
+                break;
+            }
+            send_joined(&mut joined);
         }
     }
 }
@@ -1119,5 +1331,41 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn joined_parts_keep_their_lists_and_their_order() {
+        let (lists, order) = join(vec!["a0", "a1", "a2"], vec![2, 0, 1], vec!["b0", "b1"], vec![1, 0]);
+        let (lists, order) = join(lists, order, vec!["c0"], vec![0]);
+        assert_eq!(lists, ["a0", "a1", "a2", "b0", "b1", "c0"]);
+        let run: Vec<&str> = order.iter().map(|&i| lists[i]).collect();
+        assert_eq!(
+            run,
+            ["a2", "a0", "a1", "b1", "b0", "c0"],
+            "each part's lists in its own order, parts one after the other"
+        );
+        let (lists, order) = join(vec!["a0"], vec![0, 0], Vec::new(), Vec::new());
+        let (lists, order) = join(lists, order, vec!["b0"], vec![0, 0]);
+        let run: Vec<&str> = order.iter().map(|&i| lists[i]).collect();
+        assert_eq!(run, ["a0", "a0", "b0", "b0"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_list_will_write_matches_deferred_value_writes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let addr = 0x1234_0000usize;
+        list.defer_write(addr as *mut u8, Written::Value(99), 8);
+        assert!(list.will_write(addr, 4, |v| v == 99));
+        assert!(list.will_write(addr, 8, |v| v >= 99));
+        assert!(!list.will_write(addr + 4, 4, |v| v == 99));
+        assert!(!list.will_write(addr, 16, |v| v == 99));
+        assert!(!list.will_write(addr, 8, |v| v == 100));
     }
 }
