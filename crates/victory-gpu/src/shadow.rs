@@ -183,22 +183,32 @@ pub(crate) fn cards() -> bool {
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// The least size of a title buffer whose copy goes to the card's memory, and the
+/// most bytes of such copies (their "before" hashes not counted), both in bytes:
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 64 KiB; `VICTORY_CARD_BUFFERS_MIN_MB`
+/// overrides in MiB if explicitly set) and `VICTORY_CARD_BUFFERS_MB` (default
+/// 2048 MiB).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        // From 64 KiB (one compare piece) up and 2,048 MiB total by default:
+        // moves the ~300 small shader-written title buffers (< 1 MiB) off the
+        // CPU snapshot/compare path onto VRAM + GPU CARD_COMPARE.
+        let min_bytes = if let Ok(v) = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB")
+            && let Ok(n) = v.trim().parse::<u64>()
+        {
+            (n << 20).max(4 << 10)
+        } else {
+            let kb = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(64);
+            (kb << 10).max(4 << 10)
+        };
+        (min_bytes, mb("VICTORY_CARD_BUFFERS_MB", 2048))
     })
 }
 
