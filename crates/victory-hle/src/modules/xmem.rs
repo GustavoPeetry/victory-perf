@@ -147,6 +147,9 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // An unconstrained allocation can commit at an address unknown beforehand;
+    // take the global remap gate when scoped texture locking is active.
+    let _changing = victory_gpu::texture_scoped_remap().then(victory_gpu::title_memory_remapping);
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -329,6 +332,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // MEM_RELEASE releases the full reservation beyond any single range.
+            let _changing =
+                victory_gpu::texture_scoped_remap().then(victory_gpu::title_memory_remapping);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -656,7 +662,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(|| {
+        remapping_extent(&physical, base, n.checked_mul(PAGE)?)
+    });
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -725,7 +733,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(|| remapping_extent(&physical, to, len));
     unmap(&mut physical, to, len);
     if from == 0 {
         return true;
@@ -785,6 +793,30 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         i += run;
     }
     true
+}
+
+/// Full span possibly transiently unmapped by `unmap`, including any
+/// adjacent views at the ends whose Windows section mapping must be split and
+/// re-mapped. Returns `None` for non-page-aligned, zero-length, or overflowing spans.
+fn remapping_extent(
+    physical: &Physical,
+    base: usize,
+    len: usize,
+) -> Option<std::ops::Range<usize>> {
+    if len == 0 || !base.is_multiple_of(PAGE) {
+        return None;
+    }
+    let mut end = base.checked_add(len.checked_next_multiple_of(PAGE)?)?;
+    let mut start = base;
+    if let Some((&at, (size, _))) = physical.views.range(..=base).next_back()
+        && at.checked_add(*size)? > base
+    {
+        start = at;
+    }
+    if let Some((&at, (size, _))) = physical.views.range(..end).next_back() {
+        end = end.max(at.checked_add(*size)?);
+    }
+    Some(start..end)
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1206,6 +1238,16 @@ mod tests {
         assert!(!a.is_null() && !b.is_null());
         let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
         assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        {
+            let table = physical();
+            let base = a as usize;
+            assert_eq!(
+                remapping_extent(&table, base + PAGE, 1),
+                Some(base..base + 3 * PAGE)
+            );
+            assert_eq!(remapping_extent(&table, base + 1, PAGE), None);
+            assert_eq!(remapping_extent(&table, usize::MAX - PAGE + 1, PAGE), None);
+        }
 
         // The same page at a second address shows the same bytes.
         assert_eq!(

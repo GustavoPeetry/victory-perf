@@ -711,9 +711,26 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.size;
         let start = self.memory as usize;
+        let Some(end) = start.checked_add(size) else {
+            return 0;
+        };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let scoped = crate::watch::scoped_remap();
+        let mut early = if scoped {
+            let got = if no_wait() {
+                crate::watch::texture_reading(start, end, false)
+            } else {
+                waited(2, || crate::watch::texture_reading(start, end, true))
+            };
+            let Some(guard) = got else {
+                return self.refresh_unlocked(last, size);
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -742,20 +759,49 @@ impl Staging {
         // A texture that changed without the guard seeing it is hashed at
         // every check for a while (e.g. movie planes rotating in memory).
         let mut unseen = false;
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || {
-                if self.is_view.load(std::sync::atomic::Ordering::Relaxed) {
-                    crate::watch::writes_guarded(start, start + size)
+        let guard_on = *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"));
+        let sample_view = || {
+            if self.is_view.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::watch::writes_guarded(start, end)
+            } else {
+                crate::watch::writes_kind(start, end, true).map(|(now, w, is_view)| {
+                    if is_view {
+                        self.is_view.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (now, w)
+                })
+            }
+        };
+        let guarded = if guard_on {
+            if scoped {
+                if let Some(sample) = waited(1, || {
+                    crate::watch::texture_writes_without_arming(start, end, &self.is_view)
+                }) {
+                    Some(sample)
                 } else {
-                    crate::watch::writes_kind(start, start + size, true).map(|(now, w, is_view)| {
-                        if is_view {
-                            self.is_view.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        (now, w)
-                    })
+                    // Never acquire `ALL` while holding the narrow texture permit:
+                    // drop the narrow permit first, take `ALL` to arm aliases, then narrow.
+                    drop(early.take());
+                    let mut all = if no_wait() {
+                        let Some(all) = crate::watch::title_memory_reading_now() else {
+                            return self.refresh_unlocked(last, size);
+                        };
+                        all
+                    } else {
+                        waited(2, crate::watch::title_memory_reading)
+                    };
+                    let sample = waited(1, sample_view);
+                    all.restrict_to_texture(start, end);
+                    early = Some(all);
+                    sample
                 }
-            })
-        {
+            } else {
+                waited(1, sample_view)
+            }
+        } else {
+            None
+        };
+        if let Some((now, written)) = guarded {
             let frame = crate::frame::current();
             let every = crate::memcopy::hash_every();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -779,16 +825,18 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+        let _mapped = match early {
+            Some(guard) => guard,
+            None if no_wait() => {
+                // Not waited for: while the runtime remaps title memory the
+                // texture is read through the kernel instead, whole or not at
+                // all (`no_wait`).
+                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                    return self.refresh_unlocked(last, size);
+                };
+                mapped
+            }
+            None => waited(2, crate::watch::title_memory_reading),
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -825,7 +873,7 @@ impl Staging {
             let _ = changed;
             return size;
         }
-        if through_copy() {
+        if scoped || through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = crate::memcopy::content_hash(tiled);
                 #[cfg(feature = "diagnostics")]

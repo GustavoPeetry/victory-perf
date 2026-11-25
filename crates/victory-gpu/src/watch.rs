@@ -356,20 +356,56 @@ fn finish_writes(first: usize, last: usize, new_pages: &[usize]) -> (u64, Vec<(u
 /// Direct path for memory already known to be view-guarded: skips the failing
 /// `GetWriteWatch` kernel syscall and runs `guard()` without holding `JOURNAL`.
 pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_guarded_inner(start, end, true)
+}
+
+fn writes_guarded_inner(
+    start: usize,
+    end: usize,
+    arm_aliases: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let guarding = std::time::Instant::now();
-    let written = guard(first * PAGE, last * PAGE);
+    let written = guard_view(first * PAGE, last * PAGE, arm_aliases);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
     let written = written?;
     Some(finish_writes(first, last, &written))
 }
 
+/// Checks view-guarded texture memory without arming unguarded blocks or
+/// aliases; returns `None` when arming is required so the caller can drop its
+/// narrow scope permit and re-sample under `ALL`.
+pub(crate) fn texture_writes_without_arming(
+    start: usize,
+    end: usize,
+    is_view: &std::sync::atomic::AtomicBool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if is_view.load(Relaxed) {
+        return writes_guarded_inner(start, end, false);
+    }
+    let (now, written, view) = writes_kind_inner(start, end, true, false)?;
+    if view {
+        is_view.store(true, Relaxed);
+    }
+    Some((now, written))
+}
+
 /// Like [`writes`], also returning whether the range is view-guarded memory
 /// (`true`) so callers can cache that fact and skip future `GetWriteWatch`
 /// syscalls via [`writes_guarded`].
 pub(crate) fn writes_kind(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
+    writes_kind_inner(start, end, guarded, true)
+}
+
+fn writes_kind_inner(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    arm_aliases: bool,
+) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -425,7 +461,7 @@ pub(crate) fn writes_kind(start: usize, end: usize, guarded: bool) -> Option<(u6
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard_view(first * PAGE, last * PAGE, arm_aliases);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         found_pages = written?;
@@ -638,7 +674,12 @@ fn guards_write() -> std::sync::RwLockWriteGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_view(start, end, true)
+}
+
+fn guard_view(start: usize, end: usize, arm_aliases: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards already confirmed as a view
     // (read-only, absent, or opened by a write since last remap) needs no
     // `VirtualQuery` to Windows. The query walks page tables to the end of
@@ -670,6 +711,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if g.clean.covers(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
+    }
+    // Without holding the global reader scope, return `None` before protecting
+    // any unguarded block or arming aliases across other virtual views.
+    if !arm_aliases && view_guard() && g.protected.range(first..last).count() != last - first {
+        return None;
     }
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
@@ -1030,36 +1076,123 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+mod scoped;
+
+/// Whether texture snapshots use range-scoped remap locks instead of the
+/// global `MAPPING` `RwLock` (`VICTORY_TEXTURE_SCOPED_REMAP=1`, opt-in).
+pub fn scoped_remap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SCOPED_REMAP").is_some_and(|s| s == "1"))
+}
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    _mapping: std::sync::RwLockWriteGuard<'static, ()>,
+    _scope: Option<scoped::Permit<'static>>,
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    title_memory_remapping_in(|| None)
+}
+
+/// Scoped variant of [`title_memory_remapping`]: derives the whole affected
+/// address range via `area` before waiting for overlapping readers, falling
+/// back to the global range if `None` or empty.
+pub fn title_memory_remapping_in(
+    area: impl FnOnce() -> Option<std::ops::Range<usize>>,
+) -> Remapping {
+    let _scope = scoped_remap().then(|| {
+        let region = area().filter(|r| r.start < r.end).unwrap_or(scoped::ALL);
+        scoped::GATE.write(region)
+    });
+    Remapping {
+        _mapping: MAPPING.write().unwrap_or_else(|e| e.into_inner()),
+        _scope,
+    }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading {
+    _mapping: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _scope: Option<scoped::Permit<'static>>,
+}
+
+fn texture_area(start: usize, end: usize) -> std::ops::Range<usize> {
+    end.checked_next_multiple_of(BLOCK)
+        .map(|stop| (start / BLOCK * BLOCK)..stop)
+        .filter(|r| r.start < r.end)
+        .unwrap_or(scoped::ALL)
+}
+
+impl Reading {
+    /// Narrows a global `ALL` reader permit down to `[start, end)` after
+    /// view guards and aliases have been armed.
+    pub(crate) fn restrict_to_texture(&mut self, start: usize, end: usize) {
+        if let Some(scope) = &mut self._scope {
+            scope.narrow(texture_area(start, end));
+        }
+    }
+}
+
+pub(crate) fn texture_reading(start: usize, end: usize, wait: bool) -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE
+            .read(texture_area(start, end), wait)
+            .map(|scope| Reading {
+                _mapping: None,
+                _scope: Some(scope),
+            });
+    }
+    if wait {
+        Some(title_memory_reading())
+    } else {
+        title_memory_reading_now()
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    if scoped_remap() {
+        return Reading {
+            _mapping: None,
+            _scope: scoped::GATE.read(scoped::ALL, true),
+        };
+    }
+    Reading {
+        _mapping: Some(MAPPING.read().unwrap_or_else(|e| e.into_inner())),
+        _scope: None,
+    }
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE
+            .read(scoped::ALL, false)
+            .map(|scope| Reading {
+                _mapping: None,
+                _scope: Some(scope),
+            });
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading {
+            _mapping: Some(guard),
+            _scope: None,
+        }),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading {
+            _mapping: Some(e.into_inner()),
+            _scope: None,
+        }),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
@@ -1774,6 +1907,22 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn texture_writes_without_arming_requires_protected_blocks() {
+        let _serial = lock_guards();
+        let is_view = std::sync::atomic::AtomicBool::new(false);
+        let (section, one, two) = two_views(BLOCK);
+        assert!(texture_writes_without_arming(one, one + BLOCK, &is_view).is_none());
+        assert!(writable(two), "alias must not be armed before global scope");
+        assert!(guard(one, one + BLOCK).is_some());
+        is_view.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!writable(two), "alias is armed once full guard ran");
+        let (_, written) = texture_writes_without_arming(one, one + BLOCK, &is_view)
+            .expect("already-armed clean texture succeeds without arming aliases");
+        assert!(written.is_empty());
+        drop_views(section, &[one, two], BLOCK);
     }
 }
 
