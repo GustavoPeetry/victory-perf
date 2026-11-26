@@ -21,11 +21,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL, D3D12_RAYTRACING_GEOMETRY_DESC,
     D3D12_RAYTRACING_GEOMETRY_DESC_0, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
     D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC, D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-    D3D12_RAYTRACING_INSTANCE_DESC, D3D12_RAYTRACING_TIER_1_0, D3D12_RAYTRACING_TIER_1_1,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
-    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RAYTRACING_INSTANCE_DESC, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_RESOURCE_UAV_BARRIER,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device,
     ID3D12Device5, ID3D12Fence, ID3D12GraphicsCommandList4, ID3D12Resource,
@@ -88,7 +87,7 @@ pub fn stats() -> DxrStats {
 /// Queries `D3D12_FEATURE_DATA_D3D12_OPTIONS5` for `RaytracingTier`.
 ///
 /// Returned integer codes follow D3D12 (`0` = Not Supported, `10` = Tier 1.0,
-/// `11` = Tier 1.1).
+/// `11` = Tier 1.1, `12` = Tier 1.2).
 pub fn probe_tier(device: &ID3D12Device) -> Option<u32> {
     let mut opts5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
     // SAFETY: `device` is live and `opts5` matches `D3D12_FEATURE_D3D12_OPTIONS5`.
@@ -102,13 +101,10 @@ pub fn probe_tier(device: &ID3D12Device) -> Option<u32> {
     if hr.is_err() {
         return None;
     }
-    let tier_code = if opts5.RaytracingTier == D3D12_RAYTRACING_TIER_1_1 {
-        11
-    } else if opts5.RaytracingTier == D3D12_RAYTRACING_TIER_1_0 {
-        10
-    } else {
-        0
-    };
+    let tier_code = u32::try_from(opts5.RaytracingTier.0)
+        .ok()
+        .filter(|&v| v >= 10)
+        .unwrap_or(0);
     DXR_TIER.store(tier_code, Ordering::Relaxed);
     Some(tier_code)
 }
@@ -440,6 +436,7 @@ mod tests {
             return;
         }
         let s = super::run_isolated_smoke(&host.device).expect("DXR BLAS/TLAS smoke build");
+        println!("DXR_SMOKE_RESULT={s:?}");
         assert!(s.tier >= 10);
         assert!(s.blas_builds >= 1);
         assert!(s.tlas_builds >= 1);

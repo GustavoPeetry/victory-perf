@@ -1280,7 +1280,13 @@ mod tests {
         let saving_tail_pct = 100.0 * (1.0 - tail_mapped as f64 / virt as f64);
         let saving_mip3_pct = 100.0 * (1.0 - mip3_mapped as f64 / virt as f64);
 
-        let dxr = crate::dxr_proto::run_isolated_smoke(&device).ok();
+        let dxr = match crate::dxr_proto::run_isolated_smoke(&device) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                println!("REA002_BENCH_DXR_ERR={e}");
+                None
+            }
+        };
         println!(
             "REA002_BENCH_SPARSE_4K_BC7 tier={:?} virt_bytes={} tail_mapped_bytes={} tail_saving_pct={:.2} \
              mip3_mapped_bytes={} mip3_saving_pct={:.2} create_us={create_us} map_tail_us={tail_us} map_mip3_us={mip3_us} \
