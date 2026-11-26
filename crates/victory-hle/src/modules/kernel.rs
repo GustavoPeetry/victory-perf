@@ -395,6 +395,45 @@ fn refuse(file: &str) {
     }
 }
 
+/// Windows `GROUP_AFFINITY` (16 bytes on x64).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GroupAffinity {
+    pub mask: usize,
+    pub group: u16,
+    pub reserved: [u16; 3],
+}
+
+/// Adapts a thread affinity mask onto desktop topology when `VICTORY_REA_HOST_SCHEDULER=1`.
+pub extern "system" fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize {
+    let adapted = victory_core::scheduler::adapt_title_affinity(mask);
+    host::set_thread_affinity_mask(thread, adapted)
+}
+
+/// Adapts group affinity onto desktop topology when `VICTORY_REA_HOST_SCHEDULER=1`.
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    group_affinity: *const GroupAffinity,
+    previous: *mut GroupAffinity,
+) -> i32 {
+    if group_affinity.is_null() {
+        return host::set_thread_group_affinity(thread, group_affinity, previous);
+    }
+    if !victory_core::scheduler::enabled() {
+        return host::set_thread_group_affinity(thread, group_affinity, previous);
+    }
+    // SAFETY: title passed a readable GROUP_AFFINITY structure.
+    let mut adjusted = unsafe { *group_affinity };
+    adjusted.mask = victory_core::scheduler::adapt_title_affinity(adjusted.mask);
+    host::set_thread_group_affinity(thread, &raw const adjusted, previous)
+}
+
+/// Clamps extreme title thread priorities when `VICTORY_REA_HOST_SCHEDULER=1`.
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    let adapted = victory_core::scheduler::clamp_title_priority(priority);
+    host::set_thread_priority(thread, adapted)
+}
+
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
 pub(crate) fn module() -> HleModule {
@@ -405,6 +444,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -430,6 +470,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadAffinityMask),
+            hle_export!(SetThreadGroupAffinity),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -578,6 +621,40 @@ mod host {
             .collect();
         names.join(" < ")
     }
+
+    pub(super) fn set_thread_affinity_mask(thread: *mut c_void, mask: usize) -> usize {
+        // SAFETY: forwarding title thread handle and affinity mask to Win32.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetThreadAffinityMask(thread, mask)
+        }
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        thread: *mut c_void,
+        group_affinity: *const super::GroupAffinity,
+        previous: *mut super::GroupAffinity,
+    ) -> i32 {
+        use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+        const {
+            assert!(size_of::<super::GroupAffinity>() == size_of::<GROUP_AFFINITY>());
+            assert!(align_of::<super::GroupAffinity>() == align_of::<GROUP_AFFINITY>());
+        }
+        // SAFETY: layout asserted identical to `GROUP_AFFINITY`.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetThreadGroupAffinity(
+                thread,
+                group_affinity.cast::<GROUP_AFFINITY>(),
+                previous.cast::<GROUP_AFFINITY>(),
+            )
+        }
+    }
+
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: forwarding title thread handle and priority to Win32.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority)
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -646,6 +723,22 @@ mod host {
 
     pub(super) fn callers() -> String {
         String::new()
+    }
+
+    pub(super) fn set_thread_affinity_mask(_: *mut c_void, _: usize) -> usize {
+        0
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        _: *mut c_void,
+        _: *const super::GroupAffinity,
+        _: *mut super::GroupAffinity,
+    ) -> i32 {
+        0
+    }
+
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        0
     }
 }
 
@@ -809,5 +902,29 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thread_scheduling_overrides_resolve_and_pass_through_when_disabled() {
+        assert!(!victory_core::scheduler::enabled());
+        assert_eq!(
+            crate::registry::lookup("kernel32.dll", "SetThreadPriority"),
+            Some(SetThreadPriority as *const () as usize)
+        );
+        assert_eq!(
+            crate::registry::lookup("kernel32.dll", "SetThreadAffinityMask"),
+            Some(SetThreadAffinityMask as *const () as usize)
+        );
+        assert_eq!(
+            crate::registry::lookup(
+                "api-ms-win-core-processtopology-l1-1-0.dll",
+                "SetThreadGroupAffinity"
+            ),
+            Some(SetThreadGroupAffinity as *const () as usize)
+        );
+        // With scheduler disabled by default, priority & affinity helpers return exact inputs.
+        assert_eq!(victory_core::scheduler::adapt_title_affinity(0x1), 0x1);
+        assert_eq!(victory_core::scheduler::clamp_title_priority(15), 15);
     }
 }

@@ -1326,9 +1326,14 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let baseline = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = victory_core::scheduler::shadow_workers(baseline);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                victory_core::scheduler::apply_current_thread_role(
+                    victory_core::scheduler::ThreadRole::ShadowWorker,
+                    i,
+                );
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {

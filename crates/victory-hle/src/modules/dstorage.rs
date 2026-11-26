@@ -422,12 +422,13 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let baseline = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = victory_core::scheduler::streaming_workers(baseline);
         let started = (0..workers)
-            .filter(|i| {
+            .filter(|&i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || work(scheduler, i))
                     .is_ok()
             })
             .count();
@@ -489,7 +490,11 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 }
 
 /// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn work(scheduler: &'static Scheduler, worker_index: usize) {
+    victory_core::scheduler::apply_current_thread_role(
+        victory_core::scheduler::ThreadRole::StreamingIo,
+        worker_index,
+    );
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {

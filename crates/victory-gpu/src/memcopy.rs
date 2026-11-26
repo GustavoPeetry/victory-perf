@@ -283,9 +283,14 @@ fn pool() -> &'static Pool {
         more: Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| n.get() / 6).clamp(1, 3);
+        let baseline = std::thread::available_parallelism().map_or(2, |n| n.get() / 6).clamp(1, 3);
+        let n = victory_core::scheduler::memcopy_workers(baseline);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-texprep-{i}")).spawn(move || {
+                victory_core::scheduler::apply_current_thread_role(
+                    victory_core::scheduler::ThreadRole::ShadowWorker,
+                    i,
+                );
                 let pool = POOL.get().expect("made above");
                 loop {
                     let job = {

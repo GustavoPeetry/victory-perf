@@ -244,6 +244,10 @@ fn disposer() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
         std::thread::Builder::new()
             .name("victory-retire".into())
             .spawn(move || {
+                victory_core::scheduler::apply_current_thread_role(
+                    victory_core::scheduler::ThreadRole::BackgroundTelemetry,
+                    0,
+                );
                 while let Ok(batch) = rx.recv() {
                     drop(batch);
                 }
@@ -6971,6 +6975,13 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        static SUBMIT_ROLE: std::sync::Once = std::sync::Once::new();
+        SUBMIT_ROLE.call_once(|| {
+            victory_core::scheduler::apply_current_thread_role(
+                victory_core::scheduler::ThreadRole::RenderSubmit,
+                0,
+            );
+        });
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
