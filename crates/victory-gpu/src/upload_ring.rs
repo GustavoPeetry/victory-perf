@@ -507,16 +507,21 @@ mod tests {
             checkout_upload(&device, 32 << 10, 0).expect("alloc pooled buffer");
         let raw1 = res1.as_raw() as usize;
         assert_eq!(cap1, 64 << 10);
-        // Retire at submission 5; before finished=5 it must NOT be reused!
-        return_upload(res1, ptr1, cap1, 5);
+        // Retire at `retired_at` ahead of any finished host submissions; before then it must NOT be reused!
+        let retired_at = crate::host::finished_submission().saturating_add(5);
+        return_upload(res1, ptr1, cap1, retired_at);
         assert!(
-            UPLOAD_POOL.lock().unwrap().take(cap1, 4).is_none(),
-            "in-flight retired buffer must not be reused before fence reaches submission 5"
+            UPLOAD_POOL
+                .lock()
+                .unwrap()
+                .take(cap1, retired_at - 1)
+                .is_none(),
+            "in-flight retired buffer must not be reused before fence reaches submission {retired_at}"
         );
 
         let before_hits = stats().pool_hits;
         let (res2, _ptr2, cap2) =
-            checkout_upload(&device, 40 << 10, 5).expect("reuse pooled buffer");
+            checkout_upload(&device, 40 << 10, retired_at).expect("reuse pooled buffer");
         assert_eq!(cap2, 64 << 10);
         assert_eq!(
             res2.as_raw() as usize,

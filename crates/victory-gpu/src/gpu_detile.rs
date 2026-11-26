@@ -456,11 +456,15 @@ impl GpuDetiler {
 
         // Prepare tiled buffer via upload_ring when active, else transient upload resource.
         let tiled_bytes = align_up(tiled.len() as u64, 256);
-        let pooled_tiled = crate::upload_ring::checkout_upload(
-            &self.device,
-            tiled_bytes,
-            crate::host::finished_submission(),
-        );
+        let pooled_tiled = if crate::upload_ring::enabled() {
+            crate::upload_ring::checkout_upload(
+                &self.device,
+                tiled_bytes,
+                crate::host::finished_submission(),
+            )
+        } else {
+            None
+        };
         let tiled_res = if let Some((res, ptr, _)) = &pooled_tiled {
             RING_HITS.fetch_add(1, Ordering::Relaxed);
             // SAFETY: pooled upload resource mapped for at least `tiled.len()` bytes.
