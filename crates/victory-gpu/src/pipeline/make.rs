@@ -542,6 +542,9 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    active: usize,
+    active_early: usize,
+    pressure: Option<(Instant, bool)>,
 }
 
 impl Queue {
@@ -549,6 +552,9 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            active: 0,
+            active_early: 0,
+            pressure: None,
         }
     }
 
@@ -557,6 +563,10 @@ impl Queue {
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
+            return None;
+        }
+        if priority == EARLY && compile_guard() && self.early.len() >= 64 {
+            // Leave it unqueued. A draw or dispatch can still request it.
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
@@ -568,15 +578,63 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+    fn pop(&mut self, reserve: bool, pressure: bool) -> Option<(Arc<Pending>, bool)> {
+        if pressure && self.active != 0 {
+            return None;
+        }
+        let (p, early) = if let Some(p) = self.requested.pop_front() {
+            (p, false)
+        } else {
+            if pressure || (reserve && self.active_early != 0) {
+                return None;
+            }
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+            let p = std::iter::from_fn(|| self.early.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
+            (p, true)
+        };
         p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        if reserve {
+            self.active += 1;
+            self.active_early += usize::from(early);
+        }
+        Some((p, early))
     }
+
+    fn under_pressure(&mut self) -> bool {
+        if let Some((at, pressured)) = self.pressure
+            && at.elapsed() < Duration::from_millis(250)
+        {
+            return pressured;
+        }
+        let pressured = memory_under_pressure();
+        self.pressure = Some((Instant::now(), pressured));
+        pressured
+    }
+
+    fn finished(&mut self, early: bool) {
+        self.active -= 1;
+        self.active_early -= usize::from(early);
+    }
+}
+
+fn compile_guard() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_PIPELINE_COMPILE_GUARD").is_some_and(|v| v == "1")
+    })
+}
+
+fn memory_under_pressure() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut memory = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer is initialized with its size and writable.
+    let available = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    available && (memory.ullAvailPhys < GIB + GIB / 2 || memory.ullAvailPageFile < 2 * GIB)
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -589,6 +647,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
         return;
     }
     if !workers() {
+        if priority == EARLY && compile_guard() {
+            return;
+        }
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
         }
@@ -606,13 +667,21 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next(guarded: bool) -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        let pressure = guarded && queue.under_pressure();
+        if let Some(p) = queue.pop(guarded, pressure) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = if pressure && (!queue.early.is_empty() || !queue.requested.is_empty()) {
+            AVAILABLE
+                .wait_timeout(queue, Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+        } else {
+            AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner())
+        };
     }
 }
 
@@ -624,6 +693,7 @@ fn workers() -> bool {
         let baseline =
             std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         let workers = victory_core::scheduler::shader_workers(baseline);
+        let guarded = compile_guard();
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -639,7 +709,15 @@ fn workers() -> bool {
                         i,
                     );
                     loop {
-                        next().make();
+                        let (job, early) = next(guarded);
+                        job.make();
+                        if guarded {
+                            QUEUE
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .finished(early);
+                            AVAILABLE.notify_all();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -655,6 +733,47 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn speculative_jobs_leave_capacity_for_requested_work() {
+        let mut queue = Queue::new();
+        let slow = Arc::new(Pending::new(vec![], None));
+        let needed = Arc::new(Pending::new(vec![], None));
+        assert_eq!(queue.push(&slow, EARLY), Some(true));
+        assert_eq!(queue.push(&needed, EARLY), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true, false).unwrap().0, &slow));
+        assert!(queue.pop(true, false).is_none());
+        assert_eq!(queue.push(&needed, REQUESTED), Some(false));
+        let (job, early) = queue.pop(true, false).unwrap();
+        assert!(Arc::ptr_eq(&job, &needed));
+        assert!(!early);
+        queue.finished(early);
+        queue.finished(true);
+        assert!(queue.pop(true, false).is_none());
+    }
+
+    #[test]
+    fn low_memory_skips_speculation_but_allows_requested_progress() {
+        let mut queue = Queue::new();
+        let early = Arc::new(Pending::new(vec![], None));
+        let first = Arc::new(Pending::new(vec![], None));
+        let second = Arc::new(Pending::new(vec![], None));
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert!(queue.pop(true, true).is_none());
+        assert_eq!(queue.push(&first, REQUESTED), Some(true));
+        assert_eq!(queue.push(&second, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true, true).unwrap().0, &first));
+        assert!(queue.pop(true, true).is_none());
+        queue.finished(false);
+        assert!(Arc::ptr_eq(&queue.pop(true, true).unwrap().0, &second));
+        queue.finished(false);
+        assert!(Arc::ptr_eq(&queue.pop(true, false).unwrap().0, &early));
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
