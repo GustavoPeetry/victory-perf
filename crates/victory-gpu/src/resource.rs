@@ -556,14 +556,14 @@ fn twin_texture(
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
-            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
+            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, None))
         })
     } else {
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
     Some(std::sync::Arc::new(Twin {
-        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS, None)),
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
@@ -1124,8 +1124,10 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
-    /// The bytes the host gives it.
+    /// The bytes the host gives it (committed bytes; 0 for sparse reserved textures).
     bytes: u64,
+    /// Sparse mip residency binding when placed as a D3D12 Reserved Resource.
+    sparse: Option<std::sync::Arc<crate::tiles::SparseBinding>>,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
@@ -1307,10 +1309,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some((texture, sparse)) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
+        if let Some(ref binding) = sparse {
+            binding.set_authority_va(r.data() as usize);
+        }
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -1324,7 +1329,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             );
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
-        let mut host = HostTexture::new(texture, state);
+        let mut host = HostTexture::new(texture, state, sparse);
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1725,7 +1730,51 @@ fn evict_under_vram_pressure(idle_ms: u64) {
         return;
     }
     let goal = budget / 100 * room_percent().max(90).saturating_sub(6);
-    let target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
+    let mut target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
+
+    // Sparse reclamation pass: unmap cold fine mips (retaining packed tails) before
+    // evicting whole textures from descriptor heaps.
+    if crate::tiles::reclaim_enabled()
+        && let Some(host_ctx) = crate::host::host()
+    {
+        let bindings: Vec<std::sync::Arc<crate::tiles::SparseBinding>> = {
+            let all = textures();
+            let mut out = Vec::new();
+            for &at in all.iter() {
+                // SAFETY: `at` is live while `TEXTURES` is locked.
+                let r = unsafe { &*(at as *const Resource) };
+                if let Some((host_tex, _)) = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                    && let Some(ref sparse) = host_tex.sparse
+                {
+                    out.push(sparse.clone());
+                }
+            }
+            out
+        };
+        let now_sub = crate::host::started_submission();
+        let fin_sub = crate::host::finished_submission();
+        let now_ms = crate::host::now_ms();
+        let mut reclaimed_total = 0u64;
+        for b in bindings {
+            if reclaimed_total >= target {
+                break;
+            }
+            reclaimed_total += b.reclaim_cold_mips(
+                &host_ctx.queue,
+                now_sub,
+                fin_sub,
+                now_ms,
+                target.saturating_sub(reclaimed_total),
+            );
+        }
+        if reclaimed_total > 0 {
+            crate::accounting::invalidate_budget_cache();
+            target = target.saturating_sub(reclaimed_total);
+            if target == 0 {
+                return;
+            }
+        }
+    }
 
     // Pass 1: gather LRU candidates under `TEXTURES` lock, then drop it before
     // touching descriptor heaps so lock ordering stays strictly acyclic.
@@ -1748,7 +1797,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                 && crate::host::references(&host.texture) > 1
             {
                 let raw = windows::core::Interface::as_raw(&host.texture) as usize;
-                out.push((last_used, at, raw, host.bytes));
+                out.push((last_used, at, raw, host.physical_bytes()));
             }
         }
         out
@@ -1896,17 +1945,31 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        sparse: Option<std::sync::Arc<crate::tiles::SparseBinding>>,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
-        let bytes = host_bytes(&texture);
+        let is_sparse = sparse.is_some();
+        let bytes = if is_sparse { 0 } else { host_bytes(&texture) };
+        let virtual_bytes = sparse.as_ref().map_or(0, |s| s.virtual_bytes);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        crate::accounting::on_texture_created(bytes, virtual_bytes, is_sparse);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
+            sparse,
             filled: false,
         }
+    }
+
+    pub(crate) fn physical_bytes(&self) -> u64 {
+        self.sparse
+            .as_ref()
+            .map_or(self.bytes, |s| s.mapped_bytes())
     }
 }
 
@@ -1914,12 +1977,15 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let is_sparse = self.sparse.is_some();
+        let virtual_bytes = self.sparse.as_ref().map_or(0, |s| s.virtual_bytes);
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
+        crate::accounting::on_texture_destroyed(self.bytes, virtual_bytes, is_sparse);
     }
 }
 
@@ -1970,6 +2036,35 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Ensure physical tiles are mapped for `first_mip..mips_total` when `this`
+/// is backed by a D3D12 sparse Reserved Resource. Returns `Some(effective_first)`
+/// for sparse resources (combining `first_mip` with title-committed mips when
+/// `first_mip == 0`), or `None` for normal committed textures.
+#[cfg(windows)]
+pub(crate) fn ensure_resident_mips(this: This, first_mip: u32, mips_total: u32) -> Option<u32> {
+    if !crate::tiles::enabled() || this.is_null() {
+        return None;
+    }
+    let (host_tex, _) = hosted(this, false)?;
+    let sparse = host_tex.sparse.as_ref()?;
+    let host_ctx = crate::host::host()?;
+    let active_first = if first_mip == 0 && mips_total < u32::MAX {
+        crate::texture::committed_mip_floor_for(this, mips_total)
+    } else if first_mip >= mips_total && mips_total != u32::MAX {
+        mips_total.saturating_sub(1)
+    } else {
+        first_mip
+    };
+    sparse.ensure_resident(
+        &host_ctx.queue,
+        active_first,
+        crate::host::started_submission(),
+        crate::host::finished_submission(),
+        crate::host::now_ms(),
+    );
+    Some(active_first)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -1977,7 +2072,10 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    Option<std::sync::Arc<crate::tiles::SparseBinding>>,
+)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2027,6 +2125,28 @@ fn host_texture(
         }
         value
     });
+    let initial_state = D3D12_RESOURCE_STATES(
+        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+    );
+    let clear_ptr = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast());
+
+    // Front A: if sparse residency is enabled and eligible, allocate via D3D12
+    // Reserved Resource with 0 initial physical VRAM tiles.
+    // SAFETY: `d` matches D3D12_RESOURCE_DESC layout checked above.
+    let d3d_desc = unsafe { *(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+    if crate::tiles::eligible(&host.device, &d3d_desc)
+        && let Some((res, binding)) =
+            crate::tiles::SparseBinding::create(&host.device, &d3d_desc, initial_state, clear_ptr)
+    {
+        crate::host::name(&res, || {
+            format!(
+                "sparse texture {}x{} f{} mips {} flags {:#x}",
+                d.width, d.height, d.mip_levels, d.format, d.flags
+            )
+        });
+        return Some((res, Some(binding)));
+    }
+
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2039,11 +2159,9 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            initial_state,
             // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+            clear_ptr,
             &mut texture,
         )
     };
@@ -2055,7 +2173,7 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.

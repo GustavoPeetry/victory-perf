@@ -61,6 +61,8 @@ pub(crate) struct Staging {
     /// Set once a texture's memory turns out to be view-guarded so future
     /// refreshes skip the failing `GetWriteWatch` syscall.
     is_view: std::sync::atomic::AtomicBool,
+    /// Minimum mip index mapped on a backing sparse Reserved Resource (`u32::MAX` if non-sparse or unset).
+    resident_first: std::sync::atomic::AtomicU32,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
 }
@@ -468,6 +470,9 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    if crate::tiles::enabled() {
+        let _ = crate::resource::ensure_resident_mips(resource, 0, u32::MAX);
+    }
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -593,6 +598,23 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    let sparse_first = if crate::tiles::enabled() {
+        // SAFETY: live D3D12 resource.
+        let mips_total = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        crate::resource::ensure_resident_mips(resource, first, mips_total)
+    } else {
+        None
+    };
+    if let Some(af) = sparse_first {
+        let prev = staging.resident_first.swap(af, Relaxed);
+        if prev != u32::MAX && af < prev {
+            staging.uploaded.store(false, Relaxed);
+            staging.dirty.store(true, Relaxed);
+            let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+            last.partial = None;
+            last.hash = None;
+        }
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
@@ -611,6 +633,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if let Some(af) = sparse_first
+            && staging.part(i).0 < af
+        {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -1344,10 +1371,159 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         is_view: std::sync::atomic::AtomicBool::new(false),
+        resident_first: std::sync::atomic::AtomicU32::new(u32::MAX),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Find the smallest standard mip whose console memory range has committed pages,
+/// keeping unstreamed finer mips unmapped in sparse Reserved Resources.
+pub(crate) fn committed_mip_floor(
+    at: *const u8,
+    layout: &victory_formats::texture::Layout,
+) -> u32 {
+    use victory_formats::texture::Dimension;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+
+    if at.is_null()
+        || layout.size == 0
+        || layout.slices != 1
+        || layout.thick
+        || layout.desc.samples != 1
+        || layout.desc.swizzle.xor()
+        || layout.desc.dimension == Dimension::Tex3d
+    {
+        return 0;
+    }
+
+    let tail = layout
+        .first_tail_mip
+        .min(layout.desc.mips.saturating_sub(1));
+    let base = at as usize;
+    let total = layout.size as usize;
+    let end = base.saturating_add(total);
+
+    let mut committed_spans: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = base;
+    while cursor < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQuery(
+                cursor as *const _,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || info.RegionSize == 0 {
+            break;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        let span_start = cursor.saturating_sub(base) as u64;
+        let span_end = region_end.saturating_sub(base) as u64;
+        let readable =
+            info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        if readable && span_end > span_start {
+            // Fast path: whole resource resides in a single committed VAD region.
+            if span_start == 0 && span_end >= layout.size {
+                return 0;
+            }
+            committed_spans.push((span_start, span_end));
+        }
+        if region_end <= cursor {
+            break;
+        }
+        cursor = region_end;
+    }
+
+    if committed_spans.is_empty() {
+        return tail;
+    }
+
+    let std_limit = (layout.first_tail_mip as usize).min(layout.mips.len());
+    for mip in 0..std_limit {
+        let info = &layout.mips[mip];
+        let m_start = info.offset;
+        let m_len = u64::from(info.pitch)
+            * u64::from(info.rows)
+            * u64::from(layout.desc.element_bytes);
+        let m_end = m_start.saturating_add(m_len);
+        if m_end > m_start
+            && committed_spans
+                .iter()
+                .any(|&(s, e)| m_start < e && s < m_end)
+        {
+            return mip as u32;
+        }
+    }
+
+    tail
+}
+
+/// Resolve the sparse committed mip floor for `resource`'s title allocation.
+pub(crate) fn committed_mip_floor_for(resource: This, mips_total: u32) -> u32 {
+    let Some((mem, desc)) = crate::resource::texture_memory(resource) else {
+        return 0;
+    };
+    let Some(t) = crate::resource::texture_layout(&desc) else {
+        return 0;
+    };
+    committed_mip_floor(mem, &t.planes[0].layout).min(mips_total.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod sparse_floor_tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    #[test]
+    fn committed_mip_floor_skips_uncommitted_high_res_mips() {
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 11,
+            element_bytes: 4,
+            block: 1,
+            swizzle: Swizzle(9),
+            samples: 1,
+        };
+        let layout = Layout::new(&desc).expect("valid layout");
+        assert!(layout.first_tail_mip > 1);
+        let total = layout.size as usize;
+        // Reserve virtual address space with ZERO physical committed pages first.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+
+        let floor_empty = committed_mip_floor(base.cast(), &layout);
+        assert_eq!(floor_empty, layout.first_tail_mip);
+
+        // Commit only the tail region at offset 0 (coarsest mips).
+        let tail_bytes = layout.bytes_from(layout.first_tail_mip) as usize;
+        let ptr = unsafe { VirtualAlloc(base, tail_bytes.max(4096), MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!ptr.is_null());
+        let floor_tail = committed_mip_floor(base.cast(), &layout);
+        assert_eq!(floor_tail, layout.first_tail_mip);
+
+        // Commit the whole texture including mip 0 -> floor drops to 0.
+        let ptr_all = unsafe { VirtualAlloc(base, total, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!ptr_all.is_null());
+        let floor_full = committed_mip_floor(base.cast(), &layout);
+        assert_eq!(floor_full, 0);
+
+        unsafe {
+            let _ = VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
 }
 
 #[cfg(test)]

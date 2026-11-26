@@ -65,6 +65,8 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+pub mod tiles;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;

@@ -38,7 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -75,6 +75,16 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn started_submission() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+#[cfg(windows)]
+pub(crate) fn finished_submission() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
@@ -246,6 +256,7 @@ fn disposer() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    crate::tiles::maintenance_drain(finished);
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
