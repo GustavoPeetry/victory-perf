@@ -258,10 +258,11 @@ fn disposer() -> Option<&'static std::sync::mpsc::Sender<Vec<(u64, Retired)>>> {
     .as_ref()
 }
 
-/// Drops what waited for submissions up to `finished`.
-fn bury(finished: u64) {
-    crate::tiles::maintenance_drain(finished);
-    let done: Vec<(u64, Retired)> = {
+    /// Drops what waited for submissions up to `finished`.
+    fn bury(finished: u64) {
+        crate::tiles::maintenance_drain(finished);
+        crate::upload_ring::drain_pool(finished);
+        let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
@@ -1977,6 +1978,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Bucketed upload buffers returned to `upload_ring` when the list clears.
+    pooled_uploads: Vec<(ID3D12Resource, *mut u8, u64)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2014,13 +2017,25 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    fn hold_pooled_upload(&mut self, buffer: ID3D12Resource, data: *mut u8, bucket_bytes: u64) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(bucket_bytes, Ordering::Relaxed);
+        self.upload_bytes += bucket_bytes;
+        self.pooled_uploads.push((buffer, data, bucket_bytes));
+    }
+
     /// Clears all per-recording entries while keeping container capacities so
     /// repeated `HostList::reset` calls do not churn heap allocations.
     fn clear(&mut self) {
-        if !self.uploads.is_empty() {
-            ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        if !self.uploads.is_empty() || !self.pooled_uploads.is_empty() {
+            let count = (self.uploads.len() + self.pooled_uploads.len()) as u64;
+            ALIVE[6].fetch_sub(count, Ordering::Relaxed);
             ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
             self.uploads.clear();
+            let sub = STARTED.load(Ordering::Acquire);
+            for (buf, ptr, cap) in self.pooled_uploads.drain(..) {
+                crate::upload_ring::return_upload(buf, ptr, cap, sub);
+            }
             self.upload_bytes = 0;
         }
         self.copies.clear();
@@ -2036,7 +2051,8 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        let count = (self.uploads.len() + self.pooled_uploads.len()) as u64;
+        ALIVE[6].fetch_sub(count, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
 }
@@ -6182,6 +6198,18 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if crate::upload_ring::enabled()
+            && let Some((buffer, data, cap)) = crate::upload_ring::checkout_upload(
+                &host.device,
+                size,
+                FINISHED.load(Ordering::Acquire),
+            )
+        {
+            name(&buffer, || format!("list pooled upload {cap:#x}"));
+            self.deferred()
+                .hold_pooled_upload(buffer.clone(), data, cap);
+            return Some((buffer, data));
+        }
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);

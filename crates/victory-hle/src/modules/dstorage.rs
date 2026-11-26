@@ -562,7 +562,15 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, request) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let staging_limit = if async_streaming_enabled() && cached_low_ram_pressure() {
+            (self.staging / 2).max(16 << 20)
+        } else {
+            self.staging
+        };
+        if self.staged > 0 && self.staged + staging > staging_limit {
+            if staging_limit < self.staging {
+                LOW_RAM_THROTTLES.fetch_add(1, Ordering::Relaxed);
+            }
             self.starved = true;
             self.refused += 1;
             return None;
@@ -877,34 +885,74 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        thread_local! {
+            static TL_BOUNCE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
         return into_destination(request, size, |out| {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            with_scratch_vec(&TL_BOUNCE, size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
+    let decode_dest = |src_bytes: &[u8]| -> Result<(), HRESULT> {
+        into_destination(request, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, src_bytes, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(src_bytes, out).map_err(|hr| fail(hr, "zlib")),
+        })
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+
+    thread_local! {
+        static TL_SOURCE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        static TL_PACKED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if async_streaming_enabled() {
+        let src_len = request.source_size as usize;
+        if request.options & MEMORY_SOURCE != 0 {
+            // SAFETY: title source stays valid until request completion.
+            let src_slice = unsafe { std::slice::from_raw_parts(request.source.cast::<u8>(), src_len) };
+            if bc != 0 && options & ZLIB != 0 {
+                with_scratch_vec(&TL_PACKED, request.intermediate_size as usize, |packed| {
+                    let n = inflate(src_slice, packed).map_err(|hr| fail(hr, "zlib"))?;
+                    decode_dest(&packed[..n])
+                })?;
+            } else {
+                decode_dest(src_slice)?;
+            }
+        } else {
+            with_scratch_vec(&TL_SOURCE, src_len, |src_buf| {
+                read_into(request, src_buf).map_err(|hr| fail(hr, "reading the source"))?;
+                if bc != 0 && options & ZLIB != 0 {
+                    with_scratch_vec(&TL_PACKED, request.intermediate_size as usize, |packed| {
+                        let n = inflate(src_buf, packed).map_err(|hr| fail(hr, "zlib"))?;
+                        decode_dest(&packed[..n])
+                    })
+                } else {
+                    decode_dest(src_buf)
+                }
+            })?;
+        }
+    } else {
+        let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+        // The console's order: zlib first, then BCPack.
+        let source = if bc != 0 && options & ZLIB != 0 {
+            let mut packed = vec![0; request.intermediate_size as usize];
+            let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+            packed.truncate(n);
+            Cow::Owned(packed)
+        } else {
+            source
+        };
+        decode_dest(&source)?;
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1015,6 +1063,106 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     Ok(Cow::Owned(bytes))
 }
 
+static SCRATCH_REUSES: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_BYTES_SAVED: AtomicU64 = AtomicU64::new(0);
+static LOW_RAM_THROTTLES: AtomicU64 = AtomicU64::new(0);
+static PAGE_DEST_NOTIFIES: AtomicU64 = AtomicU64::new(0);
+
+/// Telemetry snapshot for DirectStorage async streaming optimizations (`VICTORY_REA_ASYNC_STREAMING=1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamingStats {
+    pub enabled: bool,
+    pub scratch_reuses: u64,
+    pub scratch_bytes_saved: u64,
+    pub low_ram_throttles: u64,
+    pub page_dest_notifies: u64,
+}
+
+fn async_streaming_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_REA_ASYNC_STREAMING")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            });
+        if on {
+            tracing::info!("VICTORY_REA_ASYNC_STREAMING=1: DStorage scratch reuse, page-dest coherence, and low-RAM backpressure enabled");
+        }
+        on
+    })
+}
+
+pub fn streaming_stats() -> StreamingStats {
+    StreamingStats {
+        enabled: async_streaming_enabled(),
+        scratch_reuses: SCRATCH_REUSES.load(Ordering::Relaxed),
+        scratch_bytes_saved: SCRATCH_BYTES_SAVED.load(Ordering::Relaxed),
+        low_ram_throttles: LOW_RAM_THROTTLES.load(Ordering::Relaxed),
+        page_dest_notifies: PAGE_DEST_NOTIFIES.load(Ordering::Relaxed),
+    }
+}
+
+/// Cap on retained per-worker scratch vectors (64 MiB).
+const MAX_TL_SCRATCH_CAP: usize = 64 << 20;
+
+fn with_scratch_vec<R>(
+    cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u8>>>,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    if !async_streaming_enabled() {
+        let mut owned = vec![0u8; len];
+        return f(&mut owned);
+    }
+    cell.with_borrow_mut(|buf| {
+        let cap_before = buf.capacity();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        if cap_before >= len && len > 0 {
+            SCRATCH_REUSES.fetch_add(1, Ordering::Relaxed);
+            SCRATCH_BYTES_SAVED.fetch_add(len as u64, Ordering::Relaxed);
+        }
+        let out = f(&mut buf[..len]);
+        if buf.capacity() > MAX_TL_SCRATCH_CAP {
+            *buf = Vec::new();
+        }
+        out
+    })
+}
+
+#[cfg(windows)]
+fn cached_low_ram_pressure() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static CACHE: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+    const LOW_RAM_FLOOR: u64 = 2 << 30; // 2 GiB physical free floor for 16 GiB hosts
+
+    if let Ok(guard) = CACHE.try_lock()
+        && let Some((at, low)) = *guard
+        && at.elapsed() < std::time::Duration::from_millis(50)
+    {
+        return low;
+    }
+    let mut mem = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    let low = unsafe {
+        GlobalMemoryStatusEx(&mut mem) != 0 && mem.ullAvailPhys < LOW_RAM_FLOOR
+    };
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), low));
+    }
+    low
+}
+
+#[cfg(not(windows))]
+fn cached_low_ram_pressure() -> bool {
+    false
+}
+
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
@@ -1071,47 +1219,52 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        if async_streaming_enabled() {
+            let dst_addr = window.bytes().as_ptr() as usize;
+            victory_gpu::kernel_will_write(dst_addr, len);
+            PAGE_DEST_NOTIFIES.fetch_add(1, Ordering::Relaxed);
+        }
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
-    });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+    thread_local! {
+        static TL_DEST: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    if written {
-        if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+    with_scratch_vec(&TL_DEST, len, |data| {
+        let n = fill(data)?;
+        // A page the title has just made, or a view the host refuses for a moment (commit
+        // or address space short while a load maps many at once), can come right a little
+        // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
+        // about 1.5 s in all).
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        });
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
         }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
-            options = format_args!("{:#x}", request.options),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        if written {
+            if tries > 0 {
+                tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            }
+            Ok(())
+        } else {
+            let known = super::xmem::pages_known(pages, offset, len);
+            tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+            tracing::warn!(
+                offset,
+                len,
+                pages = pages.len(),
+                first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+                options = format_args!("{:#x}", request.options),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            );
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// The page numbers of a destination. The title fills the array after it
@@ -1788,5 +1941,39 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn scratch_reuse_recycles_capacity_under_async_streaming() {
+        const CHILD: &str = "VICTORY_TEST_DSTORAGE_SCRATCH_CHILD";
+        const OK: &str = "dstorage scratch reuse passed";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::dstorage::tests::scratch_reuse_recycles_capacity_under_async_streaming",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_REA_ASYNC_STREAMING", "1")
+                .output()
+                .expect("spawn dstorage scratch test child");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains(OK),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(async_streaming_enabled());
+        thread_local! {
+            static TL_TEST: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let p1 = with_scratch_vec(&TL_TEST, 65536, |b| b.as_ptr() as usize);
+        let p2 = with_scratch_vec(&TL_TEST, 4096, |b| b.as_ptr() as usize);
+        assert_eq!(p1, p2, "thread-local scratch must reuse same backing buffer without reallocating");
+        assert!(streaming_stats().scratch_reuses >= 1);
+        println!("{OK}");
     }
 }

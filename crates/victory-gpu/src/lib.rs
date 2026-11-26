@@ -67,6 +67,8 @@ pub mod signature;
 #[cfg(windows)]
 pub mod tiles;
 #[cfg(windows)]
+pub mod upload_ring;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
