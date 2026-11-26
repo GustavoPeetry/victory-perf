@@ -24,6 +24,9 @@ fn register_rea_telemetry() {
                 fast_clzero_bytes: s.fast_clzero_bytes,
                 fast_monitorx_calls: s.fast_monitorx_calls,
                 fast_mwaitx_calls: s.fast_mwaitx_calls,
+                wait_yields: s.wait_yields,
+                wait_sleeps: s.wait_sleeps,
+                wait_early_wakes: s.wait_early_wakes,
                 emu_total: s.emu_total,
                 emu_zeroed_bytes: s.emu_zeroed_bytes,
             }

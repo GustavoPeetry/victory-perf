@@ -24,6 +24,9 @@ pub struct CpuTelemetry {
     pub fast_clzero_bytes: u64,
     pub fast_monitorx_calls: u64,
     pub fast_mwaitx_calls: u64,
+    pub wait_yields: u64,
+    pub wait_sleeps: u64,
+    pub wait_early_wakes: u64,
     pub emu_total: u64,
     pub emu_zeroed_bytes: u64,
 }
@@ -344,7 +347,7 @@ pub(crate) fn log_window(
              \"dirty_calls\":{},\"dirty_bytes\":{},\"dirty_subsumed\":{},\"dirty_coalesced\":{},\"dirty_raw\":{},\
              \"auth_gpu\":{},\"auth_skipped_cmp\":{},\"tls_hits\":{tls_hits},\"tls_misses\":{tls_misses},\"barriers_elided\":{barriers_elided},\
              \"dyn_allocs\":{dyn_allocs},\"dyn_wraps\":{dyn_wraps},\"dyn_refusals\":{dyn_refusals},\
-             \"clzero_fast_calls\":{},\"clzero_fast_bytes\":{},\"wait_fast_calls\":{},\"emu_total\":{},\
+             \"clzero_fast_calls\":{},\"clzero_fast_bytes\":{},\"wait_fast_calls\":{},\"wait_yields\":{},\"wait_sleeps\":{},\"wait_early_wakes\":{},\"emu_total\":{},\
              \"scratch_reuses\":{},\"scratch_bytes_saved\":{},\"copy_queue_batches\":{},\"copy_queue_bytes\":{},\
              \"dxr_tier\":{},\"ffx_0x218_calls\":{}}}",
             pacing.p50_ms,
@@ -377,6 +380,9 @@ pub(crate) fn log_window(
             cpu.fast_clzero_calls,
             cpu.fast_clzero_bytes,
             cpu.fast_monitorx_calls + cpu.fast_mwaitx_calls,
+            cpu.wait_yields,
+            cpu.wait_sleeps,
+            cpu.wait_early_wakes,
             cpu.emu_total,
             stream.scratch_reuses,
             stream.scratch_bytes_saved,

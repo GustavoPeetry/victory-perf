@@ -9,9 +9,9 @@
 //! fence-gated cold-mip reclamation (`VICTORY_REA_SPARSE_RECLAIM=1`), and
 //! O(1) incremental accounting / authority tracking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -51,7 +51,7 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| {
         let on = parse_bool_env("VICTORY_REA_SPARSE_TEXTURES", false);
         if on {
-            let reclaim = parse_bool_env("VICTORY_REA_SPARSE_RECLAIM", true);
+            let reclaim = parse_bool_env("VICTORY_REA_SPARSE_RECLAIM", false);
             tracing::info!(
                 min_kb = min_bytes() >> 10,
                 reclaim,
@@ -62,11 +62,12 @@ pub fn enabled() -> bool {
     })
 }
 
-/// Whether cold high-res standard mips may be unmapped back to the pool (`VICTORY_REA_SPARSE_RECLAIM`,
-/// defaults ON whenever `VICTORY_REA_SPARSE_TEXTURES=1` unless explicitly set to `0`).
+/// Whether cold high-res standard mips may be unmapped back to the pool
+/// (`VICTORY_REA_SPARSE_RECLAIM=1`, default OFF in REA-003 for bindless safety;
+/// even when enabled, never unmaps resources with live descriptor pins or pending fences).
 pub fn reclaim_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| enabled() && parse_bool_env("VICTORY_REA_SPARSE_RECLAIM", true))
+    *ON.get_or_init(|| enabled() && parse_bool_env("VICTORY_REA_SPARSE_RECLAIM", false))
 }
 
 /// Minimum virtual resource size to manage sparsely (`VICTORY_REA_SPARSE_MIN_KB`, default 256 KiB).
@@ -459,6 +460,13 @@ impl TilePoolState {
 
 static POOL: Mutex<TilePoolState> = Mutex::new(TilePoolState::new());
 static TILE_MAP_LOCK: Mutex<()> = Mutex::new(());
+static BINDINGS: RwLock<Option<HashMap<usize, Weak<SparseBinding>>>> = RwLock::new(None);
+
+/// Serializes `ID3D12CommandQueue::ExecuteCommandLists` in [`crate::host`]
+/// against `UpdateTileMappings` on the same D3D12 direct command queue.
+pub(crate) fn queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    TILE_MAP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 static SPARSE_TEXTURES_CREATED: AtomicU64 = AtomicU64::new(0);
 static SPARSE_TEXTURES_ALIVE: AtomicU64 = AtomicU64::new(0);
@@ -467,6 +475,39 @@ static TILE_MAP_OPS: AtomicU64 = AtomicU64::new(0);
 static TILE_UNMAP_OPS: AtomicU64 = AtomicU64::new(0);
 static TILES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SPARSE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_SKIPPED_LIVE_DESCS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII pin held inside descriptor heaps while any SRV/UAV slot views this
+/// reserved resource, guaranteeing `reclaim_cold_mips` sees live bindless refs.
+pub(crate) struct SparseDescriptorPin {
+    binding: Arc<SparseBinding>,
+}
+
+impl Drop for SparseDescriptorPin {
+    fn drop(&mut self) {
+        let _ =
+            self.binding
+                .live_descriptors
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
+    }
+}
+
+/// Pins `resource` in descriptor-heap residency tracking if it was created as a
+/// sparse reserved resource.
+pub(crate) fn pin_descriptor_resource(resource: &ID3D12Resource) -> Option<SparseDescriptorPin> {
+    let raw = resource.as_raw() as usize;
+    let binding = {
+        let map = BINDINGS.read().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&raw)?.upgrade()?
+    };
+    binding.live_descriptors.fetch_add(1, Ordering::AcqRel);
+    binding
+        .last_gpu_sub
+        .fetch_max(crate::host::started_submission(), Ordering::AcqRel);
+    Some(SparseDescriptorPin { binding })
+}
 
 #[derive(Clone, Debug, Default)]
 struct MipExtents {
@@ -487,6 +528,7 @@ struct BindingState {
 pub(crate) struct SparseBinding {
     device: ID3D12Device,
     resource: ID3D12Resource,
+    raw_resource: usize,
     pub(crate) virtual_bytes: u64,
     authority_va: AtomicUsize,
     mip_levels: u32,
@@ -498,6 +540,10 @@ pub(crate) struct SparseBinding {
     mapped_tiles_count: AtomicU32,
     mip_last_submission: [AtomicU64; MAX_TRACKED_MIPS],
     mip_last_ms: [AtomicU64; MAX_TRACKED_MIPS],
+    live_descriptors: AtomicU32,
+    last_gpu_sub: AtomicU64,
+    pending_fence_sub: AtomicU64,
+    title_requested_mips: AtomicU64,
     dropped: AtomicBool,
     state: Mutex<BindingState>,
 }
@@ -522,6 +568,7 @@ pub struct SparseStats {
     pub tile_unmap_ops: u64,
     pub tiles_reclaimed_total: u64,
     pub sparse_fallbacks: u64,
+    pub reclaim_skipped_live_descriptors: u64,
 }
 
 impl SparseBinding {
@@ -536,8 +583,8 @@ impl SparseBinding {
         let mut reserved = *desc;
         reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
         reserved.Alignment = 0;
-        let allowed_clear = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
-            | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        let allowed_clear =
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         let clear_value = if (reserved.Flags & allowed_clear) != D3D12_RESOURCE_FLAG_NONE {
             clear_value
         } else {
@@ -593,9 +640,11 @@ impl SparseBinding {
         SPARSE_TEXTURES_CREATED.fetch_add(1, Ordering::Relaxed);
         SPARSE_TEXTURES_ALIVE.fetch_add(1, Ordering::Relaxed);
 
+        let raw_resource = resource.as_raw() as usize;
         let binding = Arc::new(Self {
             device: device.clone(),
             resource: resource.clone(),
+            raw_resource,
             virtual_bytes,
             authority_va: AtomicUsize::new(0),
             mip_levels,
@@ -607,6 +656,10 @@ impl SparseBinding {
             mapped_tiles_count: AtomicU32::new(0),
             mip_last_submission: [const { AtomicU64::new(0) }; MAX_TRACKED_MIPS],
             mip_last_ms: [const { AtomicU64::new(0) }; MAX_TRACKED_MIPS],
+            live_descriptors: AtomicU32::new(0),
+            last_gpu_sub: AtomicU64::new(0),
+            pending_fence_sub: AtomicU64::new(0),
+            title_requested_mips: AtomicU64::new(0),
             dropped: AtomicBool::new(false),
             state: Mutex::new(BindingState {
                 packed_mapped: false,
@@ -616,6 +669,11 @@ impl SparseBinding {
                 standard: vec![MipExtents::default(); num_standard_mips as usize],
             }),
         });
+        BINDINGS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(raw_resource, Arc::downgrade(&binding));
 
         Some((resource, binding))
     }
@@ -680,6 +738,10 @@ impl SparseBinding {
         }
         self.touch_mips(first_mip, now_submission, now_ms);
         let want_mask = self.required_mask(first_mip);
+        self.title_requested_mips
+            .fetch_or(want_mask, Ordering::Release);
+        self.last_gpu_sub
+            .fetch_max(now_submission, Ordering::AcqRel);
         if (self.mapped_mips_mask.load(Ordering::Acquire) & want_mask) == want_mask {
             return 0;
         }
@@ -995,9 +1057,29 @@ impl SparseBinding {
         TILE_UNMAP_OPS.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Releases title residency requirement for fine mips (`0..up_to_mip`),
+    /// permitting opt-in cold reclaim once no descriptor or GPU fence references them.
+    #[cfg(test)]
+    pub(crate) fn release_title_mips(&self, up_to_mip: u32) {
+        if up_to_mip == 0 {
+            return;
+        }
+        let clear = if up_to_mip >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << up_to_mip) - 1
+        };
+        self.title_requested_mips
+            .fetch_and(!clear, Ordering::Release);
+    }
+
     /// Reclaim higher-detail standard mips (`0..num_standard_mips`, never touching packed
-    /// mip tail) that have been idle longer than `RECLAIM_IDLE_SUBMISSIONS` & `RECLAIM_IDLE_MS`.
-    /// Returns reclaimed bytes.
+    /// mip tail) that are unreferenced by live descriptors, pending fences, title
+    /// residency requirements, and recent GPU submissions/time.
+    ///
+    /// Returns reclaimed bytes. Unmapped tiles retire behind a strictly advancing
+    /// fence and are NEVER drained synchronously in the same call.
+    #[cfg(test)]
     pub(crate) fn reclaim_cold_mips(
         &self,
         queue: &ID3D12CommandQueue,
@@ -1006,11 +1088,45 @@ impl SparseBinding {
         now_ms: u64,
         max_reclaim_bytes: u64,
     ) -> u64 {
+        self.reclaim_cold_mips_with_base_refs(
+            queue,
+            now_submission,
+            finished_submission,
+            now_ms,
+            max_reclaim_bytes,
+            1,
+        )
+    }
+
+    /// Reclaim higher-detail standard mips allowing up to `base_com_refs`
+    /// expected internal COM references (1 for standalone `SparseBinding`,
+    /// 2 when `HostTexture` also owns a clone of `ID3D12Resource`).
+    pub(crate) fn reclaim_cold_mips_with_base_refs(
+        &self,
+        queue: &ID3D12CommandQueue,
+        now_submission: u64,
+        finished_submission: u64,
+        now_ms: u64,
+        max_reclaim_bytes: u64,
+        base_com_refs: u32,
+    ) -> u64 {
         if !reclaim_enabled() || self.dropped.load(Ordering::Relaxed) || max_reclaim_bytes == 0 {
+            return 0;
+        }
+        if self.live_descriptors.load(Ordering::Acquire) > 0
+            || crate::host::references(&self.resource) > base_com_refs
+        {
+            RECLAIM_SKIPPED_LIVE_DESCS.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        if self.pending_fence_sub.load(Ordering::Acquire) > finished_submission
+            || finished_submission < self.last_gpu_sub.load(Ordering::Acquire)
+        {
             return 0;
         }
 
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let title_req = self.title_requested_mips.load(Ordering::Acquire);
         let mut reclaimed_bytes = 0u64;
         let mut to_retire = Vec::new();
 
@@ -1021,8 +1137,13 @@ impl SparseBinding {
             if !st.standard[mip as usize].mapped {
                 continue;
             }
+            if mip < 64 && (title_req & (1u64 << mip)) != 0 {
+                continue;
+            }
             let idx = (mip as usize).min(MAX_TRACKED_MIPS - 1);
-            let last_sub = self.mip_last_submission[idx].load(Ordering::Relaxed);
+            let last_sub = self.mip_last_submission[idx]
+                .load(Ordering::Relaxed)
+                .max(self.last_gpu_sub.load(Ordering::Relaxed));
             let last_ms = self.mip_last_ms[idx].load(Ordering::Relaxed);
             let sub_idle = finished_submission.saturating_sub(last_sub) >= RECLAIM_IDLE_SUBMISSIONS;
             let time_idle = now_ms.saturating_sub(last_ms) >= RECLAIM_IDLE_MS;
@@ -1053,9 +1174,12 @@ impl SparseBinding {
         }
 
         if !to_retire.is_empty() {
+            // Unmapped tiles stay retired strictly after the upcoming GPU fence
+            // so in-flight work completes before any pool chunk is recycled.
+            let retire_sub = now_submission.max(finished_submission).saturating_add(1);
+            self.pending_fence_sub.store(retire_sub, Ordering::Release);
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-            pool.retire(now_submission, to_retire);
-            pool.drain_retired(finished_submission);
+            pool.retire(retire_sub, to_retire);
         }
         reclaimed_bytes
     }
@@ -1087,6 +1211,11 @@ impl SparseBinding {
 
 impl Drop for SparseBinding {
     fn drop(&mut self) {
+        if let Ok(mut map) = BINDINGS.write()
+            && let Some(ref mut map) = *map
+        {
+            map.remove(&self.raw_resource);
+        }
         let va = self.authority_va.swap(0, Ordering::Relaxed);
         if va != 0 {
             authority::unregister_range(va, self.virtual_bytes as usize);
@@ -1131,6 +1260,7 @@ pub fn stats() -> SparseStats {
         tile_unmap_ops: TILE_UNMAP_OPS.load(Ordering::Relaxed),
         tiles_reclaimed_total: TILES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
         sparse_fallbacks: SPARSE_FALLBACKS.load(Ordering::Relaxed),
+        reclaim_skipped_live_descriptors: RECLAIM_SKIPPED_LIVE_DESCS.load(Ordering::Relaxed),
     }
 }
 
@@ -1351,5 +1481,119 @@ mod tests {
         binding.retire_all(1);
         POOL.lock().unwrap().drain_retired(1);
         drop(res);
+    }
+
+    #[test]
+    fn default_reclaim_policy_is_safe_and_disabled() {
+        assert!(
+            !reclaim_enabled(),
+            "aggressive sparse cold-mip reclaim must default OFF to protect bindless resources"
+        );
+    }
+
+    #[test]
+    fn live_descriptor_pin_blocks_sparse_reclaim_until_released() {
+        const CHILD: &str = "VICTORY_TEST_SPARSE_PIN_BLOCKS_RECLAIM";
+        const OK: &str = "sparse descriptor pin safety assertions passed";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tiles::tests::live_descriptor_pin_blocks_sparse_reclaim_until_released",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_REA_SPARSE_TEXTURES", "1")
+                .env("VICTORY_REA_SPARSE_RECLAIM", "1")
+                .output()
+                .expect("spawn sparse pin safety test");
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains(OK),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        assert!(enabled());
+        assert!(reclaim_enabled());
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            println!("{OK}");
+            return;
+        }
+        let device = device.unwrap();
+        let sup = query_tiled_support(&device);
+        if !sup.supported {
+            println!("{OK}");
+            return;
+        }
+        let queue: ID3D12CommandQueue = unsafe {
+            device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 11,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let (res, binding) =
+            SparseBinding::create(&device, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None).unwrap();
+        let mapped = binding.ensure_resident(&queue, 0, 1, 0, 100);
+        assert!(mapped > 0);
+        assert!(binding.num_standard_mips > 0);
+
+        // Pin via descriptor heap guard: even after huge idle submission & ms deltas,
+        // `reclaim_cold_mips` MUST refuse to unmap any mip!
+        let pin =
+            pin_descriptor_resource(&res).expect("pin must match registered reserved resource");
+        drop(res);
+        binding.release_title_mips(binding.num_standard_mips);
+        let skipped_before = RECLAIM_SKIPPED_LIVE_DESCS.load(Ordering::Relaxed);
+        let reclaimed_while_pinned = binding.reclaim_cold_mips(&queue, 500, 490, 50_000, 64 << 20);
+        assert_eq!(reclaimed_while_pinned, 0);
+        assert!(RECLAIM_SKIPPED_LIVE_DESCS.load(Ordering::Relaxed) > skipped_before);
+        let mapped_after_blocked = binding.mapped_bytes();
+
+        // Once the descriptor slot drops its pin and GPU catches up (`finished_submission >= last_gpu_sub`),
+        // safe reclaim unmaps idle standard mips WITHOUT prematurely draining retired pool extents!
+        drop(pin);
+        let retired_before = POOL.lock().unwrap().retired.len();
+        let reclaimed = binding.reclaim_cold_mips(&queue, 500, 490, 50_000, 64 << 20);
+        assert!(reclaimed > 0);
+        assert!(binding.mapped_bytes() < mapped_after_blocked);
+        let retired_after = POOL.lock().unwrap().retired.len();
+        assert!(
+            retired_after > retired_before,
+            "unmapped extents must remain in retired queue until GPU fence advances"
+        );
+        assert_eq!(
+            binding.pending_fence_sub.load(Ordering::Acquire),
+            501,
+            "pending fence must strictly advance beyond current submission"
+        );
+
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        unsafe { queue.Signal(&fence, 1).unwrap() };
+        while unsafe { fence.GetCompletedValue() } < 1 {
+            std::thread::yield_now();
+        }
+        binding.retire_all(501);
+        POOL.lock().unwrap().drain_retired(501);
+        println!("{OK}");
     }
 }

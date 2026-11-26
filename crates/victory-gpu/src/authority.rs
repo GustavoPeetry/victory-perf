@@ -39,6 +39,8 @@ struct AuthorityEntry {
     cpu_reads: u32,
     demoted_once: bool,
     readback_verified: bool,
+    generation: u64,
+    epoch: u64,
 }
 
 impl AuthorityEntry {
@@ -64,20 +66,31 @@ impl Shard {
 
 struct AuthorityTable {
     shards: [Shard; SHARDS],
+    /// Ranges spanning multiple 64 KiB shards live here so cross-shard
+    /// queries never miss a buffer registered under a different shard index.
+    spanning: RwLock<Vec<AuthorityEntry>>,
 }
 
 impl AuthorityTable {
     const fn new() -> Self {
         Self {
             shards: [const { Shard::new() }; SHARDS],
+            spanning: RwLock::new(Vec::new()),
         }
     }
 }
 
 static TABLE: AuthorityTable = AuthorityTable::new();
+static SPANNING_COUNT: AtomicU64 = AtomicU64::new(0);
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static CURRENT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 static PROMOTED_GPU_AUTH: AtomicU64 = AtomicU64::new(0);
 static DEMOTED_TO_SHARED: AtomicU64 = AtomicU64::new(0);
+static CPU_WRITE_DEMOTES: AtomicU64 = AtomicU64::new(0);
+static EPOCH_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_PAGE_SPLITS: AtomicU64 = AtomicU64::new(0);
+static AMBIGUOUS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED_BEFORE_TWINS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED_CARD_COMPARES: AtomicU64 = AtomicU64::new(0);
 static CLASS_COUNTS: [AtomicU64; 7] = [
@@ -106,6 +119,12 @@ pub struct AuthorityStats {
     pub demoted_to_shared: u64,
     pub skipped_before_twins: u64,
     pub skipped_card_compares: u64,
+    pub cpu_write_demotes: u64,
+    pub epoch_invalidations: u64,
+    pub partial_page_splits: u64,
+    pub ambiguous_fallbacks: u64,
+    pub current_epoch: u64,
+    pub generation_counter: u64,
 }
 
 fn parse_bool(name: &str) -> bool {
@@ -144,6 +163,28 @@ fn shard_index(start: usize) -> usize {
 }
 
 #[inline]
+fn spans_multiple_shards(start: usize, end: usize) -> bool {
+    start < end && (start >> 16) != (end.saturating_sub(1) >> 16)
+}
+
+fn shards_for_range(start: usize, end: usize) -> Vec<usize> {
+    if start >= end {
+        return Vec::new();
+    }
+    let first = start >> 16;
+    let last = end.saturating_sub(1) >> 16;
+    let span = last.saturating_sub(first);
+    if span + 1 >= SHARDS {
+        return (0..SHARDS).collect();
+    }
+    let mut out = Vec::with_capacity(span + 1);
+    for p in first..=last {
+        out.push(p & (SHARDS - 1));
+    }
+    out
+}
+
+#[inline]
 fn record_class_delta(old: Option<AuthorityClass>, new: Option<AuthorityClass>) {
     if let Some(c) = old {
         let idx = c as usize;
@@ -162,8 +203,13 @@ pub fn register_range(start: usize, len: usize, class: AuthorityClass, readback_
         return;
     }
     let end = start.saturating_add(len);
-    let idx = shard_index(start);
-    let mut entries = TABLE.shards[idx].entries.write().unwrap();
+    let epoch = CURRENT_EPOCH.load(Ordering::Acquire);
+    let is_spanning = spans_multiple_shards(start, end);
+    let mut entries = if is_spanning {
+        TABLE.spanning.write().unwrap()
+    } else {
+        TABLE.shards[shard_index(start)].entries.write().unwrap()
+    };
     if let Some(existing) = entries
         .iter_mut()
         .find(|e| e.start == start && e.end == end)
@@ -179,12 +225,14 @@ pub fn register_range(start: usize, len: usize, class: AuthorityClass, readback_
         let prev = existing.class;
         existing.class = class;
         existing.readback_verified |= readback_verified;
+        existing.epoch = epoch;
         if prev != class {
             record_class_delta(Some(prev), Some(class));
         }
         return;
     }
 
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
     entries.push(AuthorityEntry {
         start,
         end,
@@ -193,26 +241,57 @@ pub fn register_range(start: usize, len: usize, class: AuthorityClass, readback_
         cpu_reads: 0,
         demoted_once: false,
         readback_verified,
+        generation,
+        epoch,
     });
+    if is_spanning {
+        SPANNING_COUNT.fetch_add(1, Ordering::Release);
+    }
     record_class_delta(None, Some(class));
 }
 
-/// Remove a destroyed or unmapped VA range `[start, start + len)`.
+/// Remove a destroyed or unmapped VA range `[start, start + len)`, advancing the
+/// epoch so future allocations reusing this VA cannot inherit stale GPU authority.
 pub fn unregister_range(start: usize, len: usize) {
     if len == 0 {
         return;
     }
     let end = start.saturating_add(len);
-    let idx = shard_index(start);
-    let mut entries = TABLE.shards[idx].entries.write().unwrap();
-    let mut i = 0;
-    while i < entries.len() {
-        if entries[i].start == start && entries[i].end == end {
-            let removed = entries.swap_remove(i);
-            record_class_delta(Some(removed.class), None);
-        } else {
-            i += 1;
+    let epoch = CURRENT_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut removed_any = false;
+
+    let prune = |entries: &mut Vec<AuthorityEntry>, spanning: bool, removed_any: &mut bool| {
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i].start == start && entries[i].end == end {
+                let removed = entries.swap_remove(i);
+                record_class_delta(Some(removed.class), None);
+                if spanning {
+                    let _ =
+                        SPANNING_COUNT.fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(1))
+                        });
+                }
+                *removed_any = true;
+            } else {
+                if entries[i].overlaps(start, end) {
+                    entries[i].epoch = epoch;
+                }
+                i += 1;
+            }
         }
+    };
+
+    for idx in shards_for_range(start, end) {
+        let mut entries = TABLE.shards[idx].entries.write().unwrap();
+        prune(&mut entries, false, &mut removed_any);
+    }
+    if spans_multiple_shards(start, end) || SPANNING_COUNT.load(Ordering::Acquire) > 0 {
+        let mut entries = TABLE.spanning.write().unwrap();
+        prune(&mut entries, true, &mut removed_any);
+    }
+    if removed_any {
+        EPOCH_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -223,40 +302,32 @@ pub fn class_for(start: usize, len: usize) -> AuthorityClass {
         return AuthorityClass::SharedCoherent;
     }
     let end = start.saturating_add(len);
-    // Ranges larger than 64 KiB can touch adjacent shards; scan the primary shard
-    // and check neighbor shards if it spans a 64 KiB boundary.
-    let first_shard = shard_index(start);
-    let last_shard = shard_index(end.saturating_sub(1));
     let mut found: Option<AuthorityClass> = None;
 
-    let mut visit = |idx: usize| {
-        let entries = TABLE.shards[idx].entries.read().unwrap();
-        for e in entries.iter() {
+    let mut visit = |entries: &[AuthorityEntry]| {
+        for e in entries {
             if e.overlaps(start, end) {
                 found = Some(match (found, e.class) {
                     (None, c) => c,
                     (Some(AuthorityClass::SharedCoherent), _)
                     | (_, AuthorityClass::SharedCoherent) => AuthorityClass::SharedCoherent,
                     (Some(a), b) if a == b => a,
-                    _ => AuthorityClass::SharedCoherent,
+                    _ => {
+                        AMBIGUOUS_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        AuthorityClass::SharedCoherent
+                    }
                 });
             }
         }
     };
 
-    visit(first_shard);
-    if last_shard != first_shard {
-        // Bounded check on the endpoint shard and up to 4 intervening shards for medium ranges.
-        let mut s = first_shard;
-        let mut steps = 0usize;
-        while s != last_shard && steps < 4 {
-            s = (s + 1) & (SHARDS - 1);
-            visit(s);
-            steps += 1;
-        }
-        if s != last_shard {
-            visit(last_shard);
-        }
+    for idx in shards_for_range(start, end) {
+        let entries = TABLE.shards[idx].entries.read().unwrap();
+        visit(&entries);
+    }
+    if SPANNING_COUNT.load(Ordering::Acquire) > 0 {
+        let entries = TABLE.spanning.read().unwrap();
+        visit(&entries);
     }
 
     found.unwrap_or(AuthorityClass::SharedCoherent)
@@ -278,38 +349,84 @@ pub fn observe_gpu_write(
         return;
     }
     let end = start.saturating_add(len);
-    let idx = shard_index(start);
-    let mut entries = TABLE.shards[idx].entries.write().unwrap();
-    for e in entries.iter_mut() {
-        if !e.overlaps(start, end) {
-            continue;
+    let threshold = if strict_mode() { 4 } else { 2 };
+
+    let visit = |entries: &mut [AuthorityEntry]| {
+        for e in entries.iter_mut() {
+            if !e.overlaps(start, end) {
+                continue;
+            }
+            if readback_flagged {
+                if !matches!(e.class, AuthorityClass::SharedCoherent) {
+                    let prev = e.class;
+                    e.class = AuthorityClass::SharedCoherent;
+                    record_class_delta(Some(prev), Some(AuthorityClass::SharedCoherent));
+                }
+                continue;
+            }
+            if !readback_proven_complete {
+                continue;
+            }
+            e.gpu_writes = e.gpu_writes.saturating_add(1);
+            if e.class == AuthorityClass::SharedCoherent
+                && !e.demoted_once
+                && e.cpu_reads == 0
+                && e.gpu_writes >= threshold
+            {
+                e.class = AuthorityClass::GpuAuthoritative;
+                record_class_delta(
+                    Some(AuthorityClass::SharedCoherent),
+                    Some(AuthorityClass::GpuAuthoritative),
+                );
+                PROMOTED_GPU_AUTH.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        if readback_flagged {
-            if !matches!(e.class, AuthorityClass::SharedCoherent) {
+    };
+
+    for idx in shards_for_range(start, end) {
+        let mut entries = TABLE.shards[idx].entries.write().unwrap();
+        visit(&mut entries);
+    }
+    if SPANNING_COUNT.load(Ordering::Acquire) > 0 {
+        let mut entries = TABLE.spanning.write().unwrap();
+        visit(&mut entries);
+    }
+}
+
+fn demote_overlap(start: usize, end: usize, count_cpu_write: bool) -> bool {
+    let mut demoted = false;
+    let mut visit = |entries: &mut [AuthorityEntry]| {
+        for e in entries.iter_mut() {
+            if !e.overlaps(start, end) {
+                continue;
+            }
+            e.cpu_reads = e.cpu_reads.saturating_add(1);
+            e.demoted_once = true;
+            if matches!(
+                e.class,
+                AuthorityClass::GpuAuthoritative | AuthorityClass::GpuOnly
+            ) {
                 let prev = e.class;
                 e.class = AuthorityClass::SharedCoherent;
                 record_class_delta(Some(prev), Some(AuthorityClass::SharedCoherent));
+                DEMOTED_TO_SHARED.fetch_add(1, Ordering::Relaxed);
+                if count_cpu_write {
+                    CPU_WRITE_DEMOTES.fetch_add(1, Ordering::Relaxed);
+                }
+                demoted = true;
             }
-            continue;
         }
-        if !readback_proven_complete {
-            continue;
-        }
-        e.gpu_writes = e.gpu_writes.saturating_add(1);
-        let threshold = if strict_mode() { 4 } else { 2 };
-        if e.class == AuthorityClass::SharedCoherent
-            && !e.demoted_once
-            && e.cpu_reads == 0
-            && e.gpu_writes >= threshold
-        {
-            e.class = AuthorityClass::GpuAuthoritative;
-            record_class_delta(
-                Some(AuthorityClass::SharedCoherent),
-                Some(AuthorityClass::GpuAuthoritative),
-            );
-            PROMOTED_GPU_AUTH.fetch_add(1, Ordering::Relaxed);
-        }
+    };
+
+    for idx in shards_for_range(start, end) {
+        let mut entries = TABLE.shards[idx].entries.write().unwrap();
+        visit(&mut entries);
     }
+    if SPANNING_COUNT.load(Ordering::Acquire) > 0 {
+        let mut entries = TABLE.spanning.write().unwrap();
+        visit(&mut entries);
+    }
+    demoted
 }
 
 /// Observe a CPU read / copy-back / unexpected shadow probe overlapping `[start, start + len)`.
@@ -320,28 +437,39 @@ pub fn observe_cpu_read_or_copy(start: usize, len: usize) -> bool {
     if !enabled() || len == 0 {
         return false;
     }
-    let end = start.saturating_add(len);
-    let idx = shard_index(start);
-    let mut entries = TABLE.shards[idx].entries.write().unwrap();
-    let mut demoted = false;
-    for e in entries.iter_mut() {
-        if !e.overlaps(start, end) {
-            continue;
-        }
-        e.cpu_reads = e.cpu_reads.saturating_add(1);
-        e.demoted_once = true;
-        if matches!(
-            e.class,
-            AuthorityClass::GpuAuthoritative | AuthorityClass::GpuOnly
-        ) {
-            let prev = e.class;
-            e.class = AuthorityClass::SharedCoherent;
-            record_class_delta(Some(prev), Some(AuthorityClass::SharedCoherent));
-            DEMOTED_TO_SHARED.fetch_add(1, Ordering::Relaxed);
-            demoted = true;
-        }
+    demote_overlap(start, start.saturating_add(len), false)
+}
+
+/// Observe a CPU write overlapping `[start, start + len)` (e.g., partial 4 KiB
+/// page overwrite or direct title buffer write). Demotes overlapping GPU authority.
+pub fn observe_cpu_write(start: usize, len: usize) -> bool {
+    if !enabled() || len == 0 {
+        return false;
     }
-    demoted
+    demote_overlap(start, start.saturating_add(len), true)
+}
+
+/// Read-only diagnostic check for readback validation: returns true if a readback
+/// interval unexpectedly overlaps a `GpuAuthoritative` or `GpuOnly` entry.
+#[inline]
+pub fn is_gpu_authoritative_conflict(start: usize, len: usize) -> bool {
+    if !enabled() || len == 0 {
+        return false;
+    }
+    matches!(
+        class_for(start, len),
+        AuthorityClass::GpuAuthoritative | AuthorityClass::GpuOnly
+    )
+}
+
+#[inline]
+pub fn record_partial_page_split() {
+    PARTIAL_PAGE_SPLITS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_ambiguous_fallback() {
+    AMBIGUOUS_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Check whether a GPU shadow / Card before-twin & compare can be skipped safely.
@@ -390,6 +518,34 @@ pub fn stats() -> AuthorityStats {
         demoted_to_shared: DEMOTED_TO_SHARED.load(Ordering::Relaxed),
         skipped_before_twins: SKIPPED_BEFORE_TWINS.load(Ordering::Relaxed),
         skipped_card_compares: SKIPPED_CARD_COMPARES.load(Ordering::Relaxed),
+        cpu_write_demotes: CPU_WRITE_DEMOTES.load(Ordering::Relaxed),
+        epoch_invalidations: EPOCH_INVALIDATIONS.load(Ordering::Relaxed),
+        partial_page_splits: PARTIAL_PAGE_SPLITS.load(Ordering::Relaxed),
+        ambiguous_fallbacks: AMBIGUOUS_FALLBACKS.load(Ordering::Relaxed),
+        current_epoch: CURRENT_EPOCH.load(Ordering::Acquire),
+        generation_counter: NEXT_GENERATION.load(Ordering::Acquire),
+    }
+}
+
+/// Returns the allocation generation of the matching entry `[start, start + len)`, if active.
+pub fn range_generation(start: usize, len: usize) -> Option<u64> {
+    let end = start.saturating_add(len);
+    if spans_multiple_shards(start, end) {
+        TABLE
+            .spanning
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.start == start && e.end == end)
+            .map(|e| e.generation)
+    } else {
+        TABLE.shards[shard_index(start)]
+            .entries
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.start == start && e.end == end)
+            .map(|e| e.generation)
     }
 }
 
@@ -497,6 +653,71 @@ mod tests {
         assert_eq!(class_for(addr, 0x10_000), AuthorityClass::SharedCoherent);
 
         unregister_range(addr, 0x10_000);
+        println!("{OK}");
+    }
+
+    #[test]
+    fn cross_shard_demotion_and_epoch_reuse_are_safe() {
+        const CHILD: &str = "VICTORY_TEST_AUTHORITY_CROSS_SHARD_CHILD";
+        const OK: &str = "cross-shard authority and epoch reuse assertions passed";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "authority::tests::cross_shard_demotion_and_epoch_reuse_are_safe",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_REA_GPU_AUTHORITY", "1")
+                .output()
+                .expect("spawn cross-shard test child");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains(OK),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Large spanning buffer (256 KiB across 4 64 KiB shards).
+        let base = 0x5000_0000usize;
+        let len = 0x4_0000usize;
+        register_range(base, len, AuthorityClass::SharedCoherent, true);
+        observe_gpu_write(base + 0x2_0000, 0x1000, false, true);
+        observe_gpu_write(base + 0x2_0000, 0x1000, false, true);
+        assert_eq!(
+            class_for(base + 0x3_0000, 0x1000),
+            AuthorityClass::GpuAuthoritative,
+            "spanning entry must promote uniformly across all shards"
+        );
+
+        // A CPU write to offset +0x2_0000 (different 64K shard than `base`) MUST demote it!
+        assert!(observe_cpu_write(base + 0x2_0000, 0x1000));
+        assert_eq!(class_for(base, len), AuthorityClass::SharedCoherent);
+        assert!(!can_skip_gpu_compare(base + 0x3_0000, 0x1000, false));
+
+        // Ambiguous overlapping entries (GpuOnly + SharedCoherent) must stay SharedCoherent.
+        let sub_a = base + 0x1_0000;
+        register_range(sub_a, 0x1000, AuthorityClass::GpuOnly, true);
+        assert_eq!(class_for(sub_a, 0x1000), AuthorityClass::SharedCoherent);
+
+        // Unregistering frees the VA cleanly so reusing the VA in a new frame/generation works.
+        let before_stats = stats();
+        let old_gen = range_generation(base, len);
+        unregister_range(sub_a, 0x1000);
+        unregister_range(base, len);
+        let after_stats = stats();
+        assert!(after_stats.epoch_invalidations >= before_stats.epoch_invalidations + 2);
+        assert_eq!(range_generation(base, len), None);
+
+        register_range(base, 0x1000, AuthorityClass::SharedCoherent, true);
+        assert_ne!(old_gen, range_generation(base, 0x1000));
+        assert_eq!(class_for(base, 0x1000), AuthorityClass::SharedCoherent);
+        observe_gpu_write(base, 0x1000, false, true);
+        observe_gpu_write(base, 0x1000, false, true);
+        assert_eq!(class_for(base, 0x1000), AuthorityClass::GpuAuthoritative);
+        unregister_range(base, 0x1000);
         println!("{OK}");
     }
 }

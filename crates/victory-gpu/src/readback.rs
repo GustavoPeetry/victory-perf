@@ -54,7 +54,9 @@ pub(crate) fn trace_enabled() -> bool {
     *ON.get_or_init(|| {
         let on = parse_flag("VICTORY_REA_READBACK_TRACE");
         if on {
-            tracing::info!("VICTORY_REA_READBACK_TRACE=1: tracing read-back creator provenance and ranges");
+            tracing::info!(
+                "VICTORY_REA_READBACK_TRACE=1: tracing read-back creator provenance and ranges"
+            );
         }
         on
     })
@@ -183,7 +185,12 @@ fn resolve_creator_from_frames(
 pub(crate) fn creating_readback() -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
-    if !enabled() && !semantic_enabled() && !trace_enabled() && crate::rebar::level() < 2 {
+    if !enabled()
+        && !semantic_enabled()
+        && !trace_enabled()
+        && !crate::authority::enabled()
+        && crate::rebar::level() < 2
+    {
         return false;
     }
     let creator = match CREATOR.get() {
@@ -314,7 +321,10 @@ pub(crate) fn copy_back(start: u64, len: u64) -> bool {
     }
     let (overlaps, tagged_count) = {
         let guard = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.overlaps(start, start.saturating_add(len)), guard.len())
+        (
+            guard.overlaps(start, start.saturating_add(len)),
+            guard.len(),
+        )
     };
 
     if semantic && !legacy && (!CREATOR_VERIFIED.load(Ordering::Acquire) || tagged_count == 0) {
@@ -343,7 +353,9 @@ pub(crate) fn copy_back(start: u64, len: u64) -> bool {
         }
         if validate_enabled() {
             let n = VALIDATE_SAMPLES.fetch_add(1, Ordering::Relaxed);
-            if n.is_multiple_of(128) && crate::authority::observe_cpu_read_or_copy(start as usize, len as usize) {
+            if n.is_multiple_of(128)
+                && crate::authority::is_gpu_authoritative_conflict(start as usize, len as usize)
+            {
                 VALIDATE_WARNINGS.fetch_add(1, Ordering::Relaxed);
             }
         }
