@@ -58,6 +58,8 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/lower.rs"),
         include_str!("emit/mod.rs"),
         include_str!("emit/own_bits.rs"),
+        include_str!("emit/rea003_diff_tests.rs"),
+        include_str!("emit/rea003_recovery.rs"),
         include_str!("emit/rect.rs"),
         include_str!("emit/sampler.rs"),
         include_str!("emit/shader.rs"),
@@ -92,7 +94,13 @@ mod source_tests {
             std::fs::read_dir(dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
-                .map(|p| if p.is_dir() { count(&p) } else { usize::from(p.extension().is_some_and(|x| x == "rs")) })
+                .map(|p| {
+                    if p.is_dir() {
+                        count(&p)
+                    } else {
+                        usize::from(p.extension().is_some_and(|x| x == "rs"))
+                    }
+                })
                 .sum()
         }
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

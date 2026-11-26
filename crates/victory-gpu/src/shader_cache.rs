@@ -100,6 +100,10 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_F16_NEAREST",
+            "VICTORY_REA003_SHADER_RECOVERY",
+            "VICTORY_REA003_SHADER_OPT",
+            "VICTORY_REA003_AMBIENT_NATIVE",
+            "VICTORY_REA003_SHADOWMASK_NATIVE",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
