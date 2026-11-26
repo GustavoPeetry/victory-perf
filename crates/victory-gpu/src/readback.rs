@@ -77,10 +77,26 @@ pub(crate) fn semantic_enabled() -> bool {
     })
 }
 
-/// Whether sampled validation of untagged ranges is enabled (`VICTORY_REA_READBACK_VALIDATE=1`).
+fn parse_validate_mode(raw: &str) -> (bool, bool) {
+    let t = raw.trim();
+    if t == "2" || t.eq_ignore_ascii_case("full") {
+        (true, true)
+    } else if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes") {
+        (true, false)
+    } else {
+        (false, false)
+    }
+}
+
+/// Whether sampled or full validation of skipped/untagged ranges is enabled
+/// (`VICTORY_REA_READBACK_VALIDATE=1|2|full`).
 pub(crate) fn validate_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| parse_flag("VICTORY_REA_READBACK_VALIDATE"))
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_REA_READBACK_VALIDATE")
+            .ok()
+            .is_some_and(|v| parse_validate_mode(&v).0)
+    })
 }
 
 static CREATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
@@ -372,10 +388,7 @@ pub(crate) fn validate_authority_skip(start: u64, len: u64, tagged: bool) {
     let full = *FULL.get_or_init(|| {
         std::env::var("VICTORY_REA_READBACK_VALIDATE")
             .ok()
-            .is_some_and(|v| {
-                let t = v.trim();
-                t == "2" || t.eq_ignore_ascii_case("full")
-            })
+            .is_some_and(|v| parse_validate_mode(&v).1)
     });
     let sample = VALIDATE_SAMPLES.fetch_add(1, Ordering::Relaxed);
     if !full && !sample.is_multiple_of(128) {
@@ -554,5 +567,17 @@ mod tests {
         assert!(copy_back(0x5000_0000, 4096));
         assert!(stats().semantic_fallbacks >= 1);
         println!("{OK}");
+    }
+
+    #[test]
+    fn validate_mode_parses_sampled_and_full_tokens() {
+        assert_eq!(parse_validate_mode("0"), (false, false));
+        assert_eq!(parse_validate_mode(""), (false, false));
+        assert_eq!(parse_validate_mode("1"), (true, false));
+        assert_eq!(parse_validate_mode("true"), (true, false));
+        assert_eq!(parse_validate_mode("yes"), (true, false));
+        assert_eq!(parse_validate_mode("2"), (true, true));
+        assert_eq!(parse_validate_mode("full"), (true, true));
+        assert_eq!(parse_validate_mode(" FULL "), (true, true));
     }
 }

@@ -69,19 +69,19 @@ switch ($Mode) {
         $EnvMap['VICTORY_REA_GPU_AUTHORITY'] = '1'
         $EnvMap['VICTORY_REA_READBACK_VALIDATE'] = '1'
         $EnvMap['VICTORY_REA_SPARSE_TEXTURES'] = '1'
-        $EnvMap['VICTORY_MWAITX_BACKOFF'] = 'spin'
+        $EnvMap['VICTORY_REA_MWAITX_MODE'] = 'spin'
     }
     'mwaitx-yield' {
         $EnvMap['VICTORY_REA_GPU_AUTHORITY'] = '1'
         $EnvMap['VICTORY_REA_READBACK_VALIDATE'] = '1'
         $EnvMap['VICTORY_REA_SPARSE_TEXTURES'] = '1'
-        $EnvMap['VICTORY_MWAITX_BACKOFF'] = 'yield'
+        $EnvMap['VICTORY_REA_MWAITX_MODE'] = 'yield'
     }
     'mwaitx-progressive' {
         $EnvMap['VICTORY_REA_GPU_AUTHORITY'] = '1'
         $EnvMap['VICTORY_REA_READBACK_VALIDATE'] = '1'
         $EnvMap['VICTORY_REA_SPARSE_TEXTURES'] = '1'
-        $EnvMap['VICTORY_MWAITX_BACKOFF'] = 'progressive'
+        $EnvMap['VICTORY_REA_MWAITX_MODE'] = 'progressive'
     }
     'gpu-detile' {
         $EnvMap['VICTORY_REA_GPU_AUTHORITY'] = '1'

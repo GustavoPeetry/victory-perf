@@ -77,6 +77,15 @@ function Invoke-VictoryIsolated {
     $exeHash = (Get-FileHash -Path $resolvedExe -Algorithm SHA256).Hash.ToLowerInvariant()
     $exeInfo = Get-Item -Path $resolvedExe
 
+    $gitCommit = 'unknown'
+    try {
+        $gitCommit = (git -C $repoRoot rev-parse --short=12 HEAD 2>$null | Out-String).Trim()
+        if (-not $gitCommit) { $gitCommit = 'unknown' }
+    } catch {
+        $gitCommit = 'unknown'
+    }
+    $exeCommit = $gitCommit
+
     # Optional cross-check against research/REA-003.1/EXECUTABLE_MANIFEST.json once generated.
     if ($ManifestRole) {
         $manifestPath = Join-Path $repoRoot 'research\REA-003.1\EXECUTABLE_MANIFEST.json'
@@ -84,10 +93,20 @@ function Invoke-VictoryIsolated {
             try {
                 $manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
                 $entry = $manifest.executables.$ManifestRole
-                if ($null -ne $entry -and $entry.sha256) {
-                    $expectedHash = "$($entry.sha256)".ToLowerInvariant()
-                    if ($expectedHash -ne $exeHash) {
-                        throw "SHA-256 mismatch for manifest role '$ManifestRole' ($resolvedExe): expected $expectedHash, got $exeHash"
+                if ($null -ne $entry) {
+                    if ($entry.sha256) {
+                        $expectedHash = "$($entry.sha256)".ToLowerInvariant()
+                        if ($expectedHash -ne $exeHash) {
+                            throw "SHA-256 mismatch for manifest role '$ManifestRole' ($resolvedExe): expected $expectedHash, got $exeHash"
+                        }
+                    }
+                    if ($entry.commit) {
+                        $rawCommit = "$($entry.commit)".Trim()
+                        if ($rawCommit.Length -ge 12) {
+                            $exeCommit = $rawCommit.Substring(0, 12)
+                        } elseif ($rawCommit) {
+                            $exeCommit = $rawCommit
+                        }
                     }
                 }
             } catch [System.Management.Automation.RuntimeException] {
@@ -133,6 +152,7 @@ function Invoke-VictoryIsolated {
     }
     $effectiveEnv['VICTORY_PRESET'] = $PresetName
     $effectiveEnv['VICTORY_RUN_ID'] = $runId
+    $effectiveEnv['VICTORY_GIT_COMMIT'] = $exeCommit
     $effectiveEnv['VICTORY_RUNTIME_SHA256'] = $exeHash
     $effectiveEnv['VICTORY_CACHE_DIR'] = $cacheRoot
     if (-not $effectiveEnv.Contains('VICTORY_REA_TELEMETRY_JSON')) {
@@ -146,14 +166,6 @@ function Invoke-VictoryIsolated {
             $prevEnv[$item.Name] = $item.Value
             Remove-Item "Env:$($item.Name)" -ErrorAction SilentlyContinue
         }
-    }
-
-    $gitCommit = 'unknown'
-    try {
-        $gitCommit = (git -C $repoRoot rev-parse --short=12 HEAD 2>$null | Out-String).Trim()
-        if (-not $gitCommit) { $gitCommit = 'unknown' }
-    } catch {
-        $gitCommit = 'unknown'
     }
 
     $prevEap = $ErrorActionPreference
