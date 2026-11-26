@@ -420,4 +420,51 @@ mod tests {
         }
         unregister_range(base, 0x2000);
     }
+
+    #[test]
+    fn gpu_authority_promotes_skips_and_demotes_cleanly_under_flag() {
+        const CHILD: &str = "VICTORY_TEST_AUTHORITY_PROMOTE_CHILD";
+        const OK: &str = "gpu authority promote/demote assertions passed";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "authority::tests::gpu_authority_promotes_skips_and_demotes_cleanly_under_flag",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_REA_GPU_AUTHORITY", "1")
+                .output()
+                .expect("spawn authority test child");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains(OK),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert!(enabled());
+        let addr = 0x4000_0000usize;
+        register_range(addr, 0x10_000, AuthorityClass::SharedCoherent, true);
+        assert!(!can_skip_gpu_compare(addr, 0x10_000, false));
+
+        // After sustained non-readback GPU writes, range promotes to GpuAuthoritative.
+        observe_gpu_write(addr, 0x10_000, false, true);
+        observe_gpu_write(addr, 0x10_000, false, true);
+        assert_eq!(class_for(addr, 0x10_000), AuthorityClass::GpuAuthoritative);
+        assert!(can_skip_gpu_compare(addr, 0x10_000, false));
+
+        // Any subsequent CPU read/copy demotes permanently back to SharedCoherent.
+        assert!(observe_cpu_read_or_copy(addr, 0x1000));
+        assert_eq!(class_for(addr, 0x10_000), AuthorityClass::SharedCoherent);
+        assert!(!can_skip_gpu_compare(addr, 0x10_000, false));
+        observe_gpu_write(addr, 0x10_000, false, true);
+        observe_gpu_write(addr, 0x10_000, false, true);
+        assert_eq!(class_for(addr, 0x10_000), AuthorityClass::SharedCoherent);
+
+        unregister_range(addr, 0x10_000);
+        println!("{OK}");
+    }
 }

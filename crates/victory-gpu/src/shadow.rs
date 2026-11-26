@@ -2031,6 +2031,7 @@ impl Drop for Shadow {
             slot.fetch_sub(self.len, Ordering::Relaxed);
             let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
             crate::accounting::on_shadow_delta(-(self.len as i64), -card_bytes);
+            crate::authority::unregister_range(self.start as usize, self.len as usize);
         }
         if self.rebar != 0 {
             crate::rebar::released(self.rebar);
@@ -2386,6 +2387,12 @@ impl Shadow {
             LIVE_CLASS[class as usize].fetch_add(self.len, Ordering::Relaxed);
             let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
             crate::accounting::on_shadow_delta(self.len as i64, card_bytes);
+            crate::authority::register_range(
+                self.start as usize,
+                self.len as usize,
+                crate::authority::AuthorityClass::SharedCoherent,
+                crate::readback::stats().creator_verified,
+            );
         }
     }
 
@@ -2415,6 +2422,13 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        let tagged = crate::readback::tagged_in(address, len);
+        let creator_ok = crate::readback::stats().creator_verified;
+        crate::authority::observe_gpu_write(address as usize, len as usize, tagged, creator_ok);
+        if crate::authority::can_skip_gpu_compare(address as usize, len as usize, tagged) {
+            crate::authority::note_skipped_card_compare();
+            return;
+        }
         if !crate::readback::copy_back(address, len) {
             return;
         }
@@ -3296,6 +3310,14 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
+        if crate::authority::can_skip_gpu_compare(
+            self.start as usize,
+            self.len as usize,
+            crate::readback::tagged_in(self.start, self.len),
+        ) {
+            crate::authority::note_skipped_before_twin();
+            return false;
+        }
         let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
         if before.is_some() {
             return false;
