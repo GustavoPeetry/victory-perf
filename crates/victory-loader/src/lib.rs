@@ -44,6 +44,8 @@ mod tls;
 mod windows;
 
 #[cfg(windows)]
+pub use hooks::{ResolutionContractReport, resolution_contract_report};
+#[cfg(windows)]
 pub use fastpath::{ConsoleInsnStats, PatchSummary, console_insn_stats};
 #[cfg(windows)]
 pub use crash::{

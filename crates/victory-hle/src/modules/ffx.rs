@@ -55,15 +55,10 @@ pub extern "system" fn ffxFsr3ContextCreate(_context: *mut usize, _desc: *const 
     0
 }
 
-pub extern "system" fn ffxFsr3ContextDispatch(_context: *mut usize, desc: *const u8) -> i32 {
+pub extern "system" fn ffxFsr3ContextDispatch(_context: *mut usize, _desc: *const u8) -> i32 {
     FFX_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
     #[cfg(windows)]
-    victory_gpu::dxr_proto::on_slot_0x218_call(
-        FFX_DISPATCH_CALLS.load(Ordering::Relaxed) as u32,
-        desc,
-    );
-    #[cfg(not(windows))]
-    let _ = desc;
+    victory_gpu::dxr_proto::on_ffx_hle_dispatch();
     0
 }
 
@@ -110,9 +105,25 @@ mod tests {
         assert_eq!(fsr3.exports.len(), 4);
         assert!(fsr3.serves("amd_fidelityfx_dx12.dll"));
         assert_eq!(ffxGetInterfaceVersion(), 0x0003_0000);
+        #[cfg(windows)]
+        let before_0x218 = victory_gpu::dxr_proto::stats().ffx_0x218_calls;
+        let (_, creates_before, dispatches_before) = telemetry_stats();
+        assert_eq!(
+            ffxFsr3ContextCreate(std::ptr::null_mut(), std::ptr::null()),
+            0
+        );
         assert_eq!(
             ffxFsr3ContextDispatch(std::ptr::null_mut(), std::ptr::null()),
             0
+        );
+        let (_, creates_after, dispatches_after) = telemetry_stats();
+        assert_eq!(creates_after, creates_before + 1);
+        assert_eq!(dispatches_after, dispatches_before + 1);
+        #[cfg(windows)]
+        assert_eq!(
+            victory_gpu::dxr_proto::stats().ffx_0x218_calls,
+            before_0x218,
+            "FFX HLE dispatch must stay distinct from console slot=0x218 calls"
         );
     }
 }

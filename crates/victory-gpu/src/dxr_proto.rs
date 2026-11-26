@@ -46,6 +46,7 @@ static BLAS_BYTES: AtomicU64 = AtomicU64::new(0);
 static TLAS_BYTES: AtomicU64 = AtomicU64::new(0);
 static LAST_BUILD_US: AtomicU64 = AtomicU64::new(0);
 static FFX_0X218_CALLS: AtomicU64 = AtomicU64::new(0);
+static FFX_HLE_DISPATCH_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of experimental DXR / FFX telemetry counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -123,6 +124,16 @@ pub(crate) fn maybe_probe_host() {
             );
         }
     });
+}
+
+/// Records a host FidelityFX HLE dispatch separately from `slot=0x218` pipeline calls.
+pub fn on_ffx_hle_dispatch() {
+    FFX_HLE_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Number of `ffxFsr3ContextDispatch` HLE calls observed.
+pub fn ffx_hle_dispatch_calls() -> u64 {
+    FFX_HLE_DISPATCH_CALLS.load(Ordering::Relaxed)
 }
 
 /// Observes a title call into unimplemented console pipeline slot `0x218`

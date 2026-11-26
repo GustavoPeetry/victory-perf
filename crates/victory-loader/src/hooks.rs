@@ -69,6 +69,42 @@ pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// Environment variable that makes the title use its own temporal upscaler
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
+/// Unsafe test-only override allowing FSR4 patching outside `1280x720` (`2/3`)
+/// and `1920x1080` (`1.0`). Off by default.
+pub(crate) const FSR_FORCE_UNSAFE_SCALE_ENV: &str = "VICTORY_FSR_FORCE_UNSAFE_SCALE";
+
+/// Resolution-contract summary captured when [`resolution_levers`] runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResolutionContractReport {
+    pub own_upscaler: bool,
+    pub requested_scale: Option<f32>,
+    pub own_patches_applied: usize,
+    pub fsr_patches_applied: usize,
+    pub fsr_scale_blocked: bool,
+}
+
+static RESOLUTION_CONTRACT: std::sync::Mutex<ResolutionContractReport> =
+    std::sync::Mutex::new(ResolutionContractReport {
+        own_upscaler: false,
+        requested_scale: None,
+        own_patches_applied: 0,
+        fsr_patches_applied: 0,
+        fsr_scale_blocked: false,
+    });
+
+/// Returns the most recent resolution-contract report from [`resolution_levers`].
+pub fn resolution_contract_report() -> ResolutionContractReport {
+    *RESOLUTION_CONTRACT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Shipping FSR4 requires `maxRenderSize` to match `1280x720` (`2/3` of 1080p)
+/// or `1920x1080` (`1.0`). Lower custom scales (`0.4`, `0.5`, etc.) must use
+/// `VICTORY_OWN_UPSCALER=1` unless explicitly overridden for reproduction tests.
+fn fsr_scale_allowed(scale: f32, force_unsafe: bool) -> bool {
+    force_unsafe || (scale - (2.0 / 3.0)).abs() < 1e-3 || (scale - 1.0).abs() < 1e-3
+}
 
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
@@ -103,7 +139,12 @@ const FSR_SCALES: [(f32, usize); 4] = [
 /// - FSR's scale (a load of 2/3 on Series S) pointed at a constant equal to
 ///   `scale`, when this build has one, and its maximum size made the scaled
 ///   size (vtable slot 11 → slot 10's function).
-fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
+fn render_scale_patches_with(
+    base: usize,
+    scale: f32,
+    fsr: bool,
+    force_unsafe: bool,
+) -> (Vec<OwnedPatch>, bool) {
     let mut patches = vec![
         OwnedPatch {
             what: "render scale: own upscaler minimum",
@@ -119,7 +160,14 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
         },
     ];
     if !fsr {
-        return patches;
+        return (patches, false);
+    }
+    if !fsr_scale_allowed(scale, force_unsafe) {
+        tracing::warn!(
+            scale,
+            "Shipping FSR4 requires 1280x720 (2/3) or 1920x1080 (1.0); refusing FSR4 scale/maxRenderSize patch (set {OWN_UPSCALER_ENV}=1 for custom scales or {FSR_FORCE_UNSAFE_SCALE_ENV}=1 to override)"
+        );
+        return (patches, true);
     }
     match FSR_SCALES.iter().find(|(v, _)| (v - scale).abs() < 1e-3) {
         Some(&(_, constant)) => {
@@ -143,10 +191,15 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
         }
         None => tracing::warn!(
             scale,
-            "no FSR constant for this scale (0.5, 0.4, 1/3, 0.75); FSR keeps its own (use {OWN_UPSCALER_ENV}=1)"
+            "no FSR constant for this scale; FSR keeps its 1280x720/1920x1080 contract (use {OWN_UPSCALER_ENV}=1)"
         ),
     }
-    patches
+    (patches, false)
+}
+
+#[cfg(test)]
+fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
+    render_scale_patches_with(base, scale, fsr, false).0
 }
 
 /// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
@@ -163,6 +216,7 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
+    let force_unsafe = std::env::var_os(FSR_FORCE_UNSAFE_SCALE_ENV).is_some_and(|v| v == "1");
     if scale.is_none() && !own {
         return 0;
     }
@@ -172,6 +226,10 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         tracing::debug!("resolution levers: not the 1.0.2.1 executable; nothing patched");
         return 0;
     }
+    let mut report = ResolutionContractReport {
+        own_upscaler: own,
+        ..Default::default()
+    };
     let mut applied = 0;
     if own {
         // SAFETY: forwarded from this function's contract.
@@ -180,21 +238,43 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     if let Some(text) = scale {
         match parse_scale(&text) {
             Some(scale) => {
+                report.requested_scale = Some(scale);
                 // With the own upscaler forced, FSR is left as it is.
-                for p in render_scale_patches(base, scale, !own) {
-                    let p = Patch {
+                let (patches, blocked) = render_scale_patches_with(base, scale, !own, force_unsafe);
+                report.fsr_scale_blocked = blocked;
+                for p in patches {
+                    let is_fsr = p.what.contains("FSR");
+                    let patch = Patch {
                         what: p.what,
                         rva: p.rva,
                         expect: &p.expect,
                         new: &p.new,
                     };
                     // SAFETY: forwarded from this function's contract.
-                    applied += usize::from(unsafe { apply(base, &p) });
+                    if unsafe { apply(base, &patch) } {
+                        applied += 1;
+                        if is_fsr {
+                            report.fsr_patches_applied += 1;
+                        } else {
+                            report.own_patches_applied += 1;
+                        }
+                    }
                 }
             }
             None => tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0"),
         }
     }
+    *RESOLUTION_CONTRACT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = report;
+    tracing::info!(
+        own_upscaler = report.own_upscaler,
+        requested_scale = ?report.requested_scale,
+        own_patches_applied = report.own_patches_applied,
+        fsr_patches_applied = report.fsr_patches_applied,
+        fsr_scale_blocked = report.fsr_scale_blocked,
+        "resolution contract resolved"
+    );
     applied
 }
 
@@ -205,7 +285,10 @@ unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
     // SAFETY: the offset is inside the mapped .text of this exact build.
     let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };
     if now != p.expect || p.new.len() != p.expect.len() {
-        tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
+        tracing::warn!(
+            what = p.what,
+            "hook skipped: the bytes are not the expected ones"
+        );
         return false;
     }
     let mut old = 0;
@@ -237,20 +320,36 @@ mod tests {
     }
 
     #[test]
-    fn half_scale_patches_both_upscalers() {
+    fn half_and_subnative_scales_refuse_unsafe_fsr4_patches_unless_overridden() {
         let base = 0x7ff0_0000_0000;
-        let p = render_scale_patches(base, 0.5, true);
-        assert_eq!(p.len(), 4);
-        assert_eq!(p[0].new, 0.5f32.to_le_bytes());
-        // The FSR load now reads 0.5 at 0x5fc6edc: disp from the next instruction.
-        assert_eq!(p[2].new, [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]);
-        assert_eq!(p[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
-        assert!(p.iter().all(|p| p.new.len() == p.expect.len()));
+        let (p04, blocked04) = render_scale_patches_with(base, 0.4, true, false);
+        assert!(blocked04);
+        assert_eq!(p04.len(), 2, "FSR4 must NOT be patched to 0.4 (768x432)");
+
+        let (p05, blocked05) = render_scale_patches_with(base, 0.5, true, false);
+        assert!(blocked05);
+        assert_eq!(p05.len(), 2, "FSR4 must NOT be patched to 0.5 (960x540)");
+
+        let (p_override, blocked_override) = render_scale_patches_with(base, 0.5, true, true);
+        assert!(!blocked_override);
+        assert_eq!(p_override.len(), 4);
+        assert_eq!(p_override[0].new, 0.5f32.to_le_bytes());
+        // With explicit unsafe override, the FSR load reads 0.5 at 0x5fc6edc.
+        assert_eq!(
+            p_override[2].new,
+            [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]
+        );
+        assert_eq!(p_override[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
+        assert!(p_override.iter().all(|p| p.new.len() == p.expect.len()));
     }
 
     #[test]
-    fn odd_scales_patch_only_the_own_upscaler() {
+    fn own_upscaler_and_unmatched_scales_patch_only_the_own_upscaler() {
         assert_eq!(render_scale_patches(0, 0.6, true).len(), 2);
+        let (own04, blocked_own) = render_scale_patches_with(0, 0.4, false, false);
+        assert!(!blocked_own);
+        assert_eq!(own04.len(), 2);
+        assert_eq!(own04[0].new, 0.4f32.to_le_bytes());
         assert_eq!(render_scale_patches(0, 0.5, false).len(), 2);
     }
 }

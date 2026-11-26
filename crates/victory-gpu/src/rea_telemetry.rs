@@ -274,7 +274,7 @@ pub(crate) fn log_effective_config() {
     static LOGGED: Once = Once::new();
     LOGGED.call_once(|| {
         let id = session_identity();
-        let own_upscaler = non_empty_env("VICTORY_OWN_UPSCALER").is_some_and(|v| v == "1");
+        let own_upscaler = non_empty_env("VICTORY_OWN_UPSCALER").is_some_and(|v| v != "0");
         let render_scale = non_empty_env("VICTORY_RENDER_SCALE");
         let upscaler = crate::upscaler::UpscalerMode::from_env();
         let relay = crate::host::relay_level();
@@ -568,7 +568,7 @@ fn collect_backends_json(
     dxr: &crate::dxr_proto::DxrStats,
     ffx: &FfxHleTelemetry,
     rg: &crate::render_graph::RenderGraphSnapshot,
-) -> String {
+) -> (String, &'static str, &'static str) {
     let status_bool = |requested: bool, active: bool, calls: u64, fallbacks: u64, fails: u64| {
         let state = if !requested {
             BackendState::Disabled
@@ -751,44 +751,17 @@ fn collect_backends_json(
     );
 
     let up_mode = crate::upscaler::UpscalerMode::from_env();
-    let up_req = up_mode != crate::upscaler::UpscalerMode::Original;
-    let upscaler = BackendStatus {
-        state: if !up_req {
-            BackendState::Disabled
-        } else if ffx.dispatch_calls > 0 {
-            BackendState::ContextCreated
-        } else {
-            BackendState::Requested
-        },
-        requested: up_req,
-        enabled: up_req,
-        initialized: ffx.create_calls > 0,
-        active: false,
-        executed_calls: ffx.dispatch_calls,
-        fallback_count: 0,
-        failure_count: 0,
-    };
+    let own_upscaler = non_empty_env("VICTORY_OWN_UPSCALER").is_some_and(|v| v != "0");
+    let (upscaler, upscaler_active_backend) = crate::upscaler::runtime_status(
+        up_mode,
+        own_upscaler,
+        ffx.create_calls,
+        ffx.dispatch_calls,
+    );
 
     let dxr_req = crate::dxr_backend::dxr_enabled() || crate::dxr_proto::dxr_proto_enabled();
-    let dxr_calls = dxr.blas_builds + dxr.tlas_builds;
-    let dxr_status = BackendStatus {
-        state: if !dxr_req {
-            BackendState::Disabled
-        } else if dxr.tier < 10 {
-            BackendState::Unsupported
-        } else if dxr_calls > 0 {
-            BackendState::Active
-        } else {
-            BackendState::Requested
-        },
-        requested: dxr_req,
-        enabled: dxr_req,
-        initialized: dxr.tier >= 10 && dxr_calls > 0,
-        active: dxr_calls > 0,
-        executed_calls: dxr_calls,
-        fallback_count: 0,
-        failure_count: 0,
-    };
+    let (dxr_status, bvh_provenance) =
+        crate::dxr_backend::runtime_status(dxr_req, dxr, crate::pipeline::builder_runs());
 
     let cq_req = upload.copy_queue_enabled;
     let copy_queue = BackendStatus {
@@ -826,27 +799,31 @@ fn collect_backends_json(
         failure_count: acc.audit_mismatches,
     };
 
-    format!(
-        "\"gpu_authority\":{},\"readback_validate\":{},\"sparse_residency\":{},\"sparse_reclaim\":{},\
-         \"mwaitx_fastpath\":{},\"shader_recovery\":{},\"shader_opt\":{},\"ambient_native\":{},\
-         \"shadowmask_native\":{},\"gpu_driven\":{},\"gpu_detile\":{},\"rendergraph_fastpath\":{},\
-         \"upscaler\":{},\"dxr\":{},\"copy_queue\":{},\"accounting_audit\":{}",
-        gpu_authority.json_object(),
-        readback_validate.json_object(),
-        sparse_residency.json_object(),
-        sparse_reclaim.json_object(),
-        mwaitx_fastpath.json_object(),
-        shader_recovery.json_object(),
-        shader_opt.json_object(),
-        ambient_native.json_object(),
-        shadowmask_native.json_object(),
-        gpu_driven.json_object(),
-        gpu_detile.json_object(),
-        rendergraph_fastpath.json_object(),
-        upscaler.json_object(),
-        dxr_status.json_object(),
-        copy_queue.json_object(),
-        accounting_audit.json_object(),
+    (
+        format!(
+            "\"gpu_authority\":{},\"readback_validate\":{},\"sparse_residency\":{},\"sparse_reclaim\":{},\
+             \"mwaitx_fastpath\":{},\"shader_recovery\":{},\"shader_opt\":{},\"ambient_native\":{},\
+             \"shadowmask_native\":{},\"gpu_driven\":{},\"gpu_detile\":{},\"rendergraph_fastpath\":{},\
+             \"upscaler\":{},\"dxr\":{},\"copy_queue\":{},\"accounting_audit\":{}",
+            gpu_authority.json_object(),
+            readback_validate.json_object(),
+            sparse_residency.json_object(),
+            sparse_reclaim.json_object(),
+            mwaitx_fastpath.json_object(),
+            shader_recovery.json_object(),
+            shader_opt.json_object(),
+            ambient_native.json_object(),
+            shadowmask_native.json_object(),
+            gpu_driven.json_object(),
+            gpu_detile.json_object(),
+            rendergraph_fastpath.json_object(),
+            upscaler.json_object(),
+            dxr_status.json_object(),
+            copy_queue.json_object(),
+            accounting_audit.json_object(),
+        ),
+        upscaler_active_backend,
+        bvh_provenance,
     )
 }
 
@@ -894,7 +871,8 @@ fn format_window_json(
     let staging_mb = acc.staging_bytes >> 20;
     let upload_ring_mb = acc.upload_ring_bytes >> 20;
     let reclaimable_mb = acc.reclaimable_bytes >> 20;
-    let backends_json = collect_backends_json(acc, auth, rb, sparse, cpu, upload, dxr, ffx, rg);
+    let (backends_json, upscaler_active_backend, bvh_provenance) =
+        collect_backends_json(acc, auth, rb, sparse, cpu, upload, dxr, ffx, rg);
 
     format!(
         "{{\"run_id\":\"{}\",\"pid\":{},\"monotonic_ms\":{},\"utc_unix_ms\":{},\"commit\":\"{}\",\
@@ -918,7 +896,7 @@ fn format_window_json(
          \"clzero_fast_calls\":{},\"clzero_fast_bytes\":{},\"wait_fast_calls\":{},\"wait_yields\":{},\"wait_sleeps\":{},\"wait_early_wakes\":{},\
          \"wait_total_us\":{},\"wait_sleep_us\":{},\"emu_total\":{},\
          \"scratch_reuses\":{},\"scratch_bytes_saved\":{},\"copy_queue_batches\":{},\"copy_queue_bytes\":{},\
-         \"dxr_tier\":{},\"ffx_0x218_calls\":{},\"ffx_hle_mode\":\"{}\",\"ffx_hle_creates\":{},\"ffx_hle_dispatches\":{},\
+         \"dxr_tier\":{},\"bvh_provenance\":\"{}\",\"ffx_0x218_calls\":{},\"slot_0x218_calls\":{},\"ffx_hle_mode\":\"{}\",\"upscaler_active_backend\":\"{}\",\"ffx_hle_creates\":{},\"ffx_hle_dispatches\":{},\"ffx_hle_calls\":{},\
          \"prep_ask_once_ms\":{:.3},\"prep_copy_ms\":{:.3},\"prep_fill_ms\":{:.3},\"prep_materialize_ms\":{:.3},\
          \"prep_authority_ms\":{:.3},\"prep_note_gpu_write_ms\":{:.3},\"prep_shadow_update_ms\":{:.3},\
          \"prep_subpage_split_ms\":{:.3},\"prep_tile_lock_ms\":{:.3},\
@@ -974,9 +952,13 @@ fn format_window_json(
         upload.copy_queue_batches,
         upload.copy_queue_bytes,
         dxr.tier,
+        bvh_provenance,
+        dxr.ffx_0x218_calls,
         dxr.ffx_0x218_calls,
         ffx.mode,
+        upscaler_active_backend,
         ffx.create_calls,
+        ffx.dispatch_calls,
         ffx.dispatch_calls,
         prep.ask_once_ms,
         prep.copy_ms,
@@ -1344,6 +1326,10 @@ mod tests {
         assert!(json.contains("\"backends\":{\"gpu_authority\":"));
         assert!(json.contains("\"dxr\":{"));
         assert!(json.contains("\"upscaler\":{"));
+        assert!(json.contains("\"upscaler_active_backend\":"));
+        assert!(json.contains("\"bvh_provenance\":"));
+        assert!(json.contains("\"slot_0x218_calls\":"));
+        assert!(json.contains("\"ffx_hle_calls\":"));
         assert!(json.starts_with('{') && json.ends_with("}}"));
     }
 }

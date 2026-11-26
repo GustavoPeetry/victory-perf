@@ -59,6 +59,42 @@ pub fn dxr_enabled() -> bool {
     })
 }
 
+/// Honest DXR backend lifecycle status and BVH provenance for runtime telemetry.
+pub fn runtime_status(
+    dxr_requested: bool,
+    proto: &crate::dxr_proto::DxrStats,
+    builder_runs: bool,
+) -> (crate::rea_telemetry::BackendStatus, &'static str) {
+    use crate::rea_telemetry::{BackendState, BackendStatus};
+    let calls = proto.blas_builds + proto.tlas_builds;
+    let bvh_provenance = if calls > 0 {
+        "native_dxr"
+    } else if builder_runs {
+        "console_bvh4_memory"
+    } else {
+        "none"
+    };
+    let status = BackendStatus {
+        state: if !dxr_requested {
+            BackendState::Disabled
+        } else if proto.tier < 10 {
+            BackendState::Unsupported
+        } else if calls > 0 {
+            BackendState::Active
+        } else {
+            BackendState::Requested
+        },
+        requested: dxr_requested,
+        enabled: dxr_requested,
+        initialized: proto.tier >= 10 && calls > 0,
+        active: calls > 0,
+        executed_calls: calls,
+        fallback_count: 0,
+        failure_count: 0,
+    };
+    (status, bvh_provenance)
+}
+
 /// Runtime metrics exposed by [`DxrBackend`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DxrBackendStats {
@@ -844,3 +880,37 @@ fn blas_build_flags(
 
 /// Convenience helper for index buffers typed as `DXGI_FORMAT_R32_UINT`.
 pub const INDEX_FORMAT_U32: DXGI_FORMAT = DXGI_FORMAT_R32_UINT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dxr_proto::DxrStats;
+    use crate::rea_telemetry::BackendState;
+
+    #[test]
+    fn runtime_status_honestly_reports_probed_only_and_bvh_provenance() {
+        let mut stats = DxrStats::default();
+        let (st_off, prov_off) = runtime_status(false, &stats, false);
+        assert_eq!(st_off.state, BackendState::Disabled);
+        assert_eq!(prov_off, "none");
+
+        stats.tier = 12;
+        let (st_probe, prov_probe) = runtime_status(true, &stats, true);
+        assert_eq!(st_probe.state, BackendState::Requested);
+        assert!(!st_probe.initialized);
+        assert!(!st_probe.active);
+        assert_eq!(prov_probe, "console_bvh4_memory");
+
+        stats.tier = 0;
+        let (st_unsup, _) = runtime_status(true, &stats, false);
+        assert_eq!(st_unsup.state, BackendState::Unsupported);
+
+        stats.tier = 12;
+        stats.blas_builds = 2;
+        let (st_active, prov_active) = runtime_status(true, &stats, true);
+        assert_eq!(st_active.state, BackendState::Active);
+        assert!(st_active.initialized);
+        assert!(st_active.active);
+        assert_eq!(prov_active, "native_dxr");
+    }
+}

@@ -124,6 +124,77 @@ impl UpscalerProbe {
     }
 }
 
+fn cached_host_dlls() -> (bool, bool) {
+    static DLLS: OnceLock<(bool, bool)> = OnceLock::new();
+    *DLLS.get_or_init(|| {
+        (
+            probe_dll(w!("amd_fidelityfx_dx12.dll")),
+            probe_dll(w!("nvngx_dlss.dll")),
+        )
+    })
+}
+
+/// Honest runtime status and active backend label for upscaler telemetry.
+pub fn runtime_status(
+    mode: UpscalerMode,
+    own_upscaler: bool,
+    ffx_creates: u64,
+    ffx_dispatches: u64,
+) -> (crate::rea_telemetry::BackendStatus, &'static str) {
+    use crate::rea_telemetry::{BackendState, BackendStatus};
+    let (fsr3_dll, dlss_dll) = cached_host_dlls();
+    match mode {
+        UpscalerMode::Original => (
+            BackendStatus {
+                state: BackendState::Disabled,
+                requested: false,
+                enabled: false,
+                initialized: false,
+                active: false,
+                executed_calls: 0,
+                fallback_count: 0,
+                failure_count: 0,
+            },
+            if own_upscaler {
+                "original_title_upscaler"
+            } else {
+                "xbox_fsr4_native"
+            },
+        ),
+        UpscalerMode::Fsr3 | UpscalerMode::Dlss => {
+            let dll_present = matches!(mode, UpscalerMode::Fsr3) && fsr3_dll
+                || matches!(mode, UpscalerMode::Dlss) && dlss_dll;
+            let state = if ffx_dispatches > 0 {
+                BackendState::ContextCreated
+            } else if dll_present {
+                BackendState::Requested
+            } else {
+                BackendState::LibraryMissing
+            };
+            let label = if ffx_dispatches > 0 || !dll_present {
+                "clean_room_temporal_compute_harness_only"
+            } else if matches!(mode, UpscalerMode::Fsr3) {
+                "native_fsr3_dll_detected_unhooked"
+            } else {
+                "native_dlss_dll_detected_unhooked"
+            };
+            (
+                BackendStatus {
+                    state,
+                    requested: true,
+                    enabled: true,
+                    initialized: ffx_creates > 0,
+                    active: false,
+                    executed_calls: ffx_dispatches,
+                    fallback_count: u64::from(!dll_present),
+                    failure_count: 0,
+                },
+                label,
+            )
+        }
+    }
+}
+
 fn probe_dll(name: PCWSTR) -> bool {
     // SAFETY: `LoadLibraryW` probes presence on standard Windows DLL search path; freed immediately.
     unsafe {
@@ -845,5 +916,27 @@ mod tests {
         );
         assert_eq!(upscaler.stats().dispatches, 9);
         assert_eq!(upscaler.stats().history_resets, 2);
+    }
+
+    #[test]
+    fn runtime_status_reports_honest_upscaler_labels_and_states() {
+        use crate::rea_telemetry::BackendState;
+        let (st_orig, lbl_orig) = runtime_status(UpscalerMode::Original, true, 0, 0);
+        assert_eq!(st_orig.state, BackendState::Disabled);
+        assert_eq!(lbl_orig, "original_title_upscaler");
+
+        let (st_fsr4, lbl_fsr4) = runtime_status(UpscalerMode::Original, false, 0, 0);
+        assert_eq!(st_fsr4.state, BackendState::Disabled);
+        assert_eq!(lbl_fsr4, "xbox_fsr4_native");
+
+        let (st_req, lbl_req) = runtime_status(UpscalerMode::Fsr3, true, 0, 0);
+        assert!(st_req.requested);
+        assert!(!st_req.active);
+        assert_ne!(lbl_req, "fsr3");
+
+        let (st_ctx, lbl_ctx) = runtime_status(UpscalerMode::Dlss, true, 1, 5);
+        assert_eq!(st_ctx.state, BackendState::ContextCreated);
+        assert_eq!(lbl_ctx, "clean_room_temporal_compute_harness_only");
+        assert!(!st_ctx.active);
     }
 }
