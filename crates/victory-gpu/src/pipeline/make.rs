@@ -329,7 +329,6 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
 }
@@ -651,6 +650,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
             return;
         }
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+            if priority == EARLY {
+                super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+            }
             p.make();
         }
         return;
@@ -658,6 +660,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
+            if priority == EARLY {
+                super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+            }
             PEAK.fetch_max(
                 WAITING.fetch_add(1, Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
@@ -989,10 +994,10 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false, false).unwrap().0, &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false, false).unwrap().0, &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, false).unwrap().0, &earlier));
+        assert!(queue.pop(false, false).is_none());
     }
 }
