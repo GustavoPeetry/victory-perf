@@ -12,10 +12,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC,
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS, D3D12_COMMAND_LIST_TYPE_DIRECT,
     D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-    D3D12_ELEMENTS_LAYOUT_ARRAY, D3D12_FEATURE_D3D12_OPTIONS5,
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5, D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE,
-    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_MEMORY_POOL_UNKNOWN, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+    D3D12_ELEMENTS_LAYOUT_ARRAY, D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5,
+    D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL, D3D12_RAYTRACING_GEOMETRY_DESC,
@@ -26,10 +26,9 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-    D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12CommandAllocator,
-    ID3D12CommandQueue, ID3D12Device, ID3D12Device5, ID3D12Fence, ID3D12GraphicsCommandList4,
-    ID3D12Resource,
+    D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_RESOURCE_UAV_BARRIER,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device,
+    ID3D12Device5, ID3D12Fence, ID3D12GraphicsCommandList4, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -251,10 +250,11 @@ pub fn run_isolated_smoke(device: &ID3D12Device) -> Result<DxrStats, String> {
                 IndexCount: 0,
                 VertexCount: 3,
                 IndexBuffer: 0,
-                VertexBuffer: windows::Win32::Graphics::Direct3D12::D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
-                    StartAddress: vb_gpu,
-                    StrideInBytes: 12,
-                },
+                VertexBuffer:
+                    windows::Win32::Graphics::Direct3D12::D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                        StartAddress: vb_gpu,
+                        StrideInBytes: 12,
+                    },
             },
         },
     };
@@ -397,10 +397,12 @@ pub fn run_isolated_smoke(device: &ID3D12Device) -> Result<DxrStats, String> {
         let cmd_list: windows::Win32::Graphics::Direct3D12::ID3D12CommandList =
             list4.cast().map_err(|e| format!("cast CommandList: {e}"))?;
         queue.ExecuteCommandLists(&[Some(cmd_list)]);
-        queue.Signal(&fence, 1).map_err(|e| format!("Signal: {e}"))?;
+        queue
+            .Signal(&fence, 1)
+            .map_err(|e| format!("Signal: {e}"))?;
         if fence.GetCompletedValue() < 1 {
-            let event = CreateEventW(None, false, false, None)
-                .map_err(|e| format!("CreateEventW: {e}"))?;
+            let event =
+                CreateEventW(None, false, false, None).map_err(|e| format!("CreateEventW: {e}"))?;
             fence
                 .SetEventOnCompletion(1, event)
                 .map_err(|e| format!("SetEventOnCompletion: {e}"))?;

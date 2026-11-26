@@ -4,8 +4,8 @@
 //! `VICTORY_REA_INCREMENTAL_ACCOUNTING=1` is set. Can optionally cross-check
 //! incremental totals against full enumeration under `VICTORY_REA_ACCOUNTING_AUDIT=1`.
 
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[repr(align(64))]
@@ -183,7 +183,9 @@ pub fn on_sparse_tiles_delta(delta_bytes: i64) {
     if delta_bytes >= 0 {
         METRICS.mapped_tile_bytes.add(delta_bytes as u64);
     } else {
-        METRICS.mapped_tile_bytes.sub_saturating(delta_bytes.unsigned_abs());
+        METRICS
+            .mapped_tile_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
     }
 }
 
@@ -203,12 +205,16 @@ pub fn on_shadow_delta(ram_delta: i64, vram_delta: i64) {
     if ram_delta >= 0 {
         METRICS.shadow_ram_bytes.add(ram_delta as u64);
     } else {
-        METRICS.shadow_ram_bytes.sub_saturating(ram_delta.unsigned_abs());
+        METRICS
+            .shadow_ram_bytes
+            .sub_saturating(ram_delta.unsigned_abs());
     }
     if vram_delta >= 0 {
         METRICS.shadow_vram_bytes.add(vram_delta as u64);
     } else {
-        METRICS.shadow_vram_bytes.sub_saturating(vram_delta.unsigned_abs());
+        METRICS
+            .shadow_vram_bytes
+            .sub_saturating(vram_delta.unsigned_abs());
     }
 }
 
@@ -217,7 +223,9 @@ pub fn on_upload_ring_delta(delta_bytes: i64) {
     if delta_bytes >= 0 {
         METRICS.upload_ring_bytes.add(delta_bytes as u64);
     } else {
-        METRICS.upload_ring_bytes.sub_saturating(delta_bytes.unsigned_abs());
+        METRICS
+            .upload_ring_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
     }
 }
 
@@ -275,7 +283,11 @@ pub fn invalidate_budget_cache() {
 }
 
 /// Compare incremental live texture totals against an independent full-walk enumeration.
-pub fn record_audit(enumerated_committed_bytes: u64, enumerated_mapped_bytes: u64, tolerance: u64) -> u64 {
+pub fn record_audit(
+    enumerated_committed_bytes: u64,
+    enumerated_mapped_bytes: u64,
+    tolerance: u64,
+) -> u64 {
     METRICS.audit_runs.add(1);
     let expected = enumerated_committed_bytes.saturating_add(enumerated_mapped_bytes);
     let tracked = METRICS
@@ -283,7 +295,10 @@ pub fn record_audit(enumerated_committed_bytes: u64, enumerated_mapped_bytes: u6
         .load()
         .saturating_add(METRICS.mapped_tile_bytes.load());
     let drift = tracked.abs_diff(expected);
-    METRICS.last_audit_drift_bytes.0.store(drift, Ordering::Relaxed);
+    METRICS
+        .last_audit_drift_bytes
+        .0
+        .store(drift, Ordering::Relaxed);
     if drift > tolerance {
         METRICS.audit_mismatches.add(1);
         tracing::warn!(
@@ -333,10 +348,19 @@ mod tests {
         on_shadow_delta(1024, 2048);
 
         let mid = snapshot();
-        assert_eq!(mid.committed_textures_bytes, base.committed_textures_bytes + 4096);
-        assert_eq!(mid.reserved_textures_bytes, base.reserved_textures_bytes + 65536);
+        assert_eq!(
+            mid.committed_textures_bytes,
+            base.committed_textures_bytes + 4096
+        );
+        assert_eq!(
+            mid.reserved_textures_bytes,
+            base.reserved_textures_bytes + 65536
+        );
         assert_eq!(mid.mapped_tile_bytes, base.mapped_tile_bytes + 65536);
-        assert_eq!(mid.tile_pool_allocated_bytes, base.tile_pool_allocated_bytes + 131072);
+        assert_eq!(
+            mid.tile_pool_allocated_bytes,
+            base.tile_pool_allocated_bytes + 131072
+        );
         assert_eq!(mid.shadow_ram_bytes, base.shadow_ram_bytes + 1024);
         assert_eq!(mid.shadow_vram_bytes, base.shadow_vram_bytes + 2048);
 

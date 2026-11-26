@@ -1905,6 +1905,71 @@ mod merge_tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "rea002 microbenchmark"]
+    fn rea002_bench_avx2_vs_scalar_diff() {
+        const SIZE: usize = 16 << 20;
+        const ITERS: usize = 16;
+        let a = vec![0x3Cu8; SIZE];
+        let mut b = a.clone();
+        // Inject 1% dirty spans near tail/middle/start to exercise changed_runs.
+        for chunk in (0..SIZE).step_by(4096) {
+            if (chunk / 4096).is_multiple_of(10) {
+                b[chunk..chunk + 64].fill(0xA5);
+            }
+        }
+        // 1) Equal-buffer scan (worst case for early-exit slices_differ).
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            assert!(!(std::hint::black_box(&a) != std::hint::black_box(&a)));
+        }
+        let scalar_eq = t0.elapsed();
+
+        let avx2 = super::avx2_supported();
+        let t1 = std::time::Instant::now();
+        if avx2 {
+            for _ in 0..ITERS {
+                assert!(unsafe { !super::slices_differ_avx2(std::hint::black_box(&a), std::hint::black_box(&a)) });
+            }
+        }
+        let avx2_eq = t1.elapsed();
+
+        // 2) changed_runs over 16 MiB with sparse dirty ranges.
+        let t2 = std::time::Instant::now();
+        let mut total_runs = 0usize;
+        for _ in 0..4 {
+            total_runs += std::hint::black_box(super::changed_runs_scalar(&b, &a)).len();
+        }
+        let scalar_runs = t2.elapsed();
+
+        let t3 = std::time::Instant::now();
+        let mut total_runs_avx = 0usize;
+        if avx2 {
+            for _ in 0..4 {
+                total_runs_avx +=
+                    std::hint::black_box(unsafe { super::changed_runs_avx2(&b, &a) }).len();
+            }
+        }
+        let avx2_runs = t3.elapsed();
+        assert_eq!(total_runs, total_runs_avx);
+
+        let total_gb_eq = (SIZE * ITERS) as f64 / 1e9;
+        let total_gb_runs = (SIZE * 4) as f64 / 1e9;
+        println!(
+            "REA002_BENCH_AVX2 avx2={avx2} eq_scalar_gbps={:.2} eq_avx2_gbps={:.2} eq_speedup={:.2}x \
+             runs_scalar_ms={:.2} runs_avx2_ms={:.2} runs_scalar_gbps={:.2} runs_avx2_gbps={:.2} runs_speedup={:.2}x runs={total_runs}",
+            total_gb_eq / scalar_eq.as_secs_f64(),
+            total_gb_eq / avx2_eq.as_secs_f64(),
+            scalar_eq.as_secs_f64() / avx2_eq.as_secs_f64(),
+            scalar_runs.as_secs_f64() * 1e3 / 4.0,
+            avx2_runs.as_secs_f64() * 1e3 / 4.0,
+            total_gb_runs / scalar_runs.as_secs_f64(),
+            total_gb_runs / avx2_runs.as_secs_f64(),
+            scalar_runs.as_secs_f64() / avx2_runs.as_secs_f64(),
+        );
+    }
+
     #[test]
     fn word_merge_matches_scalar_byte_for_byte() {
         fn next(state: &mut u64) -> u64 {

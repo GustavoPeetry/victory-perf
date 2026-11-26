@@ -24,9 +24,8 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
-    VirtualProtect, VirtualQuery,
+    MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -510,10 +509,21 @@ enum CallThunkPost {
 
 #[derive(Clone, Copy, Debug)]
 enum PlannedSite {
-    ClzeroLoop { patch_va: usize, end_reg: u8 },
-    ClzeroAltLoop { patch_va: usize, cur_reg: u8, end_reg: u8 },
-    Monitorx { patch_va: usize },
-    Mwaitx { patch_va: usize },
+    ClzeroLoop {
+        patch_va: usize,
+        end_reg: u8,
+    },
+    ClzeroAltLoop {
+        patch_va: usize,
+        cur_reg: u8,
+        end_reg: u8,
+    },
+    Monitorx {
+        patch_va: usize,
+    },
+    Mwaitx {
+        patch_va: usize,
+    },
 }
 
 /// Summary of load-time binary fast-path patching.
@@ -652,8 +662,7 @@ fn find_sites_in_buffer(section_va: usize, sec: &[u8]) -> Vec<PlannedSite> {
 
         // 4. Verified MWAITX pair pattern: `mov ecx, 2; xor eax, eax; mwaitx; mov ..., [...]`
         if i + 13 <= sec.len()
-            && sec[i..i + 10]
-                == [0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x01, 0xFB]
+            && sec[i..i + 10] == [0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x01, 0xFB]
             && sec[i + 10..i + 12] == [0x48, 0x8B]
         {
             sites.push(PlannedSite::Mwaitx {
@@ -675,7 +684,10 @@ unsafe fn emit_and_patch_sites(near_va: usize, sites: &[PlannedSite]) -> PatchSu
     }
 
     let Some(slab) = (unsafe { alloc_nearby_slab(near_va) }) else {
-        tracing::warn!(near_va = format_args!("{near_va:#x}"), "failed to allocate nearby fastpath slab");
+        tracing::warn!(
+            near_va = format_args!("{near_va:#x}"),
+            "failed to allocate nearby fastpath slab"
+        );
         return summary;
     };
 
@@ -695,8 +707,7 @@ unsafe fn emit_and_patch_sites(near_va: usize, sites: &[PlannedSite]) -> PatchSu
                 cur_reg,
                 end_reg,
             } => {
-                if let Ok(stub) =
-                    emitter.emit_clzero_alt_loop_stub(cur_reg, end_reg, patch_va + 15)
+                if let Ok(stub) = emitter.emit_clzero_alt_loop_stub(cur_reg, end_reg, patch_va + 15)
                 {
                     patches.push((patch_va, 15, stub));
                     summary.clzero_alt_loops += 1;
@@ -726,7 +737,10 @@ unsafe fn emit_and_patch_sites(near_va: usize, sites: &[PlannedSite]) -> PatchSu
     }
 
     if emitter.bytes.len() > PAGE_SIZE {
-        tracing::warn!(bytes = emitter.bytes.len(), "fastpath stubs exceeded 4 KiB slab page");
+        tracing::warn!(
+            bytes = emitter.bytes.len(),
+            "fastpath stubs exceeded 4 KiB slab page"
+        );
         return PatchSummary::default();
     }
 
@@ -923,7 +937,11 @@ mod tests {
 
         let sec_slice = unsafe { std::slice::from_raw_parts(code_buf.cast::<u8>(), 0x100) };
         let sites = find_sites_in_buffer(code_va, sec_slice);
-        assert_eq!(sites.len(), 2, "must discover both standard and alt clzero loop sites");
+        assert_eq!(
+            sites.len(),
+            2,
+            "must discover both standard and alt clzero loop sites"
+        );
 
         let summary = unsafe { emit_and_patch_sites(code_va, &sites) };
         assert_eq!(summary.clzero_loops, 1);
@@ -972,7 +990,10 @@ mod tests {
         assert!(canary.iter().all(|&b| b == 0x77));
 
         let after_stats = console_insn_stats();
-        assert_eq!(after_stats.emu_total, before_stats.emu_total, "zero #UD exceptions");
+        assert_eq!(
+            after_stats.emu_total, before_stats.emu_total,
+            "zero #UD exceptions"
+        );
         assert!(after_stats.fast_clzero_bytes - before_stats.fast_clzero_bytes >= expected_bytes);
         assert!(after_stats.fast_clzero_calls - before_stats.fast_clzero_calls >= 8);
     }
@@ -1033,26 +1054,35 @@ mod tests {
         //   pop rdi               (5F)
         //   ret                   (C3)
         let func_bytes: [u8; 32] = [
-            0x57, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xF8,
-            0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA,
-            0x48, 0x8B, 0x17,
-            0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x01, 0xFB,
-            0x48, 0x8B, 0x07,
-            0x5F, 0xC3,
+            0x57, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xF8, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA,
+            0x48, 0x8B, 0x17, 0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x01, 0xFB, 0x48,
+            0x8B, 0x07, 0x5F, 0xC3,
         ];
         unsafe {
-            std::ptr::copy_nonoverlapping(func_bytes.as_ptr(), code_buf.cast::<u8>(), func_bytes.len());
+            std::ptr::copy_nonoverlapping(
+                func_bytes.as_ptr(),
+                code_buf.cast::<u8>(),
+                func_bytes.len(),
+            );
         }
-        let sec_slice = unsafe { std::slice::from_raw_parts(code_buf.cast::<u8>(), func_bytes.len()) };
+        let sec_slice =
+            unsafe { std::slice::from_raw_parts(code_buf.cast::<u8>(), func_bytes.len()) };
         let sites = find_sites_in_buffer(code_va, sec_slice);
-        assert_eq!(sites.len(), 2, "must discover monitorx and mwaitx patch windows");
+        assert_eq!(
+            sites.len(),
+            2,
+            "must discover monitorx and mwaitx patch windows"
+        );
         let summary = unsafe { emit_and_patch_sites(code_va, &sites) };
         assert_eq!(summary.monitorx_sites, 1);
         assert_eq!(summary.mwaitx_sites, 1);
 
         let mut old = 0u32;
         unsafe {
-            assert_ne!(VirtualProtect(code_buf, PAGE_SIZE, PAGE_EXECUTE_READ, &mut old), 0);
+            assert_ne!(
+                VirtualProtect(code_buf, PAGE_SIZE, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
             FlushInstructionCache(GetCurrentProcess(), code_buf, PAGE_SIZE);
         }
 
@@ -1062,8 +1092,90 @@ mod tests {
         let read = unsafe { exec(watched.as_ptr()) };
         assert_eq!(read, 0xABCD_1234_5678_90EF);
         let after = console_insn_stats();
-        assert_eq!(after.emu_total, before.emu_total, "zero #UD exceptions on monitorx/mwaitx");
+        assert_eq!(
+            after.emu_total, before.emu_total,
+            "zero #UD exceptions on monitorx/mwaitx"
+        );
         assert!(after.fast_monitorx_calls > before.fast_monitorx_calls);
         assert!(after.fast_mwaitx_calls > before.fast_mwaitx_calls);
+    }
+
+    #[test]
+    #[ignore = "rea002 microbenchmark"]
+    fn rea002_bench_erms_clzero_vs_scalar() {
+        const BUF_BYTES: usize = 4 << 20;
+        const ITERS: usize = 64;
+        let code_buf = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!code_buf.is_null());
+        let code_va = code_buf as usize;
+        let fn1: [u8; 19] = [
+            0x48, 0x89, 0xC8, 0x49, 0x89, 0xD2, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C,
+            0x39, 0xD0, 0x72, 0xF4, 0xC3,
+        ];
+        unsafe {
+            std::ptr::copy_nonoverlapping(fn1.as_ptr(), code_buf.cast::<u8>(), fn1.len());
+        }
+        let sec_slice = unsafe { std::slice::from_raw_parts(code_buf.cast::<u8>(), 64) };
+        let sites = find_sites_in_buffer(code_va, sec_slice);
+        let summary = unsafe { emit_and_patch_sites(code_va, &sites) };
+        assert_eq!(summary.clzero_loops, 1);
+
+        let mut old = 0u32;
+        unsafe {
+            assert_ne!(
+                VirtualProtect(code_buf, PAGE_SIZE, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
+            FlushInstructionCache(GetCurrentProcess(), code_buf, PAGE_SIZE);
+        }
+
+        let exec: unsafe extern "C" fn(usize, usize) -> usize =
+            unsafe { std::mem::transmute(code_va) };
+        let mut buf = vec![0xCDu8; BUF_BYTES + 128];
+        let base = ((buf.as_mut_ptr() as usize) + 63) & !63;
+
+        // Warmup + native ERMS benchmark.
+        unsafe { exec(base, base + BUF_BYTES) };
+        let t_erms = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let ret = unsafe { exec(base, base + BUF_BYTES) };
+            std::hint::black_box(ret);
+        }
+        let dt_erms = t_erms.elapsed();
+
+        // Cache-line-by-cache-line volatile scalar zeroing loop (modelling per-64B emulation).
+        let t_line = std::time::Instant::now();
+        for _ in 0..ITERS {
+            let mut cur = base;
+            let end = base + BUF_BYTES;
+            while cur < end {
+                unsafe {
+                    std::ptr::write_volatile(cur as *mut [u64; 8], [0u64; 8]);
+                }
+                cur += 64;
+            }
+        }
+        let dt_line = t_line.elapsed();
+        assert_eq!(unsafe { *(base as *const u64) }, 0);
+
+        let total_gb = (BUF_BYTES * ITERS) as f64 / 1e9;
+        println!(
+            "REA002_BENCH_ERMS buf_mb={} iters={} erms_ms={:.3} erms_gbps={:.2} \
+             line64_ms={:.3} line64_gbps={:.2} speedup={:.2}x",
+            BUF_BYTES >> 20,
+            ITERS,
+            dt_erms.as_secs_f64() * 1e3,
+            total_gb / dt_erms.as_secs_f64(),
+            dt_line.as_secs_f64() * 1e3,
+            total_gb / dt_line.as_secs_f64(),
+            dt_line.as_secs_f64() / dt_erms.as_secs_f64(),
+        );
     }
 }

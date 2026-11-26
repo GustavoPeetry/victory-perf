@@ -29,12 +29,10 @@ const MAX_CACHED_POOL_BYTES: u64 = 64 << 20;
 const MAX_POOLED_BUFFER_BYTES: u64 = 16 << 20;
 
 fn parse_bool(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|v| {
-            let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-        })
+    std::env::var(name).ok().is_some_and(|v| {
+        let t = v.trim();
+        t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+    })
 }
 
 /// Whether `VICTORY_REA_ASYNC_STREAMING=1` enables the pooled upload ring and
@@ -409,18 +407,15 @@ unsafe impl Send for AsyncCopyQueue {}
 impl AsyncCopyQueue {
     pub fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
         unsafe {
-            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                ..Default::default()
-            })?;
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })?;
             let allocator: ID3D12CommandAllocator =
                 device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-            let list: ID3D12GraphicsCommandList = device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_COPY,
-                &allocator,
-                None,
-            )?;
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
             Ok(Self {
@@ -492,24 +487,26 @@ mod tests {
         }
         let device = device.unwrap();
 
-        let (res1, ptr1, cap1) = checkout_upload(&device, 32 << 10, 0).expect("alloc pooled buffer");
+        let (res1, ptr1, cap1) =
+            checkout_upload(&device, 32 << 10, 0).expect("alloc pooled buffer");
         let raw1 = res1.as_raw() as usize;
         assert_eq!(cap1, 64 << 10);
         // Retire at submission 5; before finished=5 it must NOT be reused!
         return_upload(res1, ptr1, cap1, 5);
         assert!(
-            UPLOAD_POOL
-                .lock()
-                .unwrap()
-                .take(cap1, 4)
-                .is_none(),
+            UPLOAD_POOL.lock().unwrap().take(cap1, 4).is_none(),
             "in-flight retired buffer must not be reused before fence reaches submission 5"
         );
 
         let before_hits = stats().pool_hits;
-        let (res2, _ptr2, cap2) = checkout_upload(&device, 40 << 10, 5).expect("reuse pooled buffer");
+        let (res2, _ptr2, cap2) =
+            checkout_upload(&device, 40 << 10, 5).expect("reuse pooled buffer");
         assert_eq!(cap2, 64 << 10);
-        assert_eq!(res2.as_raw() as usize, raw1, "bucket reuse should hand back the exact cached resource");
+        assert_eq!(
+            res2.as_raw() as usize,
+            raw1,
+            "bucket reuse should hand back the exact cached resource"
+        );
         assert_eq!(stats().pool_hits, before_hits + 1);
     }
 
@@ -541,32 +538,40 @@ mod tests {
         }
 
         // Allocate DEFAULT destination buffer and READBACK verification buffer.
-        let make_buf = |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
-            let mut r = None;
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: heap_type,
-                ..Default::default()
+        let make_buf =
+            |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let mut r = None;
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: heap_type,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: payload_len,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                unsafe {
+                    device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            state,
+                            None,
+                            &mut r,
+                        )
+                        .unwrap();
+                }
+                r.unwrap()
             };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: payload_len,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            unsafe {
-                device
-                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
-                    .unwrap();
-            }
-            r.unwrap()
-        };
 
         let gpu_dst = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
         let cpu_readback = make_buf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -580,8 +585,9 @@ mod tests {
 
         // Now execute a copy gpu_dst -> cpu_readback on DirectQueue (which waits on copy_fence!).
         unsafe {
-            let alloc: ID3D12CommandAllocator =
-                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
             let list: ID3D12GraphicsCommandList = device
                 .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
                 .unwrap();
@@ -599,7 +605,11 @@ mod tests {
             let mut map_ptr: *mut c_void = std::ptr::null_mut();
             cpu_readback.Map(0, None, Some(&mut map_ptr)).unwrap();
             let got = std::slice::from_raw_parts(map_ptr.cast::<u8>(), payload_len as usize);
-            assert_eq!(got, &expected[..], "cross-queue CopyQueue -> DirectQueue transfer must match byte-for-byte");
+            assert_eq!(
+                got,
+                &expected[..],
+                "cross-queue CopyQueue -> DirectQueue transfer must match byte-for-byte"
+            );
             cpu_readback.Unmap(0, None);
         }
         ring.reclaim(1);

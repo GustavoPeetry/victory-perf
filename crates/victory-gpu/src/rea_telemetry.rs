@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn telemetry_json_rejects_in_repo_path_and_writes_temp_path() {
-        let in_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("illegal-telemetry.jsonl");
+        let in_repo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("illegal-telemetry.jsonl");
         let err = append_json_line_to(&in_repo, "{}").unwrap_err();
         assert!(err.contains("inside") || err.contains("repository") || err.contains("repo"));
 

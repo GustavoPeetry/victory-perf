@@ -216,11 +216,7 @@ impl HeapChunk {
             });
         }
         // Fall back to taking the largest available contiguous run inside this chunk.
-        let (idx, _) = self
-            .free
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, s)| s.len)?;
+        let (idx, _) = self.free.iter().enumerate().max_by_key(|(_, s)| s.len)?;
         let span = self.free.remove(idx);
         self.free_tiles -= span.len;
         Some(PoolExtent {
@@ -238,7 +234,9 @@ impl HeapChunk {
         let pos = self.free.partition_point(|s| s.start < start);
         self.free.insert(pos, FreeSpan { start, len });
         // Coalesce right neighbor, then left neighbor.
-        if pos + 1 < self.free.len() && self.free[pos].start + self.free[pos].len == self.free[pos + 1].start {
+        if pos + 1 < self.free.len()
+            && self.free[pos].start + self.free[pos].len == self.free[pos + 1].start
+        {
             self.free[pos].len += self.free[pos + 1].len;
             self.free.remove(pos + 1);
         }
@@ -374,7 +372,12 @@ impl TilePoolState {
 
     /// Allocate `count` tiles (contiguously in one chunk whenever possible so
     /// `UpdateTileMappings` avoids multi-heap splits).
-    fn alloc(&mut self, device: &ID3D12Device, count: u32, finished_submission: u64) -> Option<Vec<(ID3D12Heap, PoolExtent)>> {
+    fn alloc(
+        &mut self,
+        device: &ID3D12Device,
+        count: u32,
+        finished_submission: u64,
+    ) -> Option<Vec<(ID3D12Heap, PoolExtent)>> {
         if count == 0 {
             return Some(Vec::new());
         }
@@ -716,7 +719,8 @@ impl SparseBinding {
             if per_slice_tiles == 0 {
                 st.standard[mip as usize].mapped = true;
                 if mip < 64 {
-                    self.mapped_mips_mask.fetch_or(1u64 << mip, Ordering::Release);
+                    self.mapped_mips_mask
+                        .fetch_or(1u64 << mip, Ordering::Release);
                 }
                 continue;
             }
@@ -727,12 +731,14 @@ impl SparseBinding {
             };
             if let Some(allocs) = allocated {
                 if self.map_standard_mip_slices(queue, mip, &allocs) {
-                    st.standard[mip as usize].extents = allocs.into_iter().map(|(_, ext)| ext).collect();
+                    st.standard[mip as usize].extents =
+                        allocs.into_iter().map(|(_, ext)| ext).collect();
                     st.standard[mip as usize].mapped = true;
                     st.standard[mip as usize].tile_count = total_mip_tiles;
                     newly_mapped_tiles += total_mip_tiles;
                     if mip < 64 {
-                        self.mapped_mips_mask.fetch_or(1u64 << mip, Ordering::Release);
+                        self.mapped_mips_mask
+                            .fetch_or(1u64 << mip, Ordering::Release);
                     }
                 } else {
                     let extents = allocs.into_iter().map(|(_, ext)| ext).collect();
@@ -1022,11 +1028,14 @@ impl SparseBinding {
             st.standard[mip as usize].mapped = false;
             st.standard[mip as usize].tile_count = 0;
             if mip < 64 {
-                self.mapped_mips_mask.fetch_and(!(1u64 << mip), Ordering::Release);
+                self.mapped_mips_mask
+                    .fetch_and(!(1u64 << mip), Ordering::Release);
             }
             if tile_count > 0 {
-                self.mapped_tiles_count
-                    .fetch_sub(tile_count.min(self.mapped_tiles_count.load(Ordering::Relaxed)), Ordering::Relaxed);
+                self.mapped_tiles_count.fetch_sub(
+                    tile_count.min(self.mapped_tiles_count.load(Ordering::Relaxed)),
+                    Ordering::Relaxed,
+                );
                 let bytes = u64::from(tile_count) * TILE_SIZE;
                 reclaimed_bytes += bytes;
                 TILES_RECLAIMED_TOTAL.fetch_add(u64::from(tile_count), Ordering::Relaxed);
@@ -1170,13 +1179,9 @@ mod tests {
             Flags: D3D12_RESOURCE_FLAG_NONE,
         };
 
-        let (res, binding) = SparseBinding::create(
-            &device,
-            &desc,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-        )
-        .expect("reserved resource + tiling info");
+        let (res, binding) =
+            SparseBinding::create(&device, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None)
+                .expect("reserved resource + tiling info");
 
         assert!(binding.virtual_bytes >= 5 << 20);
         assert_eq!(binding.mapped_bytes(), 0);
@@ -1213,6 +1218,87 @@ mod tests {
 
         binding.retire_all(2);
         POOL.lock().unwrap().drain_retired(2);
+        drop(res);
+    }
+
+    #[test]
+    #[ignore = "rea002 microbenchmark"]
+    fn rea002_bench_sparse_residency_and_dxr() {
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            return;
+        }
+        let device = device.unwrap();
+        let sup = query_tiled_support(&device);
+        assert!(sup.supported);
+        let queue: ID3D12CommandQueue = unsafe {
+            device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 4096,
+            Height: 4096,
+            DepthOrArraySize: 1,
+            MipLevels: 13,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let t_create = std::time::Instant::now();
+        let (res, binding) =
+            SparseBinding::create(&device, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None)
+                .expect("4k BC7 reserved resource");
+        let create_us = t_create.elapsed().as_micros();
+
+        let t_tail = std::time::Instant::now();
+        let tail_first = binding.num_standard_mips.min(binding.mip_levels - 1);
+        let _ = binding.ensure_resident(&queue, tail_first, 1, 0, 100);
+        let tail_us = t_tail.elapsed().as_micros();
+        let tail_mapped = binding.mapped_bytes();
+
+        let t_mip3 = std::time::Instant::now();
+        let _ = binding.ensure_resident(&queue, 3, 2, 0, 101);
+        let mip3_us = t_mip3.elapsed().as_micros();
+        let mip3_mapped = binding.mapped_bytes();
+
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        unsafe { queue.Signal(&fence, 1).unwrap() };
+        while unsafe { fence.GetCompletedValue() } < 1 {
+            std::thread::yield_now();
+        }
+        let virt = binding.virtual_bytes;
+        let saving_tail_pct = 100.0 * (1.0 - tail_mapped as f64 / virt as f64);
+        let saving_mip3_pct = 100.0 * (1.0 - mip3_mapped as f64 / virt as f64);
+
+        let dxr = crate::dxr_proto::run_isolated_smoke(&device).ok();
+        println!(
+            "REA002_BENCH_SPARSE_4K_BC7 tier={:?} virt_bytes={} tail_mapped_bytes={} tail_saving_pct={:.2} \
+             mip3_mapped_bytes={} mip3_saving_pct={:.2} create_us={create_us} map_tail_us={tail_us} map_mip3_us={mip3_us} \
+             dxr_tier={} dxr_build_us={} dxr_blas_bytes={} dxr_tlas_bytes={}",
+            sup.tier,
+            virt,
+            tail_mapped,
+            saving_tail_pct,
+            mip3_mapped,
+            saving_mip3_pct,
+            dxr.map(|d| d.tier).unwrap_or(0),
+            dxr.map(|d| d.last_build_us).unwrap_or(0),
+            dxr.map(|d| d.blas_bytes).unwrap_or(0),
+            dxr.map(|d| d.tlas_bytes).unwrap_or(0),
+        );
+
+        binding.retire_all(1);
+        POOL.lock().unwrap().drain_retired(1);
         drop(res);
     }
 }

@@ -164,8 +164,16 @@ pub fn register_range(start: usize, len: usize, class: AuthorityClass, readback_
     let end = start.saturating_add(len);
     let idx = shard_index(start);
     let mut entries = TABLE.shards[idx].entries.write().unwrap();
-    if let Some(existing) = entries.iter_mut().find(|e| e.start == start && e.end == end) {
-        if existing.demoted_once && matches!(class, AuthorityClass::GpuAuthoritative | AuthorityClass::GpuOnly) {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|e| e.start == start && e.end == end)
+    {
+        if existing.demoted_once
+            && matches!(
+                class,
+                AuthorityClass::GpuAuthoritative | AuthorityClass::GpuOnly
+            )
+        {
             return;
         }
         let prev = existing.class;
@@ -259,7 +267,12 @@ pub fn class_for(start: usize, len: usize) -> AuthorityClass {
 /// Only promotes a `SharedCoherent` range to `GpuAuthoritative` if `enabled()` is
 /// true, `readback_flagged` is false, `cpu_reads == 0`, the range has never been
 /// demoted, and it has sustained at least 2 pure-GPU writes without CPU readback.
-pub fn observe_gpu_write(start: usize, len: usize, readback_flagged: bool, readback_proven_complete: bool) {
+pub fn observe_gpu_write(
+    start: usize,
+    len: usize,
+    readback_flagged: bool,
+    readback_proven_complete: bool,
+) {
     if !enabled() || len == 0 {
         return;
     }
@@ -363,13 +376,18 @@ pub fn stats() -> AuthorityStats {
     AuthorityStats {
         enabled: enabled(),
         strict: strict_mode(),
-        cpu_authoritative: CLASS_COUNTS[AuthorityClass::CpuAuthoritative as usize].load(Ordering::Relaxed),
-        cpu_to_gpu_streamed: CLASS_COUNTS[AuthorityClass::CpuToGpuStreamed as usize].load(Ordering::Relaxed),
-        gpu_authoritative: CLASS_COUNTS[AuthorityClass::GpuAuthoritative as usize].load(Ordering::Relaxed),
+        cpu_authoritative: CLASS_COUNTS[AuthorityClass::CpuAuthoritative as usize]
+            .load(Ordering::Relaxed),
+        cpu_to_gpu_streamed: CLASS_COUNTS[AuthorityClass::CpuToGpuStreamed as usize]
+            .load(Ordering::Relaxed),
+        gpu_authoritative: CLASS_COUNTS[AuthorityClass::GpuAuthoritative as usize]
+            .load(Ordering::Relaxed),
         gpu_only: CLASS_COUNTS[AuthorityClass::GpuOnly as usize].load(Ordering::Relaxed),
-        shared_coherent: CLASS_COUNTS[AuthorityClass::SharedCoherent as usize].load(Ordering::Relaxed),
+        shared_coherent: CLASS_COUNTS[AuthorityClass::SharedCoherent as usize]
+            .load(Ordering::Relaxed),
         sparse_tiled: CLASS_COUNTS[AuthorityClass::SparseTiled as usize].load(Ordering::Relaxed),
-        transient_upload: CLASS_COUNTS[AuthorityClass::TransientUpload as usize].load(Ordering::Relaxed),
+        transient_upload: CLASS_COUNTS[AuthorityClass::TransientUpload as usize]
+            .load(Ordering::Relaxed),
         promoted_gpu_auth: PROMOTED_GPU_AUTH.load(Ordering::Relaxed),
         demoted_to_shared: DEMOTED_TO_SHARED.load(Ordering::Relaxed),
         skipped_before_twins: SKIPPED_BEFORE_TWINS.load(Ordering::Relaxed),
@@ -385,7 +403,10 @@ mod tests {
     fn disabled_authority_reports_shared_coherent() {
         // Default test process has VICTORY_REA_GPU_AUTHORITY unset.
         register_range(0x1000_0000, 0x1000, AuthorityClass::GpuOnly, true);
-        assert_eq!(class_for(0x1000_0000, 0x1000), AuthorityClass::SharedCoherent);
+        assert_eq!(
+            class_for(0x1000_0000, 0x1000),
+            AuthorityClass::SharedCoherent
+        );
         assert!(!can_skip_gpu_compare(0x1000_0000, 0x1000, false));
         unregister_range(0x1000_0000, 0x1000);
     }

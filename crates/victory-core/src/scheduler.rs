@@ -106,7 +106,9 @@ fn parse_bool_env(name: &str) -> bool {
         .ok()
         .map(|v| {
             let trimmed = v.trim();
-            trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes")
+            trimmed == "1"
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
 }
@@ -184,10 +186,22 @@ pub fn plan_for_topology(topo: CpuTopology, overrides: SchedulerOverrides) -> Wo
         (physical / 2).clamp(2, 4)
     };
 
-    let streaming_workers = overrides.streaming_workers.unwrap_or(auto_streaming).clamp(1, logical);
-    let shader_workers = overrides.shader_workers.unwrap_or(auto_shader).clamp(1, logical);
-    let shadow_workers = overrides.shadow_workers.unwrap_or(auto_shadow).clamp(1, logical);
-    let memcopy_workers = overrides.memcopy_workers.unwrap_or(auto_memcopy).clamp(1, logical);
+    let streaming_workers = overrides
+        .streaming_workers
+        .unwrap_or(auto_streaming)
+        .clamp(1, logical);
+    let shader_workers = overrides
+        .shader_workers
+        .unwrap_or(auto_shader)
+        .clamp(1, logical);
+    let shadow_workers = overrides
+        .shadow_workers
+        .unwrap_or(auto_shadow)
+        .clamp(1, logical);
+    let memcopy_workers = overrides
+        .memcopy_workers
+        .unwrap_or(auto_memcopy)
+        .clamp(1, logical);
 
     let mut active_mask = if topo.preferred_mask != 0 {
         topo.preferred_mask
@@ -327,7 +341,11 @@ pub fn adapt_title_affinity(requested_mask: usize) -> usize {
     // If the title asked for a single logical core on a constrained host (<= 4C/8T)
     // widen to the preferred active mask so OS scheduler can migrate across free threads
     // without stalling on a saturated core.
-    if p.widen_single_core_masks && p.topology.physical_cores <= 4 && masked.count_ones() <= 1 && valid.count_ones() > 1 {
+    if p.widen_single_core_masks
+        && p.topology.physical_cores <= 4
+        && masked.count_ones() <= 1
+        && valid.count_ones() > 1
+    {
         AFFINITY_WIDENED.fetch_add(1, Ordering::Relaxed);
         return valid;
     }
@@ -393,8 +411,8 @@ pub fn stats() -> SchedulerStats {
 #[cfg(windows)]
 fn apply_os_thread_hints(role: ThreadRole, worker_index: usize, plan: &WorkerPlan) {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadIdealProcessor, SetThreadPriority,
-        THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
+        GetCurrentThread, SetThreadIdealProcessor, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
     };
 
     let prio = match role {
@@ -439,9 +457,9 @@ fn pick_nth_set_bit(mask: usize, n: usize) -> Option<usize> {
 fn probe_topology() -> CpuTopology {
     use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
     use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, GetSystemCpuSetInformation,
-        RelationAll, RelationCache, RelationNumaNode, RelationProcessorCore,
-        SYSTEM_CPU_SET_INFORMATION, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        GetLogicalProcessorInformationEx, GetSystemCpuSetInformation, RelationAll, RelationCache,
+        RelationNumaNode, RelationProcessorCore, SYSTEM_CPU_SET_INFORMATION,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
     let fallback_logical = std::thread::available_parallelism()
@@ -457,19 +475,23 @@ fn probe_topology() -> CpuTopology {
     let mut best_mask = 0usize;
 
     let mut bytes = 0u32;
-    let ok = unsafe { GetLogicalProcessorInformationEx(RelationAll, std::ptr::null_mut(), &mut bytes) };
+    let ok =
+        unsafe { GetLogicalProcessorInformationEx(RelationAll, std::ptr::null_mut(), &mut bytes) };
     if ok == 0 && unsafe { GetLastError() } == ERROR_INSUFFICIENT_BUFFER && bytes > 0 {
         let mut buf = vec![0u8; bytes as usize];
         let ok2 = unsafe {
             GetLogicalProcessorInformationEx(
                 RelationAll,
-                buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+                buf.as_mut_ptr()
+                    .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
                 &mut bytes,
             )
         };
         if ok2 != 0 {
             let mut offset = 0usize;
-            while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= bytes as usize {
+            while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+                <= bytes as usize
+            {
                 let info = unsafe {
                     &*buf
                         .as_ptr()
