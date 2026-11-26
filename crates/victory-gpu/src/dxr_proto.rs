@@ -151,7 +151,7 @@ pub(crate) fn on_slot_0x218_call(calls: u32, desc: *const u8) {
     }
 }
 
-fn create_buffer(
+pub(crate) fn create_buffer(
     device: &ID3D12Device,
     size: u64,
     heap_type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE,
@@ -197,7 +197,7 @@ fn create_buffer(
     resource.ok_or_else(|| "CreateCommittedResource returned None".to_owned())
 }
 
-fn upload_slice<T: Copy>(resource: &ID3D12Resource, data: &[T]) -> Result<(), String> {
+pub(crate) fn upload_slice<T: Copy>(resource: &ID3D12Resource, data: &[T]) -> Result<(), String> {
     let mut mapped: *mut c_void = std::ptr::null_mut();
     // SAFETY: UPLOAD buffer mapped across full range, written and unmapped before close.
     unsafe {

@@ -30,7 +30,13 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod dxr_backend;
+#[cfg(windows)]
+pub mod dxr_harness;
 pub mod dxr_proto;
+#[cfg(windows)]
+pub mod dxr_rayquery;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
