@@ -144,8 +144,16 @@ $Meta = [ordered]@{
 }
 $Meta | ConvertTo-Json -Depth 4 | Set-Content -Path $MetaFile -Encoding UTF8
 
-& $ExePath @CliArgs *> $LogFile
-$rc = $LASTEXITCODE
+$QuotedArgs = ($CliArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+$CmdLine = "`"$ExePath`" $QuotedArgs > `"$LogFile`" 2>&1"
+$PrevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & cmd.exe /d /s /c "`"$CmdLine`""
+    $rc = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $PrevEap
+}
 if ($rc -ne 0) {
     Write-Warning "victory.exe (diagnostics) exited with code $rc. See $LogFile"
     exit $rc
