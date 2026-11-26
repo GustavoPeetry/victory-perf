@@ -52,7 +52,7 @@ pub mod queue;
 pub mod accounting;
 pub mod authority;
 #[cfg(windows)]
-mod readback;
+pub mod readback;
 #[cfg(windows)]
 mod rebar;
 pub mod resource;
@@ -62,7 +62,7 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod shadow;
+pub mod shadow;
 pub mod signature;
 #[cfg(windows)]
 pub mod tiles;

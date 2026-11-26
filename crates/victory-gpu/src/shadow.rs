@@ -988,9 +988,189 @@ const NOT_WATCHED: u8 = 2;
 /// failing `GetWriteWatch` kernel syscall on every refresh).
 const VIEW_GUARDED: u8 = 3;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+/// Whether `VICTORY_REA_DIRTY_RANGES=1` enables AVX2 diffing, subsumption
+/// pruning, and coalesced readback DMA ranges (OFF by default).
+pub(crate) fn dirty_ranges_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_REA_DIRTY_RANGES")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            });
+        if on {
+            tracing::info!(
+                avx2 = avx2_supported(),
+                "VICTORY_REA_DIRTY_RANGES=1: AVX2 dirty-range diffing and coalesced readbacks active"
+            );
+        }
+        on
+    })
+}
+
+#[inline]
+fn avx2_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+static DIRTY_DIFF_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIRTY_DIFF_BYTES: AtomicU64 = AtomicU64::new(0);
+static DIRTY_AVX2_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIRTY_SUBSUMED_SKIPS: AtomicU64 = AtomicU64::new(0);
+static COPY_REGIONS_RAW: AtomicU64 = AtomicU64::new(0);
+static COPY_REGIONS_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+/// Telemetry snapshot for dirty range diffing and coalescing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirtyRangeStats {
+    pub enabled: bool,
+    pub avx2: bool,
+    pub diff_calls: u64,
+    pub diff_bytes: u64,
+    pub avx2_calls: u64,
+    pub subsumed_skips: u64,
+    pub copy_regions_raw: u64,
+    pub copy_regions_coalesced: u64,
+}
+
+pub(crate) fn note_copy_region_coalescing(raw: usize, coalesced: usize) {
+    COPY_REGIONS_RAW.fetch_add(raw as u64, Ordering::Relaxed);
+    COPY_REGIONS_COALESCED.fetch_add(coalesced as u64, Ordering::Relaxed);
+}
+
+pub fn dirty_stats() -> DirtyRangeStats {
+    DirtyRangeStats {
+        enabled: dirty_ranges_enabled(),
+        avx2: avx2_supported(),
+        diff_calls: DIRTY_DIFF_CALLS.load(Ordering::Relaxed),
+        diff_bytes: DIRTY_DIFF_BYTES.load(Ordering::Relaxed),
+        avx2_calls: DIRTY_AVX2_CALLS.load(Ordering::Relaxed),
+        subsumed_skips: DIRTY_SUBSUMED_SKIPS.load(Ordering::Relaxed),
+        copy_regions_raw: COPY_REGIONS_RAW.load(Ordering::Relaxed),
+        copy_regions_coalesced: COPY_REGIONS_COALESCED.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn slices_differ_avx2(a: &[u8], b: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut i = 0usize;
+    while i + 128 <= n {
+        // SAFETY: `i + 128 <= n`, unaligned loads allowed on AVX2.
+        unsafe {
+            let a0 = _mm256_loadu_si256(pa.add(i).cast());
+            let b0 = _mm256_loadu_si256(pb.add(i).cast());
+            let a1 = _mm256_loadu_si256(pa.add(i + 32).cast());
+            let b1 = _mm256_loadu_si256(pb.add(i + 32).cast());
+            let a2 = _mm256_loadu_si256(pa.add(i + 64).cast());
+            let b2 = _mm256_loadu_si256(pb.add(i + 64).cast());
+            let a3 = _mm256_loadu_si256(pa.add(i + 96).cast());
+            let b3 = _mm256_loadu_si256(pb.add(i + 96).cast());
+            let eq0 = _mm256_cmpeq_epi8(a0, b0);
+            let eq1 = _mm256_cmpeq_epi8(a1, b1);
+            let eq2 = _mm256_cmpeq_epi8(a2, b2);
+            let eq3 = _mm256_cmpeq_epi8(a3, b3);
+            let all = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            if _mm256_movemask_epi8(all) != -1 {
+                return true;
+            }
+        }
+        i += 128;
+    }
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n`.
+        unsafe {
+            let va = _mm256_loadu_si256(pa.add(i).cast());
+            let vb = _mm256_loadu_si256(pb.add(i).cast());
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) != -1 {
+                return true;
+            }
+        }
+        i += 32;
+    }
+    a[i..n] != b[i..n]
+}
+
+#[inline]
+fn slices_differ(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if dirty_ranges_enabled() && avx2_supported() && a.len() >= 32 {
+        DIRTY_AVX2_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `avx2` confirmed via runtime `is_x86_feature_detected!("avx2")`.
+        return unsafe { slices_differ_avx2(a, b) };
+    }
+    a != b
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn first_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n`.
+        let eq_mask = unsafe {
+            let va = _mm256_loadu_si256(pa.add(i).cast());
+            let vb = _mm256_loadu_si256(pb.add(i).cast());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb))
+        };
+        if eq_mask != -1 {
+            let diff_mask = (!eq_mask) as u32;
+            return Some(i + diff_mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    a[i..n].iter().zip(&b[i..n]).position(|(x, y)| x != y).map(|k| i + k)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn last_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let tail = n & !31;
+    if let Some(k) = a[tail..n].iter().zip(&b[tail..n]).rposition(|(x, y)| x != y) {
+        return Some(tail + k);
+    }
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut i = tail;
+    while i >= 32 {
+        i -= 32;
+        // SAFETY: `i + 32 <= n`.
+        let eq_mask = unsafe {
+            let va = _mm256_loadu_si256(pa.add(i).cast());
+            let vb = _mm256_loadu_si256(pb.add(i).cast());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb))
+        };
+        if eq_mask != -1 {
+            let diff_mask = (!eq_mask) as u32;
+            return Some(i + 31 - diff_mask.leading_zeros() as usize);
+        }
+    }
+    None
+}
+
+fn first_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     let from = a[..whole]
         .as_chunks::<8>().0.iter()
@@ -1000,8 +1180,7 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
 }
 
-/// Where `a` and `b` (of one length) last differ.
-fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+fn last_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
         return Some(whole + i);
@@ -1016,6 +1195,30 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b[word..word + 8])
         .rposition(|(x, y)| x != y)
         .map(|i| word + i)
+}
+
+/// Where `a` and `b` (of one length) first differ, using AVX2 when
+/// `VICTORY_REA_DIRTY_RANGES=1` and supported.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if dirty_ranges_enabled() && avx2_supported() && a.len().min(b.len()) >= 32 {
+        DIRTY_AVX2_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: AVX2 support verified at runtime.
+        return unsafe { first_difference_avx2(a, b) };
+    }
+    first_difference_scalar(a, b)
+}
+
+/// Where `a` and `b` (of one length) last differ, using AVX2 when
+/// `VICTORY_REA_DIRTY_RANGES=1` and supported.
+fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if dirty_ranges_enabled() && avx2_supported() && a.len().min(b.len()) >= 32 {
+        DIRTY_AVX2_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: AVX2 support verified at runtime.
+        return unsafe { last_difference_avx2(a, b) };
+    }
+    last_difference_scalar(a, b)
 }
 
 #[cfg(test)]
@@ -1303,7 +1506,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
-                    if now != old {
+                    if slices_differ(now, old) {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1518,10 +1721,7 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
-/// The runs of bytes where `now` differs from `was` (of one length), as
-/// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -1543,6 +1743,57 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         runs.push((first, i - first));
     }
     runs
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let pn = now.as_ptr();
+    let pw = was.as_ptr();
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        while i + 32 <= n {
+            // SAFETY: `i + 32 <= n`.
+            let eq_mask = unsafe {
+                let a = _mm256_loadu_si256(pn.add(i).cast());
+                let b = _mm256_loadu_si256(pw.add(i).cast());
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b))
+            };
+            if eq_mask != -1 {
+                i += (!eq_mask as u32).trailing_zeros() as usize;
+                break;
+            }
+            i += 32;
+        }
+        while i < n && now[i] == was[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        runs.push((first, i - first));
+    }
+    runs
+}
+
+/// The runs of bytes where `now` differs from `was` (of one length), as
+/// (offset, bytes) in order: every differing byte is in a run and no equal
+/// byte is.
+fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if dirty_ranges_enabled() && avx2_supported() && now.len().min(was.len()) >= 32 {
+        DIRTY_AVX2_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: AVX2 support verified at runtime.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
 }
 
 #[cfg(test)]
@@ -1570,9 +1821,79 @@ mod merge_tests {
             assert_eq!(put, now, "{changes:?}");
             assert_eq!(held, changes, "{changes:?}");
             // Runs do not touch: two that did would be one.
-            assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
+            assert_eq!(runs, runs_scalar_check(&now, &was));
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    fn runs_scalar_check(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        super::changed_runs_scalar(now, was)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_diff_and_changed_runs_match_scalar_exactly() {
+        if !super::avx2_supported() {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in (0..=132usize).chain([255, 256, 257, 1024, 1025, 4096, 65536]) {
+            for align_off in [0usize, 1, 7] {
+                let mut base = vec![0u8; len + 16];
+                for b in &mut base {
+                    *b = next() as u8;
+                }
+                let mut modv = base.clone();
+                // Flip isolated bytes, multi-byte runs, and boundaries.
+                if len > 0 {
+                    for _ in 0..8 {
+                        let idx = (next() as usize % len) + align_off;
+                        modv[idx] ^= ((next() & 0x7F) as u8) | 1;
+                    }
+                    if len >= 40 {
+                        let mid = align_off + len / 2;
+                        for b in &mut modv[mid - 3..mid + 19] {
+                            *b ^= 0x5A;
+                        }
+                    }
+                }
+                let a = &base[align_off..align_off + len];
+                let b = &modv[align_off..align_off + len];
+                // SAFETY: `avx2_supported()` checked above.
+                unsafe {
+                    assert_eq!(
+                        super::slices_differ_avx2(a, b),
+                        a != b,
+                        "slices_differ len={len} off={align_off}"
+                    );
+                    assert!(
+                        !super::slices_differ_avx2(a, a),
+                        "slices_differ eq len={len}"
+                    );
+                    assert_eq!(
+                        super::first_difference_avx2(a, b),
+                        super::first_difference_scalar(a, b),
+                        "first_difference len={len} off={align_off}"
+                    );
+                    assert_eq!(
+                        super::last_difference_avx2(a, b),
+                        super::last_difference_scalar(a, b),
+                        "last_difference len={len} off={align_off}"
+                    );
+                    assert_eq!(
+                        super::changed_runs_avx2(b, a),
+                        super::changed_runs_scalar(b, a),
+                        "changed_runs len={len} off={align_off}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2106,8 +2427,15 @@ impl Shadow {
         if relay() {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
-        // Dispatches declare the same ranges thousands of times.
+        // Dispatches declare the same or subsumed ranges thousands of times.
         if pending.contains(&range) {
+            return;
+        }
+        if dirty_ranges_enabled()
+            && self.card.is_none()
+            && pending.iter().any(|&(a, e)| a <= range.0 && range.1 <= e)
+        {
+            DIRTY_SUBSUMED_SKIPS.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
@@ -2403,7 +2731,9 @@ impl Shadow {
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
                 let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                DIRTY_DIFF_CALLS.fetch_add(1, Ordering::Relaxed);
+                DIRTY_DIFF_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                if slices_differ(host, &before[at - from..at - from + n]) {
                     found.push((at, n));
                 }
                 at += n;

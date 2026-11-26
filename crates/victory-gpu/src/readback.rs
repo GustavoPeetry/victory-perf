@@ -15,19 +15,29 @@
 //! could tag a buffer that is not read back (it is then copied back as
 //! before: harmless).
 
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// The title's read-back buffer creator (1.0.2.1).
 const CREATOR_RVA: u32 = 0x1d40f90;
 /// Stack bytes scanned above the creation call.
 const SCAN_BYTES: usize = 16 << 10;
 
-/// Whether the switch is on.
+fn parse_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the legacy raw switch `VICTORY_COPY_BACK_ONLY_READBACK=1` is on.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_COPY_BACK_ONLY_READBACK").is_ok_and(|v| v.trim() == "1");
+        let on = parse_flag("VICTORY_COPY_BACK_ONLY_READBACK");
         if on {
             tracing::warn!(
                 "VICTORY_COPY_BACK_ONLY_READBACK: shader writes are copied back only for the title's read-back buffers"
@@ -35,6 +45,63 @@ pub(crate) fn enabled() -> bool {
         }
         on
     })
+}
+
+/// Whether `VICTORY_REA_READBACK_TRACE=1` is enabled to log creator provenance
+/// and copy-back tag decisions without skipping copy-backs by itself.
+pub(crate) fn trace_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_flag("VICTORY_REA_READBACK_TRACE");
+        if on {
+            tracing::info!("VICTORY_REA_READBACK_TRACE=1: tracing read-back creator provenance and ranges");
+        }
+        on
+    })
+}
+
+/// Whether `VICTORY_REA_SEMANTIC_READBACK=1` is enabled (conservative fallback
+/// keeps all copy-backs active if creator provenance is unverified or `tagged == 0`).
+pub(crate) fn semantic_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_flag("VICTORY_REA_SEMANTIC_READBACK");
+        if on {
+            tracing::info!(
+                "VICTORY_REA_SEMANTIC_READBACK=1: semantic read-back filtering with conservative fallback enabled"
+            );
+        }
+        on
+    })
+}
+
+/// Whether sampled validation of untagged ranges is enabled (`VICTORY_REA_READBACK_VALIDATE=1`).
+pub(crate) fn validate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_flag("VICTORY_REA_READBACK_VALIDATE"))
+}
+
+static CREATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
+static SCAN_HITS: AtomicU64 = AtomicU64::new(0);
+static SCAN_MISSES: AtomicU64 = AtomicU64::new(0);
+static SEMANTIC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static VALIDATE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static VALIDATE_WARNINGS: AtomicU64 = AtomicU64::new(0);
+
+/// Telemetry snapshot for Front B readback classification & validation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadbackStats {
+    pub legacy_enabled: bool,
+    pub semantic_enabled: bool,
+    pub trace_enabled: bool,
+    pub validate_enabled: bool,
+    pub creator_verified: bool,
+    pub tagged_buffers: usize,
+    pub scan_hits: u64,
+    pub scan_misses: u64,
+    pub semantic_fallbacks: u64,
+    pub validate_samples: u64,
+    pub validate_warnings: u64,
 }
 
 /// `[start, end)` of title memory of the read-back buffers alive (let go
@@ -92,33 +159,69 @@ fn creator_from(address: usize) -> Option<(usize, usize)> {
     unsafe { function_at(module as usize, CREATOR_RVA) }
 }
 
+/// Multi-frame resolver: walks captured stack frames past host DLL/EXE wrappers
+/// until reaching an executable module holding `CREATOR_RVA`.
+fn resolve_creator_from_frames(
+    frames: &[usize],
+    mut resolver: impl FnMut(usize) -> Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    for &addr in frames {
+        if addr == 0 {
+            continue;
+        }
+        if let Some(range) = resolver(addr) {
+            return Some(range);
+        }
+    }
+    None
+}
+
 /// Called by a resource creation method: whether the title's read-back
 /// creator is on the stack. Learns the creator's place from the first
-/// caller in the title executable.
+/// caller in the title executable (walking past host wrapper frames).
 pub(crate) fn creating_readback() -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
-    // Also with `crate::rebar` placing title buffers (level 2), which must
-    // not place these.
-    if !enabled() && crate::rebar::level() < 2 {
+    if !enabled() && !semantic_enabled() && !trace_enabled() && crate::rebar::level() < 2 {
         return false;
     }
     let creator = match CREATOR.get() {
         Some(c) => *c,
         None => {
-            let mut frame = std::ptr::null_mut();
-            // SAFETY: room for one frame: the creation method's caller.
-            if unsafe { RtlCaptureStackBackTrace(1, 1, &mut frame, std::ptr::null_mut()) } != 1 {
-                return false;
-            }
-            let Some(c) = creator_from(frame as usize) else {
-                // A caller outside the executable (a title DLL): ask again later.
+            let mut raw_frames = [std::ptr::null_mut(); 16];
+            // SAFETY: room for up to 16 stack frames across host/title boundary.
+            let captured = unsafe {
+                RtlCaptureStackBackTrace(
+                    1,
+                    raw_frames.len() as u32,
+                    raw_frames.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            } as usize;
+            let addrs: Vec<usize> = raw_frames[..captured.min(raw_frames.len())]
+                .iter()
+                .map(|&p| p as usize)
+                .collect();
+            let Some(c) = resolve_creator_from_frames(&addrs, creator_from) else {
+                if trace_enabled() {
+                    static PROBES: AtomicU64 = AtomicU64::new(0);
+                    if PROBES.fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::info!(
+                            captured,
+                            top_frame = format_args!("{:#x}", addrs.first().copied().unwrap_or(0)),
+                            "readback trace: no frame resolved to title image holding CREATOR_RVA yet"
+                        );
+                    }
+                }
+                // A caller outside the title executable: try again on the next creation call.
                 return false;
             };
+            CREATOR_VERIFIED.store(true, Ordering::Release);
             tracing::warn!(
                 begin = format_args!("{:#x}", c.0),
                 end = format_args!("{:#x}", c.1),
-                "read-back creator found"
+                frames_walked = captured,
+                "read-back creator found via multi-frame walk"
             );
             *CREATOR.get_or_init(|| Some(c))
         }
@@ -126,6 +229,24 @@ pub(crate) fn creating_readback() -> bool {
     let Some((begin, end)) = creator else {
         return false;
     };
+    // First check fast captured return frames (exact unwind when available), then
+    // scan the raw stack window for un-registered title unwind tables.
+    let mut raw_frames = [std::ptr::null_mut(); 16];
+    let captured = unsafe {
+        RtlCaptureStackBackTrace(
+            1,
+            raw_frames.len() as u32,
+            raw_frames.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } as usize;
+    for &p in &raw_frames[..captured.min(raw_frames.len())] {
+        let addr = p as usize;
+        if (begin..end).contains(&addr) {
+            SCAN_HITS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
     let (mut low, mut high) = (0usize, 0usize);
     // SAFETY: plain out pointers.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
@@ -136,10 +257,12 @@ pub(crate) fn creating_readback() -> bool {
         // SAFETY: inside this thread's committed stack, above this frame.
         let v = unsafe { (at as *const usize).read() };
         if (begin..end).contains(&v) {
+            SCAN_HITS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         at += 8;
     }
+    SCAN_MISSES.fetch_add(1, Ordering::Relaxed);
     false
 }
 
@@ -148,7 +271,14 @@ pub(crate) fn tag(start: u64, len: u64) {
     let mut t = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
     t.insert(start, start + len);
     let n = t.len();
-    if n.is_power_of_two() {
+    drop(t);
+    crate::authority::register_range(
+        start as usize,
+        len as usize,
+        crate::authority::AuthorityClass::SharedCoherent,
+        true,
+    );
+    if n.is_power_of_two() || trace_enabled() && n <= 32 {
         tracing::warn!(
             n,
             start = format_args!("{start:#x}"),
@@ -168,39 +298,87 @@ pub(crate) fn tagged_in(start: u64, len: u64) -> bool {
 }
 
 /// Whether shader writes to `[start, start + len)` are copied back: always
-/// with the switch off; with it on, only where a read-back buffer lies.
+/// with switches off; with `VICTORY_COPY_BACK_ONLY_READBACK=1`, only where
+/// tagged; with `VICTORY_REA_SEMANTIC_READBACK=1`, falls back conservatively
+/// to copy-back if creator provenance isn't verified or `tagged() == 0`.
 pub(crate) fn copy_back(start: u64, len: u64) -> bool {
-    if !enabled() {
+    let legacy = enabled();
+    let semantic = semantic_enabled();
+    if !legacy && !semantic {
         return true;
     }
-    let back = TAGGED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .overlaps(start, start.saturating_add(len));
-    if back {
+    let (overlaps, tagged_count) = {
+        let guard = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.overlaps(start, start.saturating_add(len)), guard.len())
+    };
+
+    if semantic && !legacy && (!CREATOR_VERIFIED.load(Ordering::Acquire) || tagged_count == 0) {
+        SEMANTIC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if validate_enabled() {
+            VALIDATE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        }
+        return true;
+    }
+
+    if overlaps {
         crate::memcopy::add(crate::memcopy::M::BackGoes, 1);
     } else {
         crate::memcopy::add(crate::memcopy::M::BackKept, 1);
         crate::memcopy::add(crate::memcopy::M::BackKeptBytes, len);
+        if trace_enabled() {
+            static KEPT_LOGS: AtomicU64 = AtomicU64::new(0);
+            if KEPT_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::info!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    tagged_count,
+                    "readback trace: skipping non-readback copy-back"
+                );
+            }
+        }
+        if validate_enabled() {
+            let n = VALIDATE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            if n.is_multiple_of(128) && crate::authority::observe_cpu_read_or_copy(start as usize, len as usize) {
+                VALIDATE_WARNINGS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
-    back
+    overlaps
 }
 
 /// Removes one registration owned by a read-back buffer being let go.
 /// Its exact range matters: aliases may share a start but differ in size.
 pub(crate) fn untag(start: u64, len: u64) {
-    // Level 2 also tags read-back buffers when copy-back filtering is off.
-    if enabled() || crate::rebar::level() >= 2 {
+    // Level 2 / semantic / trace modes also tag read-back buffers when legacy copy-back filtering is off.
+    if enabled() || semantic_enabled() || trace_enabled() || crate::rebar::level() >= 2 {
         TAGGED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(start, start + len);
+        crate::authority::unregister_range(start as usize, len as usize);
     }
 }
 
 /// How many read-back buffers are alive.
 pub(crate) fn tagged() -> usize {
     TAGGED.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Return snapshot of REA-002 readback provenance & filtering telemetry.
+pub fn stats() -> ReadbackStats {
+    ReadbackStats {
+        legacy_enabled: enabled(),
+        semantic_enabled: semantic_enabled(),
+        trace_enabled: trace_enabled(),
+        validate_enabled: validate_enabled(),
+        creator_verified: CREATOR_VERIFIED.load(Ordering::Relaxed),
+        tagged_buffers: tagged(),
+        scan_hits: SCAN_HITS.load(Ordering::Relaxed),
+        scan_misses: SCAN_MISSES.load(Ordering::Relaxed),
+        semantic_fallbacks: SEMANTIC_FALLBACKS.load(Ordering::Relaxed),
+        validate_samples: VALIDATE_SAMPLES.load(Ordering::Relaxed),
+        validate_warnings: VALIDATE_WARNINGS.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]
@@ -277,5 +455,49 @@ mod tests {
         let (b, e) = unsafe { function_at(base, f as u32) }.expect("own function in .pdata");
         assert_eq!(b, function_at as *const () as usize);
         assert!(e > b);
+    }
+
+    #[test]
+    fn multi_frame_walk_skips_host_wrappers() {
+        let frames = [0x1000_1111, 0x1000_2222, 0x7ff6_1d40_f900, 0x7ff6_0000_1234];
+        let found = resolve_creator_from_frames(&frames, |addr| {
+            (addr == 0x7ff6_1d40_f900).then_some((0x7ff6_1d40_f900, 0x7ff6_1d41_0200))
+        });
+        assert_eq!(found, Some((0x7ff6_1d40_f900, 0x7ff6_1d41_0200)));
+    }
+
+    #[test]
+    fn semantic_readback_falls_back_conservatively_without_verified_tags() {
+        const CHILD: &str = "VICTORY_TEST_SEMANTIC_FALLBACK_CHILD";
+        const OK: &str = "semantic fallback assertion passed";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "readback::tests::semantic_readback_falls_back_conservatively_without_verified_tags",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("VICTORY_REA_SEMANTIC_READBACK", "1")
+                .env("VICTORY_COPY_BACK_ONLY_READBACK", "0")
+                .env("VICTORY_REA_READBACK_VALIDATE", "1")
+                .output()
+                .expect("spawn semantic fallback child test");
+            assert!(
+                output.status.success() && String::from_utf8_lossy(&output.stdout).contains(OK),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        assert!(semantic_enabled());
+        assert!(!enabled());
+        assert_eq!(tagged(), 0);
+        // Must preserve full copy-back until creator is verified AND buffers are tagged.
+        assert!(copy_back(0x5000_0000, 4096));
+        assert!(stats().semantic_fallbacks >= 1);
+        println!("{OK}");
     }
 }

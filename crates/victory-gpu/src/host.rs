@@ -4105,6 +4105,14 @@ impl Host {
         }
         let mut fallback_after = None;
         if !fallback.is_empty() {
+            if crate::shadow::dirty_ranges_enabled() {
+                fallback.sort_unstable_by_key(|(s, lo, _, _)| (std::sync::Arc::as_ptr(s) as usize, *lo));
+                let mut offset = 0u64;
+                for item in &mut fallback {
+                    item.3 = offset;
+                    offset += (item.2 - item.1) as u64;
+                }
+            }
             if fetch.is_none() {
                 *fetch = self.make_relay_fetch();
             }
@@ -4128,8 +4136,43 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &fallback {
-                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    if crate::shadow::dirty_ranges_enabled() {
+                        let mut merged_regions = 0usize;
+                        let mut idx = 0usize;
+                        while idx < fallback.len() {
+                            let (shadow, lo, hi_ref, at) = &fallback[idx];
+                            let mut hi = *hi_ref;
+                            let start_lo = *lo;
+                            let start_at = *at;
+                            let buf_ptr = shadow.buffer.as_raw();
+                            let mut next = idx + 1;
+                            while next < fallback.len() {
+                                let (nshadow, nlo, nhi, nat) = &fallback[next];
+                                if nshadow.buffer.as_raw() == buf_ptr
+                                    && *nlo == hi
+                                    && *nat == start_at + (hi - start_lo) as u64
+                                {
+                                    hi = *nhi;
+                                    next += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            list.CopyBufferRegion(
+                                &buffer,
+                                start_at,
+                                &shadow.buffer,
+                                start_lo as u64,
+                                (hi - start_lo) as u64,
+                            );
+                            merged_regions += 1;
+                            idx = next;
+                        }
+                        crate::shadow::note_copy_region_coalescing(fallback.len(), merged_regions);
+                    } else {
+                        for (shadow, lo, hi, at) in &fallback {
+                            list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                        }
                     }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4380,6 +4423,16 @@ impl Host {
             }
         }
         if !pieces.is_empty() {
+            if crate::shadow::dirty_ranges_enabled() {
+                pieces.sort_unstable_by_key(|&(i, lo, _, _)| {
+                    (std::sync::Arc::as_ptr(&plan.ranges[i].shadow) as usize, lo)
+                });
+                let mut offset = 0u64;
+                for p in &mut pieces {
+                    p.3 = offset;
+                    offset += (p.2 - p.1) as u64;
+                }
+            }
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
                 work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
@@ -4395,8 +4448,41 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                    if crate::shadow::dirty_ranges_enabled() {
+                        let mut merged_regions = 0usize;
+                        let mut idx = 0usize;
+                        while idx < pieces.len() {
+                            let (i, start_lo, mut hi, start_at) = pieces[idx];
+                            let shadow = &plan.ranges[i].shadow;
+                            let buf_ptr = shadow.buffer.as_raw();
+                            let mut next = idx + 1;
+                            while next < pieces.len() {
+                                let (ni, nlo, nhi, nat) = pieces[next];
+                                if plan.ranges[ni].shadow.buffer.as_raw() == buf_ptr
+                                    && nlo == hi
+                                    && nat == start_at + (hi - start_lo) as u64
+                                {
+                                    hi = nhi;
+                                    next += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            list.CopyBufferRegion(
+                                fetched,
+                                start_at,
+                                &shadow.buffer,
+                                start_lo as u64,
+                                (hi - start_lo) as u64,
+                            );
+                            merged_regions += 1;
+                            idx = next;
+                        }
+                        crate::shadow::note_copy_region_coalescing(pieces.len(), merged_regions);
+                    } else {
+                        for &(i, lo, hi, at) in &pieces {
+                            list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                        }
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
