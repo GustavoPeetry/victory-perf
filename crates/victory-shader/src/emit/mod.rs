@@ -194,9 +194,24 @@ pub fn group_sync() -> u8 {
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
+/// Opt-in REA-003 extended shader optimizations (`VICTORY_REA003_SHADER_OPT=1`, off by default).
+pub fn rea003_shader_opt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_REA003_SHADER_OPT")
+            .ok()
+            .is_some_and(|v| v.trim() == "1")
+    })
+}
+
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        parse_shader_opt_with_rea003(
+            std::env::var("VICTORY_SHADER_OPT").ok().as_deref(),
+            rea003_shader_opt(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -238,14 +253,24 @@ fn parse_bool_env(name: &str) -> bool {
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
+#[allow(dead_code)]
 fn parse_shader_opt(value: Option<&str>) -> u32 {
+    parse_shader_opt_with_rea003(value, false)
+}
+
+fn parse_shader_opt_with_rea003(value: Option<&str>, rea003_opt: bool) -> u32 {
+    let allowed = if rea003_opt {
+        bitcode::opt::ALL_REA003
+    } else {
+        bitcode::opt::ALL
+    };
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    parsed.map_or(allowed, |n| n & allowed)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1045,6 +1070,16 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+        assert!(!rea003_shader_opt());
+        assert_eq!(
+            parse_shader_opt_with_rea003(None, true),
+            super::bitcode::opt::ALL_REA003
+        );
+        assert_eq!(parse_shader_opt_with_rea003(Some("0"), true), 0);
+        assert_eq!(
+            parse_shader_opt_with_rea003(Some("0xffffffff"), true),
+            super::bitcode::opt::ALL_REA003
+        );
     }
 
     #[test]

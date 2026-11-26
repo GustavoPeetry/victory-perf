@@ -2941,6 +2941,7 @@ impl State {
             };
             BATCH.recorded(count);
             crate::indirect::INDIRECT_HOST_CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::indirect::note_indirect_dispatch();
             self.note_writes(list);
         }
         if run.first.kind == MESH {

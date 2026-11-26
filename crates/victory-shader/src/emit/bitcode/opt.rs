@@ -56,6 +56,9 @@ pub const FIRST: u32 = 32;
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
+pub use super::opt_rea003::{BITFIELD, LICM};
+/// Extended REA-003 optimization mask (all baseline passes plus bitfield & LICM).
+pub const ALL_REA003: u32 = ALL | BITFIELD | LICM;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -90,11 +93,11 @@ enum Key {
 
 /// The blocks reached from the entry, each after the blocks that dominate
 /// it, and each block's children in the dominator tree.
-struct Tree {
-    order: Vec<usize>,
-    children: Vec<Vec<usize>>,
+pub(super) struct Tree {
+    pub(super) order: Vec<usize>,
+    pub(super) children: Vec<Vec<usize>>,
     /// Per block: the reached blocks that branch to it, once per edge.
-    preds: Vec<Vec<usize>>,
+    pub(super) preds: Vec<Vec<usize>>,
 }
 
 /// The comparison that holds exactly when `p` does not (floats 0-15,
@@ -130,7 +133,7 @@ struct Learned {
     compares: Vec<(u8, V, V)>,
 }
 
-fn mask(bits: u32) -> u64 {
+pub(super) fn mask(bits: u32) -> u64 {
     if bits >= 64 { !0 } else { (1 << bits) - 1 }
 }
 
@@ -144,7 +147,7 @@ fn signed(bits: u32, x: u64) -> i64 {
 }
 
 /// What `v` stands for after the replacements so far.
-fn resolve(repl: &[Option<V>], mut v: V) -> V {
+pub(super) fn resolve(repl: &[Option<V>], mut v: V) -> V {
     while let V::Inst(i) = v {
         match repl[i as usize] {
             Some(r) => v = r,
@@ -155,7 +158,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -229,6 +232,12 @@ impl Module {
                 }
             }
         }
+        if passes & BITFIELD != 0 {
+            self.bitfield_simplify();
+        }
+        if passes & LICM != 0 {
+            self.licm_hoist();
+        }
         if passes & DEAD != 0 {
             self.drop_dead();
         }
@@ -258,7 +267,7 @@ impl Module {
         seen
     }
 
-    fn dominator_tree(&self) -> Tree {
+    pub(super) fn dominator_tree(&self) -> Tree {
         let n = self.blocks.len();
         let succs = |b: usize| successors(self.blocks[b].term);
         // Reverse postorder, as `write` lays the blocks out.
@@ -380,7 +389,7 @@ impl Module {
         }
     }
 
-    fn int_bits(&self, ty: Ty) -> Option<u32> {
+    pub(super) fn int_bits(&self, ty: Ty) -> Option<u32> {
         match self.types[ty.0 as usize] {
             TypeDef::Int(bits) => Some(bits),
             _ => None,
@@ -388,7 +397,7 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(super) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
@@ -399,7 +408,7 @@ impl Module {
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
-    fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
+    pub(super) fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
@@ -2114,9 +2123,12 @@ mod tests {
                 REUSE,
                 FACTS,
                 LOADS,
+                BITFIELD,
+                LICM,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
                 ALL,
+                ALL_REA003,
             ] {
                 let mut m = random_program(seed);
                 m.optimise(passes);

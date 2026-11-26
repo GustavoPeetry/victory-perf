@@ -37,8 +37,11 @@ pub mod dxr_harness;
 pub mod dxr_proto;
 #[cfg(windows)]
 pub mod dxr_rayquery;
+#[cfg(windows)]
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod gpu_detile;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -67,6 +70,7 @@ pub mod readback;
 mod rebar;
 #[cfg(windows)]
 pub mod render_graph;
+pub mod render_graph_opt;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

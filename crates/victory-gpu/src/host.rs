@@ -364,13 +364,18 @@ fn indirect_line(frames: f64) {
         return;
     }
     let (ops, clamps, gathered, host_calls) = crate::indirect::take_indirect_stats();
+    let gd = crate::indirect::gpu_driven_stats();
     let none = [0, 1, 2, 3, 4].map(|i| crate::indirect::GATHER_NONE[i].swap(0, Ordering::Relaxed));
     if ops == 0 && clamps == 0 && gathered == 0 && host_calls == 0 && none.iter().all(|&n| n == 0) {
+        if gd.gpu_driven_enabled {
+            tracing::debug!(?gd, "REA-003 gpu-driven stats");
+        }
         return;
     }
     tracing::info!(
         "indirect execution per frame: ops {:.0}, clamp passes {:.0}, gathered {:.0}, host ExecuteIndirect {:.0}; \
-         gather misses (layout {:.0}, closed {:.0}, sets {:.0}, full {:.0}, no_buf {:.0})",
+         gather misses (layout {:.0}, closed {:.0}, sets {:.0}, full {:.0}, no_buf {:.0}); \
+         gpu_driven={} hoist={} scoped={} global={} dispatches={}",
         ops as f64 / frames,
         clamps as f64 / frames,
         gathered as f64 / frames,
@@ -380,6 +385,11 @@ fn indirect_line(frames: f64) {
         none[2] as f64 / frames,
         none[3] as f64 / frames,
         none[4] as f64 / frames,
+        gd.gpu_driven_enabled,
+        gd.hoist_mode,
+        gd.scoped_clamps,
+        gd.global_clamps,
+        gd.indirect_dispatches,
     );
 }
 
@@ -2733,6 +2743,11 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// the value in a way not known here (shaders, a timestamp, another
 /// width), they are settled and memory is asked again.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
+    let fastpath = crate::render_graph_opt::rendergraph_fastpath_enabled();
+    if fastpath && late_met_known(wait) {
+        crate::render_graph_opt::note_value_wait_fast_hit();
+        return true;
+    }
     let (address, bytes) = wait.place();
     {
         let line = line();
@@ -2766,6 +2781,9 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if !unsure {
             return false;
         }
+    }
+    if fastpath {
+        crate::render_graph_opt::note_value_wait_settle();
     }
     settle_now(WHY_VALUE);
     wait.met()
@@ -6242,6 +6260,14 @@ impl HostList {
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
+        let fastpath = crate::render_graph_opt::rendergraph_fastpath_enabled();
+        if fastpath {
+            if write {
+                crate::render_graph_opt::note_twin_dirty_invalidation();
+            } else if !copy {
+                crate::render_graph_opt::note_twin_read_elided();
+            }
+        }
         if copy {
             self.twin_copy(&depth, &twin, colour);
         } else if colour {
