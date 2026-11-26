@@ -83,6 +83,8 @@ pub mod tiles;
 #[cfg(windows)]
 pub mod upload_ring;
 #[cfg(windows)]
+pub mod upscaler;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

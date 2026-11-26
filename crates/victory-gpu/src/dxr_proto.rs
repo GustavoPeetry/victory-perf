@@ -127,7 +127,7 @@ pub(crate) fn maybe_probe_host() {
 
 /// Observes a title call into unimplemented console pipeline slot `0x218`
 /// (`FFX/Brixelizer` research path).
-pub(crate) fn on_slot_0x218_call(calls: u32, desc: *const u8) {
+pub fn on_slot_0x218_call(calls: u32, desc: *const u8) {
     FFX_0X218_CALLS.fetch_add(1, Ordering::Relaxed);
     if !ffx_trace_enabled() {
         return;
