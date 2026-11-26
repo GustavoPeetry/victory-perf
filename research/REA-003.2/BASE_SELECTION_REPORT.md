@@ -1,0 +1,11 @@
+# Seleção de fundação
+
+A estratégia A preserva o trabalho REA e concentra mudanças no caminho de carregamento e compilação. É a fundação da candidata P0. A estratégia B usa o Vice-Tay `23eeb84c7aa2514b4ce2c54d030d97023b72bbaa` em branch e worktree separadas, com build release do HEAD original. A CI do HEAD reportou sucesso, o que dá uma referência mais limpa para avaliação. Resultados divulgados em GPUs mais novas e máquinas com mais RAM não estabelecem desempenho nesse host.
+
+O HEAD RDNA apresenta chamadas sem o método de produção `Ahead::take` por um atributo `cfg(test)`. O branch `upstream/in-place-buffer-gpu-path` tem a correção. O HEAD VI-BR-PORT falhou no Clippy da CI por inicializadores incompletos em `HostShader`. Essas ocorrências reduzem a utilidade imediata dos dois HEADs como referências, sem eliminar contribuições locais aproveitáveis.
+
+A escolha da candidata A considera o menor delta auditável em heap, HLE e configuração, além da preservação integral dos experimentos. A comparação de estabilidade, tempo até prisão e integridade visual depende das execuções no host. Um smoke test com PSOs criados e frames apresentados não decide a melhor fundação de gameplay.
+
+O executável de referência tem SHA-256 `8b9bd5d912a7df96ee85c9791386ada7174647dc542e7582a05abcee64922b4e`. O teste de binding sem executar o título encontrou zero imports ausentes no executável principal e nas quatro DLLs carregadas em ambas as fundações. A prova de binding de A ocorreu no primeiro build P0. Os ensaios de inicialização usam o binário final identificado no manifesto.
+
+Com a mesma projeção somente leitura do título e clones da mesma seed de dados, o primeiro marcador de apresentação fria levou 13,7 s no Vice-Tay e 73,1 s em A. A baseline congelada levou 86,4 s. O Vice-Tay chegou ao frame registrado 2.048 e teve um mínimo de aproximadamente 91 MiB de RAM disponível na mesma sessão. A e a baseline fria registraram o frame 512 dentro do orçamento inicial. Os números justificam manter o Vice-Tay como referência para reduzir o estágio anterior ao primeiro Present. A ausência de uma cena 3D equivalente e a pressão de memória observada impedem escolher B como fundação de gameplay com os dados atuais.

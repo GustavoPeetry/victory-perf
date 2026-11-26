@@ -1,0 +1,13 @@
+# Auditoria de compilação de pipelines
+
+O carregamento usa duas identidades diferentes. A chave do título registra quais PSOs merecem início antecipado. A biblioteca D3D12 usa tipo, bytes da root signature, DXIL traduzido e estado gráfico, incluindo os formatos dos render targets. A compatibilidade da biblioteca com o dispositivo é validada pelo D3D12. A tradução persistida por conteúdo passa por um namespace próprio.
+
+A Stable 192558 começou com 1.438 chaves antecipadas e biblioteca de 13,7 MB. A fila superou mil trabalhos nas primeiras amostras, embora pouco do conjunto relevante estivesse compilado. O driver acumulou cerca de 1,19 milhão de ms e a tradução 154 mil ms. Esses são agregados concorrentes. Esperas do consumidor são medida separada. O histórico de carga também inclui publicações periódicas da biblioteca, cada uma com uma janela sem novos stores durante a serialização.
+
+O backport do commit compartilhado `a30829c` limita a especulação em geral, inclusive em cache frio, pois a árvore local não usa o arquivo upstream de compilação lenta. O limite é 64 entradas especulativas, uma especulação ativa e prioridade para requisições de draw/dispatch. A 1,5 GiB de memória física disponível ou 2 GiB de margem de commit disponível ao processo, o guard pausa especulação e admite uma requisição de cada vez. Um candidato antecipado rejeitado pela capacidade pode entrar normalmente quando solicitado. Timeouts e comportamento já existente após timeout permanecem aplicáveis. O guard não interrompe trabalho que já entrou no driver. Dois workers são necessários para reservar capacidade sob condições normais.
+
+O backport de persistência usa o lock de salvamento até concluir a publicação, preserva contadores de alterações após falha e deixa salvamentos de rotina saírem sem esperar por outro save. `VICTORY_PIPELINE_HISTORY=0` omite apenas o histórico de agendamento. Bibliotecas individuais ainda são abertas, carregadas e salvas normalmente. Os lançadores dão a cada processo uma área de escrita própria.
+
+O teste do Vice-Tay cobre RGB10A2 e R11G11B10 isoladamente. A adaptação do VI-BR-PORT lê os limites Wave do PSV0 dentro de seus limites declarados. Nenhuma das duas mudanças redefine código de shader ou identidade de cache. O pool offline `warm` e o pipeline book das referências não existem nesta fundação.
+
+O próximo resultado decisivo é a diferença entre condições equivalentes na mesma cena 3D. Compare cache de PSOs inicialmente vazio, seed compatível e repetição do mesmo binário. Separe TPS de compilação, espera, draws pendentes e frame time. Uma redução de fila pode trocar velocidade de pré-aquecimento por mais capacidade disponível para o frame atual.
