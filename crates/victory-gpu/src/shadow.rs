@@ -2492,9 +2492,13 @@ impl Shadow {
         }
         let len = len.min(self.left(address));
         let tagged = crate::readback::tagged_in(address, len);
-        let creator_ok = crate::readback::stats().creator_verified;
-        crate::authority::observe_gpu_write(address as usize, len as usize, tagged, creator_ok);
-        if crate::authority::can_skip_gpu_compare(address as usize, len as usize, tagged) {
+        let rb = crate::readback::stats();
+        let readback_ready =
+            rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
+        crate::authority::observe_gpu_write(address as usize, len as usize, tagged, readback_ready);
+        if readback_ready
+            && crate::authority::can_skip_gpu_compare(address as usize, len as usize, tagged)
+        {
             crate::authority::note_skipped_card_compare();
             return;
         }
@@ -3379,11 +3383,16 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        if crate::authority::can_skip_gpu_compare(
-            self.start as usize,
-            self.len as usize,
-            crate::readback::tagged_in(self.start, self.len),
-        ) {
+        let rb = crate::readback::stats();
+        let readback_ready =
+            rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
+        if readback_ready
+            && crate::authority::can_skip_gpu_compare(
+                self.start as usize,
+                self.len as usize,
+                crate::readback::tagged_in(self.start, self.len),
+            )
+        {
             crate::authority::note_skipped_before_twin();
             return false;
         }

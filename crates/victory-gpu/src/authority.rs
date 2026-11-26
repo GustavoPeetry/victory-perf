@@ -265,8 +265,9 @@ pub fn class_for(start: usize, len: usize) -> AuthorityClass {
 /// Observe a GPU UAV / copy write to `[start, start + len)`.
 ///
 /// Only promotes a `SharedCoherent` range to `GpuAuthoritative` if `enabled()` is
-/// true, `readback_flagged` is false, `cpu_reads == 0`, the range has never been
-/// demoted, and it has sustained at least 2 pure-GPU writes without CPU readback.
+/// true, `readback_proven_complete` is true (verified creator AND tagged buffers AND
+/// past first present), `readback_flagged` is false, `cpu_reads == 0`, the range
+/// has never been demoted, and it has sustained pure-GPU writes without CPU readback.
 pub fn observe_gpu_write(
     start: usize,
     len: usize,
@@ -291,14 +292,11 @@ pub fn observe_gpu_write(
             }
             continue;
         }
+        if !readback_proven_complete {
+            continue;
+        }
         e.gpu_writes = e.gpu_writes.saturating_add(1);
-        let threshold = if strict_mode() && !readback_proven_complete {
-            u32::MAX
-        } else if readback_proven_complete {
-            2
-        } else {
-            4
-        };
+        let threshold = if strict_mode() { 4 } else { 2 };
         if e.class == AuthorityClass::SharedCoherent
             && !e.demoted_once
             && e.cpu_reads == 0
@@ -467,6 +465,19 @@ mod tests {
         }
 
         assert!(enabled());
+        let unverified = 0x3000_0000usize;
+        register_range(unverified, 0x10_000, AuthorityClass::SharedCoherent, false);
+        for _ in 0..8 {
+            observe_gpu_write(unverified, 0x10_000, false, false);
+        }
+        assert_eq!(
+            class_for(unverified, 0x10_000),
+            AuthorityClass::SharedCoherent,
+            "must never promote before readback tagging is proven"
+        );
+        assert!(!can_skip_gpu_compare(unverified, 0x10_000, false));
+        unregister_range(unverified, 0x10_000);
+
         let addr = 0x4000_0000usize;
         register_range(addr, 0x10_000, AuthorityClass::SharedCoherent, true);
         assert!(!can_skip_gpu_compare(addr, 0x10_000, false));
