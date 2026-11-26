@@ -1969,15 +1969,38 @@ impl State {
         room: bool,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ACCOUNTING").is_some_and(|v| v == "1")) {
+        let legacy_on =
+            *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ACCOUNTING").is_some_and(|v| v == "1"));
+        let incremental_on = crate::accounting::enabled();
+        let audit_on = crate::accounting::audit_enabled();
+        if !legacy_on && !incremental_on {
             return;
         }
         // When the next line is due (0: none yet, the card has had room).
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms().max(1);
         let next = NEXT.load(Ordering::Relaxed);
-        let due_now = if next == 0 { !room } else { now >= next };
+        let due_now = if next == 0 { !room || incremental_on } else { now >= next };
         if !due_now || NEXT.compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        // O(1) incremental path skips walking 18k+ descriptor slots unless audit verification is requested.
+        if incremental_on && !audit_on {
+            let snap = crate::accounting::snapshot();
+            tracing::info!(
+                room,
+                committed_tex = snap.committed_texture_count,
+                committed_mb = snap.committed_textures_bytes >> 20,
+                sparse_tex = snap.sparse_texture_count,
+                reserved_mb = snap.reserved_textures_bytes >> 20,
+                mapped_tile_mb = snap.mapped_tile_bytes >> 20,
+                tile_pool_mb = snap.tile_pool_allocated_bytes >> 20,
+                shadow_ram_mb = snap.shadow_ram_bytes >> 20,
+                shadow_vram_mb = snap.shadow_vram_bytes >> 20,
+                dxgi_actual = snap.dxgi_queries_actual,
+                dxgi_cached = snap.dxgi_queries_cached,
+                "REA-002 O(1) incremental memory accounting"
+            );
             return;
         }
         // Due slots; of them uploaded before; of them viewing nothing the

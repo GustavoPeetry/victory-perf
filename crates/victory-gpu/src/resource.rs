@@ -1387,7 +1387,7 @@ pub(crate) fn room() -> bool {
     if filled < FLOOR {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    match crate::host::host().and_then(crate::accounting::video_memory_budget) {
         Some([budget, used, ..]) => used < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
@@ -1505,7 +1505,29 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     for ((slot, now), before) in since.iter_mut().zip([kinds[2], kinds[3], kinds[4], kinds[5], kinds[6]]).zip(&BEFORE) {
         *slot = now.saturating_sub(before.swap(now, Relaxed));
     }
-    let video = crate::host::host().and_then(|h| h.video_memory());
+    let video = crate::host::host().and_then(crate::accounting::video_memory_budget);
+    let enum_committed_all = HOST_TEXTURES[1].load(Relaxed);
+    let mut enum_mapped_sparse = 0u64;
+    if crate::accounting::audit_enabled() {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: live entry under `TEXTURES` lock.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref()
+                && host.sparse.is_some()
+            {
+                enum_mapped_sparse += host.physical_bytes();
+            }
+        }
+        let drift = crate::accounting::record_audit(enum_committed_all, enum_mapped_sparse, 0);
+        tracing::info!(
+            enum_committed_mb = enum_committed_all >> 20,
+            enum_sparse_mapped_mb = enum_mapped_sparse >> 20,
+            drift_bytes = drift,
+            "REA-002 accounting audit verified"
+        );
+    }
     let noted_us = began.elapsed().as_micros() as u64;
     let walk = move || {
         fn texels(m: &texture::Mip) -> u64 {
@@ -1722,7 +1744,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
     if !evict_enabled() {
         return;
     }
-    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+    let Some([budget, used, ..]) = crate::host::host().and_then(crate::accounting::video_memory_budget) else {
         return;
     };
     let cap = budget / 100 * room_percent().max(90);

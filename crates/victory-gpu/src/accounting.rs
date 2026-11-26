@@ -99,7 +99,6 @@ struct CachedBudget {
 }
 
 static BUDGET_CACHE: Mutex<Option<CachedBudget>> = Mutex::new(None);
-#[allow(dead_code)] // Wired into host/shadow budget callers in Front C
 const DEFAULT_BUDGET_TTL: Duration = Duration::from_millis(50);
 
 /// Point-in-time O(1) snapshot of tracked host memory pools.
@@ -260,7 +259,6 @@ where
 
 /// Query DXGI adapter video memory through [`cached_video_memory_with`] (50 ms TTL)
 /// when incremental accounting is enabled, or query directly otherwise.
-#[allow(dead_code)] // Wired into host/shadow budget callers in Front C
 pub(crate) fn video_memory_budget(host: &crate::host::Host) -> Option<[u64; 4]> {
     if enabled() {
         cached_video_memory_with(DEFAULT_BUDGET_TTL, || host.video_memory())

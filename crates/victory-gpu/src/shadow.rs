@@ -327,7 +327,7 @@ fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
         least,
         most,
         card_vram_percent(),
-        host.video_memory(),
+        crate::accounting::video_memory_budget(host),
         CARD_BYTES[0].load(Ordering::Relaxed),
     ) {
         note_card_reject(reason, size);
@@ -379,11 +379,15 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if most == 0 || !cards() || !((64 << 10)..(1 << 30)).contains(&size) {
         return None;
     }
+    // Check cheap atomic ceiling before querying DXGI video memory budget (`fxceless` #1250).
+    if WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_add(size) > most {
+        return None;
+    }
     let host = host()?;
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
+    if let Some([budget, used, ..]) = crate::accounting::video_memory_budget(host)
         && used + size > budget / 100 * 72
     {
         return None;
@@ -1584,7 +1588,7 @@ pub(crate) fn card_telemetry_line(frames: f64) {
     let cls = [0, 1, 2, 3, 4].map(|i| LIVE_CLASS[i].load(Ordering::Relaxed));
     let [snap_ms, cmp_ms, merge_ms] =
         [0, 1, 2].map(|i| BACK_TIMING_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
-    let vm = host().and_then(|h| h.video_memory());
+    let vm = host().and_then(crate::accounting::video_memory_budget);
     let [lb_mb, lu_mb, nlb_mb, nlu_mb] = vm.map_or([0; 4], |v| v.map(mb));
     let [tex_alive, tex_alive_bytes, tex_let_go, tex_let_go_bytes, tex_remade, tex_remade_bytes, tex_made] =
         crate::resource::KINDS.each_ref().map(|k| k.load(Ordering::Relaxed));
@@ -2020,6 +2024,8 @@ impl Drop for Shadow {
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if let Some(slot) = LIVE_CLASS.get(self.live_class as usize) {
             slot.fetch_sub(self.len, Ordering::Relaxed);
+            let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
+            crate::accounting::on_shadow_delta(-(self.len as i64), -card_bytes);
         }
         if self.rebar != 0 {
             crate::rebar::released(self.rebar);
@@ -2373,6 +2379,8 @@ impl Shadow {
         if (class as usize) < LIVE_CLASS.len() && self.live_class == u8::MAX {
             self.live_class = class;
             LIVE_CLASS[class as usize].fetch_add(self.len, Ordering::Relaxed);
+            let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
+            crate::accounting::on_shadow_delta(self.len as i64, card_bytes);
         }
     }
 
@@ -3687,14 +3695,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.set_live_class(if card.is_some() {
+        let is_card = card.is_some();
+        shadow.card = card;
+        shadow.set_live_class(if is_card {
             0
         } else if len >= card_limits().0 {
             1
         } else {
             2
         });
-        shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3967,8 +3976,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
-    shadow.set_live_class(if card.is_some() { 3 } else { 4 });
+    let is_card = card.is_some();
     shadow.card = card;
+    shadow.set_live_class(if is_card { 3 } else { 4 });
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
