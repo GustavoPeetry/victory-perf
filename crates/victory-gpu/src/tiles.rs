@@ -93,6 +93,21 @@ fn max_pool_bytes() -> Option<u64> {
     })
 }
 
+fn effective_max_pool_bytes() -> u64 {
+    if let Some(explicit) = max_pool_bytes() {
+        return explicit;
+    }
+    let dxgi_budget = crate::host::host()
+        .and_then(crate::accounting::video_memory_budget)
+        .map(|v| v[0])
+        .unwrap_or(0);
+    if dxgi_budget > 0 {
+        (dxgi_budget.saturating_mul(55) / 100).min(4096 << 20)
+    } else {
+        4096 << 20
+    }
+}
+
 /// Device-level Tiled Resources tier reported by `CheckFeatureSupport`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TiledSupport {
@@ -323,12 +338,8 @@ impl TilePoolState {
 
     fn grow(&mut self, device: &ID3D12Device, min_tiles_needed: u32) -> Option<u64> {
         let want_tiles = DEFAULT_HEAP_TILES.max(min_tiles_needed);
-        let want_bytes = u64::from(want_tiles) * TILE_SIZE;
-        if let Some(cap) = max_pool_bytes()
-            && self.total_heap_bytes + want_bytes > cap
-        {
-            return None;
-        }
+        let pool_cap = effective_max_pool_bytes();
+        let dxgi = crate::host::host().and_then(crate::accounting::video_memory_budget);
 
         // Try default chunk size first, falling back to smaller 4 MiB chunk if tight on VRAM.
         let candidates = if min_tiles_needed <= 64 && want_tiles > 64 {
@@ -339,8 +350,12 @@ impl TilePoolState {
 
         for tiles in candidates {
             let bytes = u64::from(tiles) * TILE_SIZE;
-            if let Some(cap) = max_pool_bytes()
-                && self.total_heap_bytes + bytes > cap
+            if self.total_heap_bytes + bytes > pool_cap {
+                continue;
+            }
+            if let Some([budget, used, ..]) = dxgi
+                && budget > 0
+                && used.saturating_add(bytes) > budget.saturating_mul(90) / 100
             {
                 continue;
             }
@@ -372,46 +387,7 @@ impl TilePoolState {
         None
     }
 
-    /// Allocate `count` tiles (contiguously in one chunk whenever possible so
-    /// `UpdateTileMappings` avoids multi-heap splits).
-    fn alloc(
-        &mut self,
-        device: &ID3D12Device,
-        count: u32,
-        finished_submission: u64,
-    ) -> Option<Vec<(ID3D12Heap, PoolExtent)>> {
-        if count == 0 {
-            return Some(Vec::new());
-        }
-        self.drain_retired(finished_submission);
-
-        // Fast path: find one chunk holding all `count` tiles contiguously.
-        let single_id = self
-            .chunks
-            .iter()
-            .filter(|(_, c)| c.free.iter().any(|s| s.len >= count))
-            .map(|(&id, c)| (id, c.free_tiles))
-            .min_by_key(|&(_, f)| f)
-            .map(|(id, _)| id);
-
-        if let Some(id) = single_id
-            && let Some(chunk) = self.chunks.get_mut(&id)
-            && let Some(ext) = chunk.take_best(count)
-        {
-            self.free_tiles = self.free_tiles.saturating_sub(u64::from(ext.tile_count));
-            return Some(vec![(chunk.heap.clone(), ext)]);
-        }
-
-        // Otherwise allocate a fresh heap chunk sized for at least `count` tiles.
-        if let Some(new_id) = self.grow(device, count)
-            && let Some(chunk) = self.chunks.get_mut(&new_id)
-            && let Some(ext) = chunk.take_best(count)
-        {
-            self.free_tiles = self.free_tiles.saturating_sub(u64::from(ext.tile_count));
-            return Some(vec![(chunk.heap.clone(), ext)]);
-        }
-
-        // Last resort (e.g., pool cap near saturation): piece together across existing chunks.
+    fn alloc_split(&mut self, count: u32) -> Option<Vec<(ID3D12Heap, PoolExtent)>> {
         if self.free_tiles < u64::from(count) {
             return None;
         }
@@ -445,6 +421,53 @@ impl TilePoolState {
             }
             None
         }
+    }
+
+    /// Allocate `count` tiles (contiguously in one chunk whenever possible, then
+    /// splitting across existing free chunks BEFORE growing new 16 MiB heaps).
+    fn alloc(
+        &mut self,
+        device: &ID3D12Device,
+        count: u32,
+        finished_submission: u64,
+    ) -> Option<Vec<(ID3D12Heap, PoolExtent)>> {
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        self.drain_retired(finished_submission);
+
+        // 1. Fast path: find one chunk holding all `count` tiles contiguously.
+        let single_id = self
+            .chunks
+            .iter()
+            .filter(|(_, c)| c.free.iter().any(|s| s.len >= count))
+            .map(|(&id, c)| (id, c.free_tiles))
+            .min_by_key(|&(_, f)| f)
+            .map(|(id, _)| id);
+
+        if let Some(id) = single_id
+            && let Some(chunk) = self.chunks.get_mut(&id)
+            && let Some(ext) = chunk.take_best(count)
+        {
+            self.free_tiles = self.free_tiles.saturating_sub(u64::from(ext.tile_count));
+            return Some(vec![(chunk.heap.clone(), ext)]);
+        }
+
+        // 2. Reuse free tiles fragmented across existing chunks before allocating new VRAM heaps.
+        if let Some(extents) = self.alloc_split(count) {
+            return Some(extents);
+        }
+
+        // 3. Only allocate a new heap chunk when existing free tiles are insufficient and within DXGI budget.
+        if let Some(new_id) = self.grow(device, count)
+            && let Some(chunk) = self.chunks.get_mut(&new_id)
+            && let Some(ext) = chunk.take_best(count)
+        {
+            self.free_tiles = self.free_tiles.saturating_sub(u64::from(ext.tile_count));
+            return Some(vec![(chunk.heap.clone(), ext)]);
+        }
+
+        None
     }
 
     fn retire(&mut self, submission: u64, extents: Vec<PoolExtent>) {
@@ -536,7 +559,7 @@ pub(crate) struct SparseBinding {
     authority_va: AtomicUsize,
     mip_levels: u32,
     array_slices: u32,
-    num_standard_mips: u32,
+    pub(crate) num_standard_mips: u32,
     packed_info: D3D12_PACKED_MIP_INFO,
     subresource_tilings: Vec<D3D12_SUBRESOURCE_TILING>,
     mapped_mips_mask: AtomicU64,
@@ -1071,7 +1094,6 @@ impl SparseBinding {
 
     /// Releases title residency requirement for fine mips (`0..up_to_mip`),
     /// permitting opt-in cold reclaim once no descriptor or GPU fence references them.
-    #[cfg(test)]
     pub(crate) fn release_title_mips(&self, up_to_mip: u32) {
         if up_to_mip == 0 {
             return;
@@ -1607,5 +1629,66 @@ mod tests {
         binding.retire_all(501);
         POOL.lock().unwrap().drain_retired(501);
         println!("{OK}");
+    }
+
+    #[test]
+    fn tile_pool_splits_across_existing_chunks_before_grow_and_caps_budget() {
+        let mut device: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            return;
+        }
+        let device = device.unwrap();
+        let sup = query_tiled_support(&device);
+        if !sup.supported {
+            return;
+        }
+        let mut pool = TilePoolState::new();
+        // Force grow of two 16 MiB chunks (256 tiles each) by allocating 250 + 250 tiles,
+        // leaving 6 free tiles in chunk 1 and 6 free tiles in chunk 2 (= 12 free tiles total, none contiguous for 10).
+        let a1 = pool.alloc(&device, 250, 1).expect("alloc 250 tiles");
+        assert_eq!(a1.len(), 1);
+        let heaps_after_first = pool.chunks.len();
+        assert_eq!(heaps_after_first, 1);
+
+        let a2 = pool.alloc(&device, 250, 1).expect("alloc second 250 tiles");
+        assert_eq!(pool.chunks.len(), 2);
+        let heap_bytes_before_split = pool.total_heap_bytes;
+        assert_eq!(pool.free_tiles, 12);
+
+        // Request 10 tiles: no single chunk has 10 contiguous tiles, so `alloc` MUST split across
+        // both existing chunks BEFORE growing a 3rd 16 MiB heap!
+        let split = pool
+            .alloc(&device, 10, 1)
+            .expect("split 10 tiles across existing chunks");
+        assert_eq!(
+            pool.chunks.len(),
+            2,
+            "multi-chunk split must avoid growing a new 16 MiB heap"
+        );
+        assert_eq!(pool.total_heap_bytes, heap_bytes_before_split);
+        let sum_tiles: u32 = split.iter().map(|(_, e)| e.tile_count).sum();
+        assert_eq!(sum_tiles, 10);
+        assert_eq!(pool.free_tiles, 2);
+
+        let cap = effective_max_pool_bytes();
+        assert!(cap <= (4096 << 20) && cap > 0);
+        let acc_before = accounting::snapshot().tile_pool_allocated_bytes;
+        // Cleanly retire and drain local test pool so accounting counters return to baseline.
+        let retire_extents =
+            |exts: Vec<(ID3D12Heap, PoolExtent)>, sub: u64, st: &mut TilePoolState| {
+                let plain: Vec<PoolExtent> = exts.into_iter().map(|(_, e)| e).collect();
+                st.retire(sub, plain);
+            };
+        retire_extents(a1, 2, &mut pool);
+        retire_extents(a2, 2, &mut pool);
+        retire_extents(split, 2, &mut pool);
+        pool.drain_retired(2);
+        // Drain even if below hysteresis by explicitly releasing remaining empty chunks.
+        for (_, chunk) in std::mem::take(&mut pool.chunks) {
+            let chunk_bytes = u64::from(chunk.total_tiles) * TILE_SIZE;
+            pool.total_heap_bytes = pool.total_heap_bytes.saturating_sub(chunk_bytes);
+            accounting::on_tile_pool_delta(-(chunk_bytes as i64));
+        }
+        assert!(accounting::snapshot().tile_pool_allocated_bytes <= acc_before);
     }
 }

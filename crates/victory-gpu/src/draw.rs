@@ -2078,8 +2078,14 @@ impl State {
         {
             return;
         }
-        // O(1) incremental path skips walking 18k+ descriptor slots unless audit verification is requested.
-        if incremental_on && !audit_on {
+        static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let window_idx = WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let periodic_due =
+            crate::accounting::periodic_audit_enabled() && window_idx.is_multiple_of(20);
+        if incremental_on {
+            if audit_on || periodic_due {
+                let _ = crate::resource::run_accounting_audit();
+            }
             let snap = crate::accounting::snapshot();
             tracing::info!(
                 room,
@@ -2091,11 +2097,16 @@ impl State {
                 tile_pool_mb = snap.tile_pool_allocated_bytes >> 20,
                 shadow_ram_mb = snap.shadow_ram_bytes >> 20,
                 shadow_vram_mb = snap.shadow_vram_bytes >> 20,
+                scratch_vram_mb = snap.scratch_vram_bytes >> 20,
                 dxgi_actual = snap.dxgi_queries_actual,
                 dxgi_cached = snap.dxgi_queries_cached,
+                audit_runs = snap.audit_runs,
+                audit_mismatches = snap.audit_mismatches,
                 "REA-002 O(1) incremental memory accounting"
             );
-            return;
+            if !legacy_on {
+                return;
+            }
         }
         // Due slots; of them uploaded before; of them viewing nothing the
         // title fills; and the textures (each once) whose host copy is

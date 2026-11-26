@@ -408,6 +408,7 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        crate::accounting::on_staging_delta(-(self.bytes as i64));
     }
 }
 
@@ -1045,8 +1046,14 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let res_first = self
+            .resident_first
+            .load(std::sync::atomic::Ordering::Relaxed);
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
+            if res_first != u32::MAX && mip < res_first {
+                continue;
+            }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1068,9 +1075,6 @@ impl Staging {
                 );
             if gpu_ok {
                 continue;
-            }
-            if crate::gpu_detile::gpu_detile_enabled() {
-                crate::gpu_detile::note_cpu_fallback();
             }
             if let Err(e) =
                 self.layout
@@ -1432,6 +1436,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    crate::accounting::on_staging_delta(total as i64);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]

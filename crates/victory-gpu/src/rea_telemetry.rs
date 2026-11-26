@@ -736,7 +736,7 @@ fn collect_backends_json(
         detile_on,
         detile_on && detile_stats.dispatches > 0,
         detile_stats.dispatches,
-        detile_stats.fallback_cpu,
+        detile_stats.fallback_cpu + detile_stats.cpu_adaptive_skips,
         0,
     );
 
@@ -890,6 +890,7 @@ fn format_window_json(
     let acc_res_mb = acc.reserved_textures_bytes >> 20;
     let shadow_ram_mb = acc.shadow_ram_bytes >> 20;
     let shadow_vram_mb = acc.shadow_vram_bytes >> 20;
+    let scratch_vram_mb = acc.scratch_vram_bytes >> 20;
     let staging_mb = acc.staging_bytes >> 20;
     let upload_ring_mb = acc.upload_ring_bytes >> 20;
     let reclaimable_mb = acc.reclaimable_bytes >> 20;
@@ -909,7 +910,7 @@ fn format_window_json(
          \"upload_ring_mb\":{upload_ring_mb},\"reclaimable_mb\":{reclaimable_mb},\
          \"retired_pending\":{},\"sparse_mapped_mb\":{},\"sparse_virt_mb\":{},\
          \"sparse_reclaimed_tiles\":{},\"shadow_ram_mb\":{shadow_ram_mb},\"shadow_vram_mb\":{shadow_vram_mb},\
-         \"dxgi_act\":{},\"dxgi_hit\":{},\"audit_runs\":{},\"audit_mismatches\":{},\
+         \"scratch_vram_mb\":{scratch_vram_mb},\"dxgi_act\":{},\"dxgi_hit\":{},\"audit_runs\":{},\"audit_mismatches\":{},\
          \"rb_tagged\":{},\"rb_hit\":{},\"rb_miss\":{},\"rb_semantic_fallbacks\":{},\"rb_validate_samples\":{},\"rb_validate_warnings\":{},\
          \"dirty_calls\":{},\"dirty_bytes\":{},\"dirty_subsumed\":{},\"dirty_coalesced\":{},\"dirty_raw\":{},\
          \"auth_gpu\":{},\"auth_skipped_cmp\":{},\"tls_hits\":{tls_hits},\"tls_misses\":{tls_misses},\"barriers_elided\":{barriers_elided},\

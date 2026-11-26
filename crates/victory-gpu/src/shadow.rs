@@ -2389,8 +2389,13 @@ impl Drop for Shadow {
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if let Some(slot) = LIVE_CLASS.get(self.live_class as usize) {
             slot.fetch_sub(self.len, Ordering::Relaxed);
-            let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
-            crate::accounting::on_shadow_delta(-(self.len as i64), -card_bytes);
+            let ram_delta = if self.rebar != 0 { 0 } else { self.len as i64 };
+            let vram_delta = self
+                .card
+                .as_ref()
+                .map_or(0, |c| c.size as i64)
+                .saturating_add(self.rebar as i64);
+            crate::accounting::on_shadow_delta(-ram_delta, -vram_delta);
             crate::authority::unregister_range(self.start as usize, self.len as usize);
         }
         if self.rebar != 0 {
@@ -2785,8 +2790,13 @@ impl Shadow {
         if (class as usize) < LIVE_CLASS.len() && self.live_class == u8::MAX {
             self.live_class = class;
             LIVE_CLASS[class as usize].fetch_add(self.len, Ordering::Relaxed);
-            let card_bytes = self.card.as_ref().map_or(0, |c| c.size as i64);
-            crate::accounting::on_shadow_delta(self.len as i64, card_bytes);
+            let ram_delta = if self.rebar != 0 { 0 } else { self.len as i64 };
+            let vram_delta = self
+                .card
+                .as_ref()
+                .map_or(0, |c| c.size as i64)
+                .saturating_add(self.rebar as i64);
+            crate::accounting::on_shadow_delta(ram_delta, vram_delta);
             crate::authority::register_range(
                 self.start as usize,
                 self.len as usize,

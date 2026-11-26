@@ -11,28 +11,29 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use victory_formats::texture::{Dimension, Layout, Swizzle};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1_0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_FENCE_FLAG_NONE,
-    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_RANGE,
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_ROOT_CONSTANTS,
-    D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
-    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_ROOT_PARAMETER_TYPE_SRV,
-    D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_NONE,
-    D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL, D3D12SerializeRootSignature,
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12RootSignature,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    D3D12_RESOURCE_STATES, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+    D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
+    D3D12SerializeRootSignature, ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue,
+    ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource,
+    ID3D12RootSignature,
 };
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, s};
 
-use crate::dxr_backend::{align_up, readback_vec, transition_barrier, uav_barrier_all};
-use crate::dxr_proto::{create_buffer, upload_slice};
+use crate::dxr_backend::{align_up, transition_barrier, uav_barrier_all};
+use crate::dxr_proto::create_buffer;
 
 /// Gate flag for GPU compute detiling (`VICTORY_REA003_GPU_DETILE=1`, off by default).
 pub fn gpu_detile_enabled() -> bool {
@@ -44,6 +45,29 @@ pub fn gpu_detile_enabled() -> bool {
     })
 }
 
+/// Minimum output slice bytes before GPU compute detiling is worthwhile (`VICTORY_REA003_GPU_DETILE_MIN_KB`, default 256 KiB).
+pub fn min_gpu_detile_bytes() -> usize {
+    static MIN_BYTES: OnceLock<usize> = OnceLock::new();
+    *MIN_BYTES.get_or_init(|| {
+        std::env::var("VICTORY_REA003_GPU_DETILE_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(256 << 10, |kb| kb << 10)
+    })
+}
+
+/// Maximum scratch/output slice bytes allowed for GPU detiling (`VICTORY_REA003_GPU_DETILE_MAX_KB`, default 16 MiB).
+pub fn max_gpu_detile_bytes() -> usize {
+    static MAX_BYTES: OnceLock<usize> = OnceLock::new();
+    *MAX_BYTES.get_or_init(|| {
+        std::env::var("VICTORY_REA003_GPU_DETILE_MAX_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&kb| kb >= 256)
+            .map_or(16 << 20, |kb| kb << 10)
+    })
+}
+
 /// Cumulative metrics from GPU detile operations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuDetileStats {
@@ -51,6 +75,8 @@ pub struct GpuDetileStats {
     pub bytes_detiled: u64,
     pub upload_ring_hits: u64,
     pub fallback_cpu: u64,
+    pub cpu_adaptive_skips: u64,
+    pub scratch_allocations: u64,
     pub last_dispatch_us: u64,
 }
 
@@ -58,6 +84,8 @@ static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static BYTES_DETILED: AtomicU64 = AtomicU64::new(0);
 static RING_HITS: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_CPU: AtomicU64 = AtomicU64::new(0);
+static CPU_ADAPTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static LAST_US: AtomicU64 = AtomicU64::new(0);
 
 pub fn stats() -> GpuDetileStats {
@@ -66,6 +94,8 @@ pub fn stats() -> GpuDetileStats {
         bytes_detiled: BYTES_DETILED.load(Ordering::Relaxed),
         upload_ring_hits: RING_HITS.load(Ordering::Relaxed),
         fallback_cpu: FALLBACK_CPU.load(Ordering::Relaxed),
+        cpu_adaptive_skips: CPU_ADAPTIVE_SKIPS.load(Ordering::Relaxed),
+        scratch_allocations: SCRATCH_ALLOCS.load(Ordering::Relaxed),
         last_dispatch_us: LAST_US.load(Ordering::Relaxed),
     }
 }
@@ -238,6 +268,54 @@ pub struct DetileSubresource {
     pub depth_pitch: usize,
 }
 
+struct MappedScratch {
+    res: ID3D12Resource,
+    ptr: *mut u8,
+    cap: u64,
+}
+
+impl MappedScratch {
+    fn ensure(
+        slot: &mut Option<Self>,
+        device: &ID3D12Device,
+        need: u64,
+        tracked_bytes: &mut u64,
+    ) -> Result<(*const u8, *mut u8, ID3D12Resource), String> {
+        let need = align_up(need.max(256), 4096);
+        let cur_cap = slot.as_ref().map_or(0, |b| b.cap);
+        if cur_cap < need {
+            if let Some(old) = slot.take() {
+                *tracked_bytes = tracked_bytes.saturating_sub(old.cap);
+                crate::accounting::on_scratch_vram_delta(-(old.cap as i64));
+                drop(old);
+            }
+            let res = create_buffer(
+                device,
+                need,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: UPLOAD resource mapped cleanly for persistent host writes.
+            unsafe {
+                res.Map(0, None, Some(&mut ptr))
+                    .map_err(|e| format!("Map upload scratch: {e}"))?;
+            }
+            SCRATCH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            *tracked_bytes = tracked_bytes.saturating_add(need);
+            crate::accounting::on_scratch_vram_delta(need as i64);
+            *slot = Some(Self {
+                res,
+                ptr: ptr.cast(),
+                cap: need,
+            });
+        }
+        let s = slot.as_ref().expect("slot ensured above");
+        Ok((s.ptr.cast_const(), s.ptr, s.res.clone()))
+    }
+}
+
 /// Self-contained D3D12 compute detiler matching [`victory_formats::texture::Layout::detile`].
 pub struct GpuDetiler {
     device: ID3D12Device,
@@ -249,6 +327,12 @@ pub struct GpuDetiler {
     event: HANDLE,
     root_sig: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    scratch_tiled: Option<MappedScratch>,
+    scratch_lut: Option<MappedScratch>,
+    scratch_out_seed: Option<MappedScratch>,
+    scratch_out_uav: Option<(ID3D12Resource, u64, D3D12_RESOURCE_STATES)>,
+    scratch_out_rb: Option<(ID3D12Resource, u64)>,
+    tracked_scratch_bytes: u64,
 }
 
 impl GpuDetiler {
@@ -371,7 +455,70 @@ impl GpuDetiler {
             event,
             root_sig,
             pso,
+            scratch_tiled: None,
+            scratch_lut: None,
+            scratch_out_seed: None,
+            scratch_out_uav: None,
+            scratch_out_rb: None,
+            tracked_scratch_bytes: 0,
         })
+    }
+
+    fn ensure_out_uav(
+        &mut self,
+        need: u64,
+    ) -> Result<(ID3D12Resource, D3D12_RESOURCE_STATES), String> {
+        let need = align_up(need.max(256), 4096);
+        let cur_cap = self.scratch_out_uav.as_ref().map_or(0, |b| b.1);
+        if cur_cap < need {
+            if let Some(old) = self.scratch_out_uav.take() {
+                self.tracked_scratch_bytes = self.tracked_scratch_bytes.saturating_sub(old.1);
+                crate::accounting::on_scratch_vram_delta(-(old.1 as i64));
+                drop(old);
+            }
+            let res = create_buffer(
+                &self.device,
+                need,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            SCRATCH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            self.tracked_scratch_bytes = self.tracked_scratch_bytes.saturating_add(need);
+            crate::accounting::on_scratch_vram_delta(need as i64);
+            self.scratch_out_uav = Some((res, need, D3D12_RESOURCE_STATE_COPY_DEST));
+        }
+        let (res, _, state) = self.scratch_out_uav.as_ref().expect("out_uav ensured");
+        Ok((res.clone(), *state))
+    }
+
+    fn ensure_out_rb(&mut self, need: u64) -> Result<ID3D12Resource, String> {
+        let need = align_up(need.max(256), 4096);
+        let cur_cap = self.scratch_out_rb.as_ref().map_or(0, |b| b.1);
+        if cur_cap < need {
+            if let Some(old) = self.scratch_out_rb.take() {
+                self.tracked_scratch_bytes = self.tracked_scratch_bytes.saturating_sub(old.1);
+                crate::accounting::on_scratch_vram_delta(-(old.1 as i64));
+                drop(old);
+            }
+            let res = create_buffer(
+                &self.device,
+                need,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            SCRATCH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            self.tracked_scratch_bytes = self.tracked_scratch_bytes.saturating_add(need);
+            crate::accounting::on_scratch_vram_delta(need as i64);
+            self.scratch_out_rb = Some((res, need));
+        }
+        Ok(self
+            .scratch_out_rb
+            .as_ref()
+            .expect("out_rb ensured")
+            .0
+            .clone())
     }
 
     /// Detiles `tiled` subresource into `linear`, matching [`Layout::detile`].
@@ -392,6 +539,9 @@ impl GpuDetiler {
             .mips
             .get(mip as usize)
             .ok_or_else(|| "invalid mip".to_owned())?;
+        if layout.desc.samples != 1 || layout.desc.swizzle.xor() || !layout.addressable() {
+            return Err("unsupported XOR/MSAA/unaddressable layout for GPU detile".to_owned());
+        }
         let elem_bytes = layout.desc.element_bytes;
         if !matches!(elem_bytes, 1 | 2 | 4 | 8 | 16) {
             return Err("unsupported element_bytes for GPU detile".to_owned());
@@ -432,6 +582,17 @@ impl GpuDetiler {
         if tiled.len() > u32::MAX as usize || linear.len() > u32::MAX as usize {
             return Err("buffer exceeds 32-bit byte address range".to_owned());
         }
+        let gx_count = match elem_bytes {
+            1 => m.width.div_ceil(4),
+            2 => m.width.div_ceil(2),
+            _ => m.width,
+        };
+        let gx = gx_count.div_ceil(8);
+        let gy = m.height.div_ceil(8);
+        let gz = m.depth;
+        if gx > 65535 || gy > 65535 || gz > 65535 {
+            return Err("dispatch grid exceeds D3D12 65535 dimension limit".to_owned());
+        }
 
         let (pat_x, pat_y) = layout.pattern_xy();
         let pat_z = layout.pattern_z();
@@ -454,77 +615,58 @@ impl GpuDetiler {
             );
         }
 
-        // Prepare tiled buffer via upload_ring when active, else transient upload resource.
-        let tiled_bytes = align_up(tiled.len() as u64, 256);
-        let pooled_tiled = if crate::upload_ring::enabled() {
-            crate::upload_ring::checkout_upload(
-                &self.device,
-                tiled_bytes,
-                crate::host::finished_submission(),
-            )
-        } else {
-            None
-        };
-        let tiled_res = if let Some((res, ptr, _)) = &pooled_tiled {
-            RING_HITS.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: pooled upload resource mapped for at least `tiled.len()` bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(tiled.as_ptr(), *ptr, tiled.len());
-            }
-            res.clone()
-        } else {
-            let res = create_buffer(
-                &self.device,
-                tiled_bytes,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            )?;
-            upload_slice(&res, tiled)?;
-            res
-        };
-
-        let lut_bytes = align_up((lut.len() * 4) as u64, 256);
-        let lut_res = create_buffer(
+        let (_, tiled_ptr, tiled_res) = MappedScratch::ensure(
+            &mut self.scratch_tiled,
             &self.device,
-            lut_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
+            align_up(tiled.len() as u64, 256),
+            &mut self.tracked_scratch_bytes,
         )?;
-        upload_slice(&lut_res, &lut)?;
+        // SAFETY: `tiled_ptr` points to persistent UPLOAD allocation >= `tiled.len()`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tiled.as_ptr(), tiled_ptr, tiled.len());
+        }
+
+        let lut_byte_len = lut.len() * 4;
+        let (_, lut_ptr, lut_res) = MappedScratch::ensure(
+            &mut self.scratch_lut,
+            &self.device,
+            align_up(lut_byte_len as u64, 256),
+            &mut self.tracked_scratch_bytes,
+        )?;
+        // SAFETY: `lut_ptr` points to persistent UPLOAD allocation >= `lut_byte_len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(lut.as_ptr().cast::<u8>(), lut_ptr, lut_byte_len);
+        }
+
+        // Skip `out_seed` copy whenever CS writes every byte of `linear` densely.
+        let row_exact = row_pitch == (m.width as usize) * (elem_bytes as usize);
+        let slice_exact = m.depth <= 1 || depth_pitch == row_pitch * (m.height as usize);
+        let tail_aligned = elem_bytes >= 4
+            || (elem_bytes == 2 && m.width.is_multiple_of(2))
+            || (elem_bytes == 1 && m.width.is_multiple_of(4));
+        let overwrites_all =
+            row_exact && slice_exact && tail_aligned && need_linear == linear.len();
+
+        let seed_res = if overwrites_all {
+            None
+        } else {
+            let (_, seed_ptr, seed_res) = MappedScratch::ensure(
+                &mut self.scratch_out_seed,
+                &self.device,
+                align_up(linear.len() as u64, 256),
+                &mut self.tracked_scratch_bytes,
+            )?;
+            // SAFETY: `seed_ptr` points to persistent UPLOAD allocation >= `linear.len()`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(linear.as_ptr(), seed_ptr, linear.len());
+            }
+            Some(seed_res)
+        };
 
         let out_bytes = align_up(linear.len() as u64, 256);
-        // Preserve caller padding bytes outside written pixels by seeding UAV via upload copy if non-zero.
-        let out_seed = create_buffer(
-            &self.device,
-            out_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-        )?;
-        upload_slice(&out_seed, linear)?;
+        let (out_uav, prev_uav_state) = self.ensure_out_uav(out_bytes)?;
+        let out_rb = self.ensure_out_rb(out_bytes)?;
 
-        let out_uav = create_buffer(
-            &self.device,
-            out_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        )?;
-        let out_rb = create_buffer(
-            &self.device,
-            out_bytes,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        )?;
-
-        let gx_count = match elem_bytes {
-            1 => m.width.div_ceil(4),
-            2 => m.width.div_ceil(2),
-            _ => m.width,
-        };
         let (tail_x, tail_y) = m.tail.map_or((0, 0), |t| (t.x, t.y));
         let consts = DetileConstants {
             width: m.width,
@@ -548,14 +690,14 @@ impl GpuDetiler {
             gx_count,
             pad: 0,
         };
-        let gx = gx_count.div_ceil(8);
-        let gy = m.height.div_ceil(8);
-        let gz = m.depth;
         let started = Instant::now();
         let next_fence = self.fence_value + 1;
 
-        // SAFETY: all upload, UAV, and readback resources remain alive until fence wait completes.
+        // SAFETY: all scratch upload, UAV, and readback resources remain alive until fence wait finishes.
         unsafe {
+            if self.fence.GetCompletedValue() == u64::MAX {
+                return Err("D3D12 device already removed before gpu_detile".to_owned());
+            }
             let tiled_va = tiled_res.GetGPUVirtualAddress();
             let lut_va = lut_res.GetGPUVirtualAddress();
             let out_va = out_uav.GetGPUVirtualAddress();
@@ -566,12 +708,29 @@ impl GpuDetiler {
             self.list
                 .Reset(&self.alloc, None)
                 .map_err(|e| format!("Reset list: {e}"))?;
-            self.list.CopyResource(&out_uav, &out_seed);
-            self.list.ResourceBarrier(&[transition_barrier(
-                &out_uav,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
+
+            if let Some(ref seed) = seed_res {
+                if prev_uav_state != D3D12_RESOURCE_STATE_COPY_DEST {
+                    self.list.ResourceBarrier(&[transition_barrier(
+                        &out_uav,
+                        prev_uav_state,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                }
+                self.list.CopyResource(&out_uav, seed);
+                self.list.ResourceBarrier(&[transition_barrier(
+                    &out_uav,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            } else if prev_uav_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+                self.list.ResourceBarrier(&[transition_barrier(
+                    &out_uav,
+                    prev_uav_state,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+
             self.list.SetComputeRootSignature(&self.root_sig);
             self.list.SetPipelineState(&self.pso);
             self.list
@@ -596,22 +755,46 @@ impl GpuDetiler {
             self.queue
                 .Signal(&self.fence, next_fence)
                 .map_err(|e| format!("Signal: {e}"))?;
-            if self.fence.GetCompletedValue() < next_fence {
+            let completed = self.fence.GetCompletedValue();
+            if completed == u64::MAX {
+                return Err("D3D12 device removed on gpu_detile Signal".to_owned());
+            }
+            if completed < next_fence {
                 self.fence
                     .SetEventOnCompletion(next_fence, self.event)
                     .map_err(|e| format!("SetEventOnCompletion: {e}"))?;
-                WaitForSingleObject(self.event, INFINITE);
+                let wait = WaitForSingleObject(self.event, 5000);
+                let after = self.fence.GetCompletedValue();
+                if after == u64::MAX {
+                    return Err("D3D12 device removed waiting for gpu_detile".to_owned());
+                }
+                if wait != WAIT_OBJECT_0 && after < next_fence {
+                    return Err(
+                        "gpu_detile timed out after 5000 ms waiting for GPU fence".to_owned()
+                    );
+                }
             }
+        }
+        if let Some((_, _, ref mut st)) = self.scratch_out_uav {
+            *st = D3D12_RESOURCE_STATE_COPY_SOURCE;
         }
         self.fence_value = next_fence;
         let elapsed_us = started.elapsed().as_micros().max(1) as u64;
 
-        if let Some((res, ptr, bucket)) = pooled_tiled {
-            crate::upload_ring::return_upload(res, ptr, bucket, crate::host::finished_submission());
+        // Read back directly from `out_rb` into caller slice without intermediate Vec allocation.
+        let mut rb_ptr: *mut c_void = std::ptr::null_mut();
+        let read_range = D3D12_RANGE {
+            Begin: 0,
+            End: linear.len(),
+        };
+        // SAFETY: GPU copy into `out_rb` finished before fence completion above.
+        unsafe {
+            out_rb
+                .Map(0, Some(&read_range), Some(&mut rb_ptr))
+                .map_err(|e| format!("Map out_rb: {e}"))?;
+            std::ptr::copy_nonoverlapping(rb_ptr.cast::<u8>(), linear.as_mut_ptr(), linear.len());
+            out_rb.Unmap(0, None);
         }
-
-        let gpu_bytes = readback_vec::<u8>(&out_rb, linear.len())?;
-        linear.copy_from_slice(&gpu_bytes);
 
         DISPATCHES.fetch_add(1, Ordering::Relaxed);
         BYTES_DETILED.fetch_add(linear.len() as u64, Ordering::Relaxed);
@@ -622,6 +805,15 @@ impl GpuDetiler {
 
 impl Drop for GpuDetiler {
     fn drop(&mut self) {
+        self.scratch_tiled = None;
+        self.scratch_lut = None;
+        self.scratch_out_seed = None;
+        self.scratch_out_uav = None;
+        self.scratch_out_rb = None;
+        if self.tracked_scratch_bytes > 0 {
+            crate::accounting::on_scratch_vram_delta(-(self.tracked_scratch_bytes as i64));
+            self.tracked_scratch_bytes = 0;
+        }
         if !self.event.is_invalid() {
             // SAFETY: owned Win32 event handle closed once on Drop.
             unsafe {
@@ -644,37 +836,79 @@ fn supported_swizzle(s: Swizzle) -> bool {
             | Swizzle::SW_4KB_D
             | Swizzle::SW_64KB_S
             | Swizzle::SW_64KB_D
-            | Swizzle::SW_64KB_S_X
-            | Swizzle::SW_64KB_D_X
-            | Swizzle::SW_64KB_R_X
-            | Swizzle::SW_64KB_Z_X
     )
 }
 
 static SHARED_DETILER: Mutex<Option<GpuDetiler>> = Mutex::new(None);
 
-/// Attempts GPU detile using a lazy host-device [`GpuDetiler`]; returns `false` on unsupported inputs
-/// so the caller falls back to CPU `Layout::detile`.
+/// Adaptive GPU detile admission gate checking layout support, slice size bounds
+/// (`[min_gpu_detile_bytes, max_gpu_detile_bytes]`), D3D12 dispatch dimensions, and VRAM headroom.
+pub(crate) fn should_use_gpu(layout: &Layout, mip: u32, linear_len: usize) -> bool {
+    if layout.desc.samples != 1 || layout.desc.swizzle.xor() || !layout.addressable() {
+        return false;
+    }
+    if layout.desc.swizzle != Swizzle::LINEAR && !supported_swizzle(layout.desc.swizzle) {
+        return false;
+    }
+    if linear_len < min_gpu_detile_bytes() || linear_len > max_gpu_detile_bytes() {
+        return false;
+    }
+    let Some(m) = layout.mips.get(mip as usize) else {
+        return false;
+    };
+    let gx_count = match layout.desc.element_bytes {
+        1 => m.width.div_ceil(4),
+        2 => m.width.div_ceil(2),
+        _ => m.width,
+    };
+    if gx_count.div_ceil(8) > 65535 || m.height.div_ceil(8) > 65535 || m.depth > 65535 {
+        return false;
+    }
+    if let Some([budget, used, ..]) =
+        crate::host::host().and_then(crate::accounting::video_memory_budget)
+        && budget > 0
+        && used >= budget.saturating_mul(82) / 100
+    {
+        return false;
+    }
+    true
+}
+
+/// Attempts adaptive GPU detile using a lazy host-device [`GpuDetiler`]; returns `false` on skipped or unsupported inputs
+/// so the caller falls back cleanly to CPU `Layout::detile`.
 pub fn try_detile_to_slice(
     layout: &Layout,
     tiled: &[u8],
     sub: DetileSubresource,
     linear: &mut [u8],
 ) -> bool {
+    if !should_use_gpu(layout, sub.mip, linear.len()) {
+        CPU_ADAPTIVE_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let Some(host) = crate::host::host() else {
+        CPU_ADAPTIVE_SKIPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     let mut guard = SHARED_DETILER.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         let Ok(detiler) = GpuDetiler::new(&host.device) else {
+            note_cpu_fallback();
             return false;
         };
         *guard = Some(detiler);
     }
     let Some(detiler) = guard.as_mut() else {
+        note_cpu_fallback();
         return false;
     };
-    detiler.detile_to_slice(layout, tiled, sub, linear).is_ok()
+    match detiler.detile_to_slice(layout, tiled, sub, linear) {
+        Ok(_) => true,
+        Err(_) => {
+            note_cpu_fallback();
+            false
+        }
+    }
 }
 
 fn compile_cs51(source: &str) -> Result<Vec<u8>, String> {
@@ -834,6 +1068,132 @@ mod tests {
         println!(
             "GPU_DETILE_1024_RGBA8_SW64KBS cpu_us={cpu_us} gpu_us={gpu_us} stats={:?}",
             stats()
+        );
+    }
+
+    #[test]
+    fn gpu_detile_reuses_persistent_scratch_and_rejects_xor_or_small() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let scratch_base = crate::accounting::snapshot().scratch_vram_bytes;
+        let allocs_before = SCRATCH_ALLOCS.load(Ordering::Relaxed);
+        {
+            let mut detiler = GpuDetiler::new(&host.device).expect("GpuDetiler::new");
+            // Small < 256 KiB slice is rejected by adaptive selector (`should_use_gpu == false`).
+            let small_layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S,
+            })
+            .expect("small layout");
+            assert!(!should_use_gpu(&small_layout, 0, 64 * 64 * 4));
+
+            // XOR swizzle & MSAA are strictly rejected by both `should_use_gpu` and `detile_to_slice`.
+            let xor_layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 512,
+                height: 512,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S_X,
+            })
+            .expect("xor layout");
+            assert!(!should_use_gpu(&xor_layout, 0, 512 * 512 * 4));
+            let xor_tiled = pattern_bytes(xor_layout.size as usize);
+            let mut xor_out = vec![0u8; 512 * 512 * 4];
+            assert!(
+                detiler
+                    .detile_to_slice(
+                        &xor_layout,
+                        &xor_tiled,
+                        DetileSubresource {
+                            mip: 0,
+                            slice: 0,
+                            row_pitch: 512 * 4,
+                            depth_pitch: 512 * 512 * 4,
+                        },
+                        &mut xor_out,
+                    )
+                    .is_err()
+            );
+
+            // Large >= 256 KiB SW_64KB_S passes adaptive gate and reuses scratch across 55 dispatches.
+            let big_layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 512,
+                height: 512,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_S,
+            })
+            .expect("big layout");
+            let big_bytes = 512 * 512 * 4;
+            assert!(should_use_gpu(&big_layout, 0, big_bytes));
+            let big_tiled = pattern_bytes(big_layout.size as usize);
+            let mut cpu_expected = vec![0u8; big_bytes];
+            big_layout
+                .detile(&big_tiled, 0, 0, &mut cpu_expected, 512 * 4, big_bytes)
+                .expect("CPU detile");
+            let mut gpu_out = vec![0u8; big_bytes];
+
+            // Warm-up dispatch allocates persistent scratch once (4 buffers because overwrites_all=true skips out_seed).
+            detiler
+                .detile_to_slice(
+                    &big_layout,
+                    &big_tiled,
+                    DetileSubresource {
+                        mip: 0,
+                        slice: 0,
+                        row_pitch: 512 * 4,
+                        depth_pitch: big_bytes,
+                    },
+                    &mut gpu_out,
+                )
+                .expect("warm dispatch");
+            assert_eq!(gpu_out, cpu_expected);
+            let allocs_after_warm = SCRATCH_ALLOCS.load(Ordering::Relaxed);
+            assert!(allocs_after_warm > allocs_before);
+            assert!(crate::accounting::snapshot().scratch_vram_bytes > scratch_base);
+
+            for _ in 0..55 {
+                detiler
+                    .detile_to_slice(
+                        &big_layout,
+                        &big_tiled,
+                        DetileSubresource {
+                            mip: 0,
+                            slice: 0,
+                            row_pitch: 512 * 4,
+                            depth_pitch: big_bytes,
+                        },
+                        &mut gpu_out,
+                    )
+                    .expect("reused scratch dispatch");
+            }
+            assert_eq!(
+                SCRATCH_ALLOCS.load(Ordering::Relaxed),
+                allocs_after_warm,
+                "55 steady-state dispatches must perform ZERO new scratch allocations"
+            );
+            assert_eq!(gpu_out, cpu_expected);
+        }
+        assert_eq!(
+            crate::accounting::snapshot().scratch_vram_bytes,
+            scratch_base,
+            "dropping GpuDetiler must cleanly release tracked scratch_vram_bytes"
         );
     }
 }

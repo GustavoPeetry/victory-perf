@@ -1372,6 +1372,52 @@ pub(crate) fn host_made<'a>(
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
+#[cfg(windows)]
+#[inline]
+fn base_com_refs(host: &HostTexture) -> u32 {
+    // Sparse HostTextures hold one COM ref in `host.texture` and one inside `SparseBinding::resource`.
+    if host.sparse.is_some() { 2 } else { 1 }
+}
+
+/// Enumerates all live committed and sparse physical texture bytes in `TEXTURES`
+/// and runs [`crate::accounting::record_audit`].
+#[cfg(windows)]
+pub(crate) fn run_accounting_audit() -> u64 {
+    let mut enum_committed_all = 0u64;
+    let mut enum_mapped_sparse = 0u64;
+    {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: live entry under `TEXTURES` lock.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, twin)) = made.as_ref() {
+                if host.sparse.is_some() {
+                    enum_mapped_sparse += host.physical_bytes();
+                } else {
+                    enum_committed_all += host.bytes;
+                }
+                if let Some(t) = twin {
+                    enum_committed_all += t.colour.bytes;
+                    if let Some(plane) = &t.plane {
+                        enum_committed_all += plane.bytes;
+                    }
+                }
+            }
+        }
+    }
+    let drift = crate::accounting::record_audit(enum_committed_all, enum_mapped_sparse, 0);
+    tracing::info!(
+        enum_committed_mb = enum_committed_all >> 20,
+        enum_sparse_mapped_mb = enum_mapped_sparse >> 20,
+        drift_bytes = drift,
+        "REA-002 accounting audit verified"
+    );
+    drift
+}
+
+/// Whether there is room on the card for another texture copy the title
+/// fills ([`fills`], those [`crate::texture`] uploads). Returns `true`
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
@@ -1387,7 +1433,9 @@ pub(crate) fn room() -> bool {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
-    let filled = KINDS[1].load(Relaxed);
+    let filled = KINDS[1]
+        .load(Relaxed)
+        .saturating_add(crate::accounting::snapshot().tile_pool_allocated_bytes);
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1529,27 +1577,8 @@ pub(crate) fn card_accounting(
         *slot = now.saturating_sub(before.swap(now, Relaxed));
     }
     let video = crate::host::host().and_then(crate::accounting::video_memory_budget);
-    let enum_committed_all = HOST_TEXTURES[1].load(Relaxed);
-    let mut enum_mapped_sparse = 0u64;
     if crate::accounting::audit_enabled() {
-        let all = textures();
-        for &at in all.iter() {
-            // SAFETY: live entry under `TEXTURES` lock.
-            let r = unsafe { &*(at as *const Resource) };
-            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((host, _)) = made.as_ref()
-                && host.sparse.is_some()
-            {
-                enum_mapped_sparse += host.physical_bytes();
-            }
-        }
-        let drift = crate::accounting::record_audit(enum_committed_all, enum_mapped_sparse, 0);
-        tracing::info!(
-            enum_committed_mb = enum_committed_all >> 20,
-            enum_sparse_mapped_mb = enum_mapped_sparse >> 20,
-            drift_bytes = drift,
-            "REA-002 accounting audit verified"
-        );
+        let _ = run_accounting_audit();
     }
     let noted_us = began.elapsed().as_micros() as u64;
     let walk = move || {
@@ -1747,7 +1776,9 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let idle_ms = crate::host::vram_idle_ms(
+        crate::host::host().and_then(crate::accounting::video_memory_budget),
+    );
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1764,7 +1795,7 @@ pub(crate) fn let_go_idle() {
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && crate::host::references(&host.texture) == base_com_refs(host)
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1776,11 +1807,12 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            let phys = host.physical_bytes();
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            KINDS[3].fetch_add(phys, Relaxed);
             went += 1;
-            bytes += host.bytes;
+            bytes += phys;
             if first.is_none() {
                 first = Some(at);
             }
@@ -1812,8 +1844,14 @@ fn evict_under_vram_pressure(idle_ms: u64) {
     const EVICT_IDLE_FRAMES: u64 = 120;
     const MIN_FREE: u64 = 128 << 20;
     const MAX_FREE: u64 = 512 << 20;
+    const EVICT_COOLDOWN_MS: u64 = 1000;
+    static COOLDOWN_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     if !evict_enabled() {
+        return;
+    }
+    let now_ms = crate::host::now_ms();
+    if now_ms < COOLDOWN_UNTIL_MS.load(Relaxed) {
         return;
     }
     let Some([budget, used, ..]) =
@@ -1821,11 +1859,14 @@ fn evict_under_vram_pressure(idle_ms: u64) {
     else {
         return;
     };
-    let cap = budget / 100 * room_percent().max(90);
+    let trigger_pct = room_percent().clamp(84, 92);
+    let cap = budget / 100 * trigger_pct;
     if budget == 0 || used < cap {
         return;
     }
-    let goal = budget / 100 * room_percent().max(90).saturating_sub(6);
+    let goal_pct = trigger_pct.saturating_sub(8);
+    let goal = budget / 100 * goal_pct;
+    let used_pct = used.saturating_mul(100) / budget;
     let mut target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
 
     // Sparse reclamation pass: unmap cold fine mips (retaining packed tails) before
@@ -1833,7 +1874,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
     if crate::tiles::reclaim_enabled()
         && let Some(host_ctx) = crate::host::host()
     {
-        let bindings: Vec<std::sync::Arc<crate::tiles::SparseBinding>> = {
+        let bindings: Vec<(u64, std::sync::Arc<crate::tiles::SparseBinding>)> = {
             let all = textures();
             let mut out = Vec::new();
             for &at in all.iter() {
@@ -1847,18 +1888,23 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                     .as_ref()
                     && let Some(ref sparse) = host_tex.sparse
                 {
-                    out.push(sparse.clone());
+                    out.push((r.host.used.load(Relaxed), sparse.clone()));
                 }
             }
             out
         };
         let now_sub = crate::host::started_submission();
         let fin_sub = crate::host::finished_submission();
-        let now_ms = crate::host::now_ms();
         let mut reclaimed_total = 0u64;
-        for b in bindings {
+        for (last_used, b) in bindings {
             if reclaimed_total >= target {
                 break;
+            }
+            if used_pct >= 94
+                && crate::host::long_ago(last_used, 5_000, 5)
+                && b.num_standard_mips > 0
+            {
+                b.release_title_mips(b.num_standard_mips);
             }
             reclaimed_total += b.reclaim_cold_mips_with_base_refs(
                 &host_ctx.queue,
@@ -1878,11 +1924,16 @@ fn evict_under_vram_pressure(idle_ms: u64) {
         }
     }
 
-    // Pass 1: gather LRU candidates under `TEXTURES` lock, then drop it before
-    // touching descriptor heaps so lock ordering stays strictly acyclic.
-    let mut candidates: Vec<(u64, usize, usize, u64)> = {
+    // Pass 1: gather unpinned zombies (`refs == base_com_refs`) separately from pinned LRU
+    // victims (`refs > base_com_refs`) under `TEXTURES` lock, then drop it before touching
+    // descriptor heaps so lock ordering stays strictly acyclic.
+    let (mut unpinned_zombies, mut candidates): (
+        Vec<(u64, usize, u64)>,
+        Vec<(u64, usize, usize, u64)>,
+    ) = {
         let all = textures();
-        let mut out = Vec::new();
+        let mut zombies = Vec::new();
+        let mut pinned = Vec::new();
         for &at in all.iter() {
             // SAFETY: every entry in `TEXTURES` is live under its lock.
             let r = unsafe { &*(at as *const Resource) };
@@ -1890,49 +1941,74 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                 continue;
             }
             let last_used = r.host.used.load(Relaxed);
-            if !crate::host::long_ago(last_used, idle_ms, EVICT_IDLE_FRAMES) {
+            let eligible = crate::host::long_ago(last_used, idle_ms, EVICT_IDLE_FRAMES)
+                || (used_pct >= 94 && crate::host::long_ago(last_used, 5_000, 5));
+            if !eligible {
                 continue;
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((host, _)) = made.as_ref()
                 && std::sync::Arc::strong_count(host) == 1
-                && crate::host::references(&host.texture) > 1
             {
-                let raw = windows::core::Interface::as_raw(&host.texture) as usize;
-                out.push((last_used, at, raw, host.physical_bytes()));
+                let refs = crate::host::references(&host.texture);
+                let base_refs = base_com_refs(host);
+                let phys = host.physical_bytes();
+                if refs == base_refs {
+                    zombies.push((last_used, at, phys));
+                } else if refs > base_refs {
+                    let raw = windows::core::Interface::as_raw(&host.texture) as usize;
+                    pinned.push((last_used, at, raw, phys));
+                }
             }
         }
-        out
+        (zombies, pinned)
     };
-    if candidates.is_empty() {
+    if unpinned_zombies.is_empty() && candidates.is_empty() {
+        COOLDOWN_UNTIL_MS.store(now_ms.saturating_add(EVICT_COOLDOWN_MS), Relaxed);
         return;
     }
-    // Oldest `moment()` first (frame in high 32 bits, tenths in low 32 bits).
+
+    unpinned_zombies.sort_unstable_by_key(|&(last_used, _, _)| last_used);
     candidates.sort_unstable_by_key(|&(last_used, _, _, _)| last_used);
 
-    let mut victim_ptrs = std::collections::HashSet::new();
-    let mut victim_resources = Vec::new();
+    let mut direct_resources = Vec::new();
     let mut selected = 0u64;
-    for (_, at, raw, bytes) in candidates {
-        victim_ptrs.insert(raw);
-        victim_resources.push(at);
+    for (_, at, bytes) in unpinned_zombies {
+        direct_resources.push(at);
         selected += bytes;
         if selected >= target {
             break;
         }
     }
 
-    let slots_cleared = crate::descriptor::evict_kept_resources(&victim_ptrs);
-    if slots_cleared == 0 {
+    let mut victim_ptrs = std::collections::HashSet::new();
+    let mut victim_resources = Vec::new();
+    if selected < target {
+        for (_, at, raw, bytes) in candidates {
+            victim_ptrs.insert(raw);
+            victim_resources.push(at);
+            selected += bytes;
+            if selected >= target {
+                break;
+            }
+        }
+    }
+
+    let slots_cleared = if victim_ptrs.is_empty() {
+        0
+    } else {
+        crate::descriptor::evict_kept_resources(&victim_ptrs)
+    };
+    if slots_cleared == 0 && direct_resources.is_empty() {
+        COOLDOWN_UNTIL_MS.store(now_ms.saturating_add(EVICT_COOLDOWN_MS), Relaxed);
         return;
     }
 
-    // Pass 2: now that descriptor heaps released their COM references (and no
-    // submission is in flight), free every victim whose refcount dropped to 1.
+    // Pass 2: free unpinned zombies and any victim whose refcount dropped to `base_com_refs`.
     let (mut freed, mut freed_bytes) = (0u64, 0u64);
     {
         let all = textures();
-        for at in victim_resources {
+        for at in direct_resources.into_iter().chain(victim_resources) {
             if !all.contains(&at) {
                 continue;
             }
@@ -1942,7 +2018,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                 let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
                 let ready = made.as_ref().is_some_and(|(host, _)| {
                     std::sync::Arc::strong_count(host) == 1
-                        && crate::host::references(&host.texture) == 1
+                        && crate::host::references(&host.texture) == base_com_refs(host)
                 });
                 if ready {
                     crate::texture::unstage(at as This);
@@ -1952,16 +2028,18 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                 }
             };
             if let Some((host, _)) = gone {
+                let phys = host.physical_bytes();
                 r.host.gone.store(true, Relaxed);
                 KINDS[2].fetch_add(1, Relaxed);
-                KINDS[3].fetch_add(host.bytes, Relaxed);
+                KINDS[3].fetch_add(phys, Relaxed);
                 freed += 1;
-                freed_bytes += host.bytes;
+                freed_bytes += phys;
                 crate::host::retire(host);
             }
         }
     }
     if freed > 0 {
+        crate::tiles::maintenance_drain(crate::host::finished_submission());
         crate::accounting::invalidate_budget_cache();
         tracing::info!(
             textures = freed,
@@ -1971,6 +2049,9 @@ fn evict_under_vram_pressure(idle_ms: u64) {
             vram_budget_mb = budget >> 20,
             "VRAM pressure: evicted LRU idle textures from descriptor heaps"
         );
+    }
+    if freed_bytes < (4 << 20) && slots_cleared == 0 {
+        COOLDOWN_UNTIL_MS.store(now_ms.saturating_add(EVICT_COOLDOWN_MS), Relaxed);
     }
 }
 
@@ -4297,5 +4378,124 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn sparse_host_texture_base_com_refs_and_room_respect_tile_pool_and_audit() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Resource,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let committed_tex: ID3D12Resource = unsafe {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(87),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                ..Default::default()
+            };
+            let mut res = None;
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut res,
+                )
+                .unwrap();
+            res.unwrap()
+        };
+        let committed_ht = HostTexture::new(committed_tex, 0, None);
+        assert_eq!(super::base_com_refs(&committed_ht), 1);
+        assert_eq!(crate::host::references(&committed_ht.texture), 1);
+
+        if crate::tiles::query_tiled_support(&host.device).supported {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1024,
+                Height: 1024,
+                DepthOrArraySize: 1,
+                MipLevels: 11,
+                Format: DXGI_FORMAT(87),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                ..Default::default()
+            };
+            let (res, binding) = crate::tiles::SparseBinding::create(
+                &host.device,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+            )
+            .unwrap();
+            let sparse_ht = HostTexture::new(res, 0, Some(binding));
+            assert_eq!(
+                super::base_com_refs(&sparse_ht),
+                2,
+                "sparse HostTexture must report base_com_refs=2"
+            );
+            assert_eq!(
+                crate::host::references(&sparse_ht.texture),
+                2,
+                "sparse HostTexture + SparseBinding hold 2 internal COM refs"
+            );
+        }
+
+        // Verify `run_accounting_audit()` updates audit_runs without panicking.
+        let audits_before = crate::accounting::snapshot().audit_runs;
+        let _drift = super::run_accounting_audit();
+        assert!(crate::accounting::snapshot().audit_runs > audits_before);
+    }
+
+    #[test]
+    fn room_counts_sparse_tile_pool_bytes_against_budget() {
+        const CHILD: &str = "VICTORY_TEST_ROOM_SPARSE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(super::room(), "room() should be true below 1 MiB limit");
+            crate::accounting::on_tile_pool_delta(2 << 20);
+            assert!(
+                !super::room(),
+                "room() must return false once tile_pool_allocated_bytes exceeds limit"
+            );
+            crate::accounting::on_tile_pool_delta(-(2 << 20));
+            assert!(super::room());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "resource::tests::room_counts_sparse_tile_pool_bytes_against_budget",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_TEXTURE_BUDGET_MB", "1")
+            .output()
+            .expect("spawn room sparse test");
+        assert!(
+            out.status.success(),
+            "room sparse test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -265,6 +265,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    crate::accounting::on_retired_pending_delta(1);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -312,6 +313,7 @@ fn bury(finished: u64) {
     if done.is_empty() {
         return;
     }
+    crate::accounting::on_retired_pending_delta(-(done.len() as i64));
     if let Some(tx) = disposer() {
         let _ = tx.send(done);
     } else {
@@ -2185,6 +2187,10 @@ impl Drop for Deferred {
         let count = (self.uploads.len() + self.pooled_uploads.len()) as u64;
         ALIVE[6].fetch_sub(count, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        for (buf, _ptr, cap) in self.pooled_uploads.drain(..) {
+            crate::accounting::on_upload_ring_delta(-(cap as i64));
+            drop(buf);
+        }
     }
 }
 
@@ -9108,6 +9114,33 @@ mod batch {
             out.status.success(),
             "child test failed: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn deferred_drop_decrements_upload_ring_accounting() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Some((buf, _ptr)) = host.shared_buffer(64 << 10) else {
+            return;
+        };
+        let before = crate::accounting::snapshot().upload_ring_bytes;
+        let cap = 64u64 << 10;
+        crate::accounting::on_upload_ring_delta(cap as i64);
+        assert_eq!(
+            crate::accounting::snapshot().upload_ring_bytes,
+            before + cap
+        );
+        {
+            let mut def = super::Deferred::default();
+            def.hold_pooled_upload(buf, std::ptr::null_mut(), cap);
+            // Drop without calling `clear()`.
+        }
+        assert_eq!(
+            crate::accounting::snapshot().upload_ring_bytes,
+            before,
+            "dropping Deferred with unreturned pooled uploads must decrement upload_ring_bytes"
         );
     }
 }

@@ -61,6 +61,7 @@ struct Metrics {
     staging_bytes: AlignedCounter,
     shadow_ram_bytes: AlignedCounter,
     shadow_vram_bytes: AlignedCounter,
+    scratch_vram_bytes: AlignedCounter,
     upload_ring_bytes: AlignedCounter,
     reclaimable_bytes: AlignedCounter,
     retired_pending_count: AlignedCounter,
@@ -85,6 +86,7 @@ impl Metrics {
             staging_bytes: AlignedCounter::new(),
             shadow_ram_bytes: AlignedCounter::new(),
             shadow_vram_bytes: AlignedCounter::new(),
+            scratch_vram_bytes: AlignedCounter::new(),
             upload_ring_bytes: AlignedCounter::new(),
             reclaimable_bytes: AlignedCounter::new(),
             retired_pending_count: AlignedCounter::new(),
@@ -126,6 +128,7 @@ pub struct AccountingSnapshot {
     pub staging_bytes: u64,
     pub shadow_ram_bytes: u64,
     pub shadow_vram_bytes: u64,
+    pub scratch_vram_bytes: u64,
     pub upload_ring_bytes: u64,
     pub reclaimable_bytes: u64,
     pub retired_pending_count: u64,
@@ -166,6 +169,25 @@ pub fn enabled() -> bool {
 pub fn audit_enabled() -> bool {
     static AUDIT: OnceLock<bool> = OnceLock::new();
     *AUDIT.get_or_init(|| parse_flag("VICTORY_REA_ACCOUNTING_AUDIT"))
+}
+
+/// Whether `VICTORY_REA_ACCOUNTING_AUDIT` was explicitly forced off (`0`/`false`/`no`).
+pub fn audit_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var("VICTORY_REA_ACCOUNTING_AUDIT")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no")
+            })
+    })
+}
+
+/// Low-cost periodic texture-table audit runs every 20 windows under incremental accounting
+/// unless `VICTORY_REA_ACCOUNTING_AUDIT=0` explicitly disables it.
+pub fn periodic_audit_enabled() -> bool {
+    enabled() && !audit_disabled()
 }
 
 /// Track creation of a committed host texture (`committed_bytes > 0`) or
@@ -266,6 +288,22 @@ pub fn on_upload_ring_delta(delta_bytes: i64) {
     }
 }
 
+/// Adjust GPU scratch VRAM attributed to backend passes such as GpuDetiler.
+pub fn on_scratch_vram_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.scratch_vram_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS
+            .scratch_vram_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
+    }
+    if delta_bytes != 0 {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_add(delta_bytes, Ordering::Relaxed);
+    }
+}
+
 /// Update staging pool footprint in host-visible memory.
 pub fn on_staging_delta(delta_bytes: i64) {
     if delta_bytes >= 0 {
@@ -318,9 +356,9 @@ pub fn cached_video_memory_with<F>(ttl: Duration, query_fn: F) -> Option<[u64; 4
 where
     F: FnOnce() -> Option<[u64; 4]>,
 {
-    let delta = BUDGET_UNFLUSHED_LOCAL_DELTA.0.load(Ordering::Relaxed);
-    if let Ok(guard) = BUDGET_CACHE.lock()
-        && let Some(cached) = *guard
+    let mut guard = BUDGET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let delta = BUDGET_UNFLUSHED_LOCAL_DELTA.0.load(Ordering::Acquire);
+    if let Some(cached) = *guard
         && cached.captured_at.elapsed() < ttl
         && delta.abs() < MAX_UNFLUSHED_BUDGET_DELTA
     {
@@ -330,16 +368,21 @@ where
         return Some(vals);
     }
 
-    BUDGET_UNFLUSHED_LOCAL_DELTA.0.store(0, Ordering::Release);
-    let values = query_fn()?;
+    // Consume accumulated local delta atomically under the cache lock right before
+    // querying DXGI so concurrent allocations after the query are preserved cleanly.
+    let consumed = BUDGET_UNFLUSHED_LOCAL_DELTA.0.swap(0, Ordering::AcqRel);
+    let Some(values) = query_fn() else {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_add(consumed, Ordering::Relaxed);
+        return None;
+    };
     METRICS.dxgi_queries_actual.add(1);
     record_nonlocal_video_memory(values);
-    if let Ok(mut guard) = BUDGET_CACHE.lock() {
-        *guard = Some(CachedBudget {
-            captured_at: Instant::now(),
-            values,
-        });
-    }
+    *guard = Some(CachedBudget {
+        captured_at: Instant::now(),
+        values,
+    });
     Some(values)
 }
 
@@ -404,6 +447,7 @@ pub fn snapshot() -> AccountingSnapshot {
         staging_bytes: METRICS.staging_bytes.load(),
         shadow_ram_bytes: METRICS.shadow_ram_bytes.load(),
         shadow_vram_bytes: METRICS.shadow_vram_bytes.load(),
+        scratch_vram_bytes: METRICS.scratch_vram_bytes.load(),
         upload_ring_bytes: METRICS.upload_ring_bytes.load(),
         reclaimable_bytes: METRICS.reclaimable_bytes.load(),
         retired_pending_count: METRICS.retired_pending_count.load(),
