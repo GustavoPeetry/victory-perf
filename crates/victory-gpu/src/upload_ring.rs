@@ -22,11 +22,11 @@ pub const RING_ALIGN: u64 = 512;
 /// Default size of each [`UploadRing`] backing chunk (32 MiB).
 pub const DEFAULT_RING_CHUNK: u64 = 32 << 20;
 
-/// Cap on cached idle upload buffers in [`UploadPool`] (64 MiB) to stay friendly to 16 GiB hosts.
-const MAX_CACHED_POOL_BYTES: u64 = 64 << 20;
+/// Cap on cached idle upload buffers in [`UploadPool`] (16 MiB) to stay friendly to 16 GiB hosts.
+const MAX_CACHED_POOL_BYTES: u64 = 16 << 20;
 
-/// Maximum bucketed single-buffer size in [`UploadPool`] (16 MiB).
-const MAX_POOLED_BUFFER_BYTES: u64 = 16 << 20;
+/// Maximum bucketed single-buffer size in [`UploadPool`] (4 MiB).
+const MAX_POOLED_BUFFER_BYTES: u64 = 4 << 20;
 
 fn parse_bool(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|v| {
@@ -229,7 +229,15 @@ fn bucket_size_for(size: u64) -> Option<u64> {
     if size > MAX_POOLED_BUFFER_BYTES {
         return None;
     }
-    Some(size.max(64 << 10).next_power_of_two())
+    if size <= (64 << 10) {
+        Some(64 << 10)
+    } else if size <= (256 << 10) {
+        Some(size.next_multiple_of(64 << 10))
+    } else if size <= (1 << 20) {
+        Some(size.next_multiple_of(256 << 10))
+    } else {
+        Some(size.next_multiple_of(512 << 10))
+    }
 }
 
 /// Checkout a reusable mapped upload buffer from the bucketed pool (or allocate one).
@@ -262,17 +270,16 @@ pub(crate) fn return_upload(
     bucket_bytes: u64,
     retire_submission: u64,
 ) {
-    UPLOAD_POOL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retire(
-            retire_submission,
-            PooledEntry {
-                resource,
-                data,
-                bucket_bytes,
-            },
-        );
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.retire(
+        retire_submission,
+        PooledEntry {
+            resource,
+            data,
+            bucket_bytes,
+        },
+    );
+    pool.drain(crate::host::finished_submission());
 }
 
 /// Drain completed pooled uploads on submission fence advance.
@@ -477,6 +484,15 @@ mod tests {
     fn default_flags_are_off_for_baseline_parity() {
         assert!(!enabled());
         assert!(!copy_queue_enabled());
+    }
+
+    #[test]
+    fn upload_pool_bucket_sizes_avoid_power_of_two_bloat() {
+        assert_eq!(bucket_size_for(16 << 10), Some(64 << 10));
+        assert_eq!(bucket_size_for(300 << 10), Some(512 << 10));
+        assert_eq!(bucket_size_for(1200 << 10), Some(1536 << 10));
+        assert_eq!(bucket_size_for(4 << 20), Some(4 << 20));
+        assert_eq!(bucket_size_for(5 << 20), None);
     }
 
     #[test]

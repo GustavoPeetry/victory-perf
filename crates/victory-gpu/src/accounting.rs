@@ -4,12 +4,15 @@
 //! `VICTORY_REA_INCREMENTAL_ACCOUNTING=1` is set. Can optionally cross-check
 //! incremental totals against full enumeration under `VICTORY_REA_ACCOUNTING_AUDIT=1`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[repr(align(64))]
 struct AlignedCounter(AtomicU64);
+
+#[repr(align(64))]
+struct AlignedSignedCounter(AtomicI64);
 
 impl AlignedCounter {
     const fn new() -> Self {
@@ -99,7 +102,10 @@ struct CachedBudget {
 }
 
 static BUDGET_CACHE: Mutex<Option<CachedBudget>> = Mutex::new(None);
-const DEFAULT_BUDGET_TTL: Duration = Duration::from_millis(50);
+static BUDGET_UNFLUSHED_LOCAL_DELTA: AlignedSignedCounter =
+    AlignedSignedCounter(AtomicI64::new(0));
+const DEFAULT_BUDGET_TTL: Duration = Duration::from_millis(15);
+const MAX_UNFLUSHED_BUDGET_DELTA: i64 = 16 << 20;
 
 /// Point-in-time O(1) snapshot of tracked host memory pools.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,6 +162,11 @@ pub fn audit_enabled() -> bool {
 pub fn on_texture_created(committed_bytes: u64, reserved_bytes: u64, is_sparse: bool) {
     METRICS.committed_textures_bytes.add(committed_bytes);
     METRICS.reserved_textures_bytes.add(reserved_bytes);
+    if committed_bytes > 0 {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_add(committed_bytes as i64, Ordering::Relaxed);
+    }
     if is_sparse {
         METRICS.sparse_texture_count.add(1);
     } else {
@@ -171,6 +182,11 @@ pub fn on_texture_destroyed(committed_bytes: u64, reserved_bytes: u64, is_sparse
     METRICS
         .reserved_textures_bytes
         .sub_saturating(reserved_bytes);
+    if committed_bytes > 0 {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_sub(committed_bytes as i64, Ordering::Relaxed);
+    }
     if is_sparse {
         METRICS.sparse_texture_count.sub_saturating(1);
     } else {
@@ -198,6 +214,11 @@ pub fn on_tile_pool_delta(delta_bytes: i64) {
             .tile_pool_allocated_bytes
             .sub_saturating(delta_bytes.unsigned_abs());
     }
+    if delta_bytes != 0 {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_add(delta_bytes, Ordering::Relaxed);
+    }
 }
 
 /// Adjust CPU RAM and GPU VRAM attributed to shadow copies / card mirrors.
@@ -215,6 +236,11 @@ pub fn on_shadow_delta(ram_delta: i64, vram_delta: i64) {
         METRICS
             .shadow_vram_bytes
             .sub_saturating(vram_delta.unsigned_abs());
+    }
+    if vram_delta != 0 {
+        BUDGET_UNFLUSHED_LOCAL_DELTA
+            .0
+            .fetch_add(vram_delta, Ordering::Relaxed);
     }
 }
 
@@ -240,20 +266,26 @@ pub fn on_reclaimable_delta(delta_bytes: i64) {
     }
 }
 
-/// Return cached `[local_usage, local_budget, nonlocal_usage, nonlocal_budget]`
-/// when within TTL, or run `query_fn` and cache its result.
+/// Return cached `[local_budget, local_usage, nonlocal_budget, nonlocal_usage]`
+/// when within TTL and `|unflushed_vram_delta| < 16 MiB`, adjusting `local_usage`
+/// by the incremental delta; otherwise run `query_fn` and cache its result.
 pub fn cached_video_memory_with<F>(ttl: Duration, query_fn: F) -> Option<[u64; 4]>
 where
     F: FnOnce() -> Option<[u64; 4]>,
 {
+    let delta = BUDGET_UNFLUSHED_LOCAL_DELTA.0.load(Ordering::Relaxed);
     if let Ok(guard) = BUDGET_CACHE.lock()
         && let Some(cached) = *guard
         && cached.captured_at.elapsed() < ttl
+        && delta.abs() < MAX_UNFLUSHED_BUDGET_DELTA
     {
         METRICS.dxgi_queries_cached.add(1);
-        return Some(cached.values);
+        let mut vals = cached.values;
+        vals[1] = vals[1].saturating_add_signed(delta);
+        return Some(vals);
     }
 
+    BUDGET_UNFLUSHED_LOCAL_DELTA.0.store(0, Ordering::Release);
     let values = query_fn()?;
     METRICS.dxgi_queries_actual.add(1);
     if let Ok(mut guard) = BUDGET_CACHE.lock() {
@@ -265,8 +297,8 @@ where
     Some(values)
 }
 
-/// Query DXGI adapter video memory through [`cached_video_memory_with`] (50 ms TTL)
-/// when incremental accounting is enabled, or query directly otherwise.
+/// Query DXGI adapter video memory through [`cached_video_memory_with`] (15 ms TTL
+/// + 16 MiB burst invalidation) when incremental accounting is enabled, or query directly otherwise.
 pub(crate) fn video_memory_budget(host: &crate::host::Host) -> Option<[u64; 4]> {
     if enabled() {
         cached_video_memory_with(DEFAULT_BUDGET_TTL, || host.video_memory())
@@ -277,6 +309,7 @@ pub(crate) fn video_memory_budget(host: &crate::host::Host) -> Option<[u64; 4]> 
 
 /// Force-invalidate the DXGI budget cache (e.g. immediately after large evictions).
 pub fn invalidate_budget_cache() {
+    BUDGET_UNFLUSHED_LOCAL_DELTA.0.store(0, Ordering::Release);
     if let Ok(mut guard) = BUDGET_CACHE.lock() {
         *guard = None;
     }
@@ -399,6 +432,46 @@ mod tests {
         let after = snapshot();
         assert_eq!(after.dxgi_queries_actual, before.dxgi_queries_actual + 1);
         assert_eq!(after.dxgi_queries_cached, before.dxgi_queries_cached + 1);
+        invalidate_budget_cache();
+    }
+
+    #[test]
+    fn budget_cache_tracks_unflushed_vram_delta_and_invalidates_on_burst() {
+        invalidate_budget_cache();
+        let mut calls = 0usize;
+        let first = cached_video_memory_with(Duration::from_secs(10), || {
+            calls += 1;
+            Some([7000 << 20, 4000 << 20, 8000 << 20, 3000 << 20])
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(first, Some([7000 << 20, 4000 << 20, 8000 << 20, 3000 << 20]));
+
+        on_texture_created(4 << 20, 0, false);
+        let adjusted = cached_video_memory_with(Duration::from_secs(10), || {
+            calls += 1;
+            Some([7000 << 20, 4004 << 20, 8000 << 20, 3000 << 20])
+        });
+        assert_eq!(calls, 1, "small delta (<16 MiB) must serve adjusted cache");
+        assert_eq!(
+            adjusted,
+            Some([7000 << 20, 4004 << 20, 8000 << 20, 3000 << 20])
+        );
+
+        on_texture_created(20 << 20, 0, false);
+        let refreshed = cached_video_memory_with(Duration::from_secs(10), || {
+            calls += 1;
+            Some([7000 << 20, 4024 << 20, 8000 << 20, 3000 << 20])
+        });
+        assert_eq!(
+            calls, 2,
+            "burst >=16 MiB must bypass TTL and force fresh DXGI query"
+        );
+        assert_eq!(
+            refreshed,
+            Some([7000 << 20, 4024 << 20, 8000 << 20, 3000 << 20])
+        );
+
+        on_texture_destroyed(24 << 20, 0, false);
         invalidate_budget_cache();
     }
 }

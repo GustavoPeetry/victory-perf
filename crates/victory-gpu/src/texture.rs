@@ -598,16 +598,16 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
-    let sparse_first = if crate::tiles::enabled() {
+    let sparse_res = if crate::tiles::enabled() {
         // SAFETY: live D3D12 resource.
         let mips_total = u32::from(unsafe { texture.GetDesc() }.MipLevels);
         crate::resource::ensure_resident_mips(resource, first, mips_total)
     } else {
         None
     };
-    if let Some(af) = sparse_first {
+    if let Some((af, newly_mapped)) = sparse_res {
         let prev = staging.resident_first.swap(af, Relaxed);
-        if prev != u32::MAX && af < prev {
+        if newly_mapped || (prev != u32::MAX && af < prev) {
             staging.uploaded.store(false, Relaxed);
             staging.dirty.store(true, Relaxed);
             let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -633,7 +633,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
-        if let Some(af) = sparse_first
+        if let Some((af, _)) = sparse_res
             && staging.part(i).0 < af
         {
             continue;

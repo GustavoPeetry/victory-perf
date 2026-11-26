@@ -51,9 +51,10 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| {
         let on = parse_bool_env("VICTORY_REA_SPARSE_TEXTURES", false);
         if on {
+            let reclaim = parse_bool_env("VICTORY_REA_SPARSE_RECLAIM", true);
             tracing::info!(
                 min_kb = min_bytes() >> 10,
-                reclaim = reclaim_enabled(),
+                reclaim,
                 "REA-002 sparse texture residency enabled"
             );
         }
@@ -148,7 +149,7 @@ pub fn eligible(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
     reserved.Alignment = 0;
     let alloc = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(&reserved)) };
-    alloc.SizeInBytes >= min_bytes()
+    alloc.SizeInBytes != u64::MAX && alloc.SizeInBytes >= min_bytes()
 }
 
 /// Extent `(heap_chunk_id, start_tile_in_chunk, tile_count)` returned by [`TilePool`].
@@ -535,6 +536,13 @@ impl SparseBinding {
         let mut reserved = *desc;
         reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
         reserved.Alignment = 0;
+        let allowed_clear = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+            | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        let clear_value = if (reserved.Flags & allowed_clear) != D3D12_RESOURCE_FLAG_NONE {
+            clear_value
+        } else {
+            None
+        };
 
         let mut resource: Option<ID3D12Resource> = None;
         // SAFETY: `reserved` uses `64KB_UNDEFINED_SWIZZLE` for a valid 2D texture.
@@ -1136,6 +1144,43 @@ mod tests {
     fn default_flag_is_off_for_baseline_parity() {
         // Under default test harness env (VICTORY_REA_SPARSE_TEXTURES unset), must be OFF.
         assert!(!enabled());
+    }
+
+    #[test]
+    fn enabled_and_reclaim_enabled_do_not_deadlock() {
+        const CHILD: &str = "VICTORY_TEST_TILES_DEADLOCK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(enabled());
+            assert!(reclaim_enabled());
+            maintenance_drain(1);
+            let s = stats();
+            assert!(s.enabled);
+            assert!(s.reclaim_enabled);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tiles::tests::enabled_and_reclaim_enabled_do_not_deadlock",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_REA_SPARSE_TEXTURES", "1")
+            .env("VICTORY_REA_SPARSE_RECLAIM", "1")
+            .spawn()
+            .expect("spawn tiles deadlock regression child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll tiles child") {
+                assert!(status.success(), "tiles child exited with {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("tiles::enabled() / reclaim_enabled() deadlocked (>10s timeout)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]

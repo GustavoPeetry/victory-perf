@@ -1500,6 +1500,8 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         let found = found.clone();
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
+            let mut local_calls = 0u64;
+            let mut local_bytes = 0u64;
             for (data, before, start, from, to, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
@@ -1515,12 +1517,18 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
+                    local_calls += 1;
+                    local_bytes += n as u64;
                     if slices_differ(now, old) {
                         pieces.push((at, n));
                     }
                     at += n;
                 }
                 mine.push((which, place, pieces));
+            }
+            if local_calls > 0 && dirty_ranges_enabled() {
+                DIRTY_DIFF_CALLS.fetch_add(local_calls, Ordering::Relaxed);
+                DIRTY_DIFF_BYTES.fetch_add(local_bytes, Ordering::Relaxed);
             }
             found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
         }));
@@ -2491,16 +2499,18 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        let tagged = crate::readback::tagged_in(address, len);
-        let rb = crate::readback::stats();
-        let readback_ready =
-            rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
-        crate::authority::observe_gpu_write(address as usize, len as usize, tagged, readback_ready);
-        if readback_ready
-            && crate::authority::can_skip_gpu_compare(address as usize, len as usize, tagged)
-        {
-            crate::authority::note_skipped_card_compare();
-            return;
+        if crate::authority::enabled() {
+            let tagged = crate::readback::tagged_in(address, len);
+            let rb = crate::readback::stats();
+            let readback_ready =
+                rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
+            crate::authority::observe_gpu_write(address as usize, len as usize, tagged, readback_ready);
+            if readback_ready
+                && crate::authority::can_skip_gpu_compare(address as usize, len as usize, tagged)
+            {
+                crate::authority::note_skipped_card_compare();
+                return;
+            }
         }
         if !crate::readback::copy_back(address, len) {
             return;
@@ -3383,18 +3393,20 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        let rb = crate::readback::stats();
-        let readback_ready =
-            rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
-        if readback_ready
-            && crate::authority::can_skip_gpu_compare(
-                self.start as usize,
-                self.len as usize,
-                crate::readback::tagged_in(self.start, self.len),
-            )
-        {
-            crate::authority::note_skipped_before_twin();
-            return false;
+        if crate::authority::enabled() {
+            let rb = crate::readback::stats();
+            let readback_ready =
+                rb.creator_verified && rb.tagged_buffers > 0 && crate::queue::presented() > 0;
+            if readback_ready
+                && crate::authority::can_skip_gpu_compare(
+                    self.start as usize,
+                    self.len as usize,
+                    crate::readback::tagged_in(self.start, self.len),
+                )
+            {
+                crate::authority::note_skipped_before_twin();
+                return false;
+            }
         }
         let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
         if before.is_some() {
@@ -3603,21 +3615,29 @@ fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize)
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-static SHADOW_EPOCH: AtomicU64 = AtomicU64::new(1);
-static SHADOW_TLS_HITS: AtomicU64 = AtomicU64::new(0);
-static SHADOW_TLS_MISSES: AtomicU64 = AtomicU64::new(0);
+#[repr(align(64))]
+struct AlignedAtomicU64(AtomicU64);
+
+static SHADOW_EPOCH: AlignedAtomicU64 = AlignedAtomicU64(AtomicU64::new(1));
+static SHADOW_TLS_HITS: AlignedAtomicU64 = AlignedAtomicU64(AtomicU64::new(0));
+static SHADOW_TLS_MISSES: AlignedAtomicU64 = AlignedAtomicU64(AtomicU64::new(0));
 
 #[inline]
 fn bump_shadow_epoch() {
-    SHADOW_EPOCH.fetch_add(1, Ordering::Release);
+    SHADOW_EPOCH.0.fetch_add(1, Ordering::Release);
 }
 
 /// Returns `(hits, misses)` for the per-thread shadow lookup cache
 /// (`VICTORY_REA_GPU_FASTPATH=1`).
 pub fn tls_cache_stats() -> (u64, u64) {
+    TLS_SHADOW_CACHE.with(|cell| {
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            cache.flush_stats();
+        }
+    });
     (
-        SHADOW_TLS_HITS.load(Ordering::Relaxed),
-        SHADOW_TLS_MISSES.load(Ordering::Relaxed),
+        SHADOW_TLS_HITS.0.load(Ordering::Relaxed),
+        SHADOW_TLS_MISSES.0.load(Ordering::Relaxed),
     )
 }
 
@@ -3637,6 +3657,8 @@ struct TlsShadowEntry {
 struct TlsShadowCache {
     entries: [TlsShadowEntry; 16],
     next: usize,
+    pending_hits: u32,
+    pending_misses: u32,
 }
 
 impl Default for TlsShadowCache {
@@ -3644,7 +3666,33 @@ impl Default for TlsShadowCache {
         Self {
             entries: std::array::from_fn(|_| TlsShadowEntry::default()),
             next: 0,
+            pending_hits: 0,
+            pending_misses: 0,
         }
+    }
+}
+
+impl TlsShadowCache {
+    #[inline]
+    fn flush_stats(&mut self) {
+        if self.pending_hits > 0 {
+            SHADOW_TLS_HITS
+                .0
+                .fetch_add(u64::from(self.pending_hits), Ordering::Relaxed);
+            self.pending_hits = 0;
+        }
+        if self.pending_misses > 0 {
+            SHADOW_TLS_MISSES
+                .0
+                .fetch_add(u64::from(self.pending_misses), Ordering::Relaxed);
+            self.pending_misses = 0;
+        }
+    }
+}
+
+impl Drop for TlsShadowCache {
+    fn drop(&mut self) {
+        self.flush_stats();
     }
 }
 
@@ -3654,9 +3702,10 @@ thread_local! {
 }
 
 fn tls_cache_lookup(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+    let cur_epoch = SHADOW_EPOCH.0.load(Ordering::Acquire);
     let found = TLS_SHADOW_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
+        let mut hit = None;
         for idx in 0..cache.entries.len() {
             let e = &cache.entries[idx];
             if e.epoch != cur_epoch {
@@ -3672,31 +3721,35 @@ fn tls_cache_lookup(address: u64, end: u64, unsized_ask: bool, any: bool) -> Opt
                     if idx > 0 {
                         cache.entries[..=idx].rotate_right(1);
                     }
-                    return Some(arc);
+                    hit = Some(arc);
+                } else {
+                    cache.entries[idx].epoch = 0;
                 }
-                cache.entries[idx].epoch = 0;
-                return None;
+                break;
             }
         }
-        None
+        if hit.is_some() {
+            cache.pending_hits += 1;
+        } else {
+            cache.pending_misses += 1;
+        }
+        if cache.pending_hits + cache.pending_misses >= 256 {
+            cache.flush_stats();
+        }
+        hit
     });
-    match found {
-        Some(arc) => {
-            SHADOW_TLS_HITS.fetch_add(1, Ordering::Relaxed);
-            if arc.window {
-                arc.used.store(crate::host::moment(), Ordering::Relaxed);
-                arc.asked[0].fetch_min(address, Ordering::Relaxed);
-                arc.asked[1].fetch_max(end, Ordering::Relaxed);
-                if unsized_ask {
-                    arc.unsized_asks.fetch_add(1, Ordering::Relaxed);
-                }
+    if let Some(arc) = found {
+        if arc.window {
+            arc.used.store(crate::host::moment(), Ordering::Relaxed);
+            arc.asked[0].fetch_min(address, Ordering::Relaxed);
+            arc.asked[1].fetch_max(end, Ordering::Relaxed);
+            if unsized_ask {
+                arc.unsized_asks.fetch_add(1, Ordering::Relaxed);
             }
-            Some(arc)
         }
-        None => {
-            SHADOW_TLS_MISSES.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        Some(arc)
+    } else {
+        None
     }
 }
 
@@ -3855,7 +3908,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if fastpath && let Some(cached) = tls_cache_lookup(address, end, len <= 1, any) {
         return Some(cached);
     }
-    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+    let cur_epoch = SHADOW_EPOCH.0.load(Ordering::Acquire);
     // Shared-read fast path: 99.99% of calls either hit an already-created
     // buffer shadow or miss into `loose()`, so parallel recording threads never
     // serialize on an exclusive lock.
@@ -3991,7 +4044,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         bump_shadow_epoch();
         let safe_end = entry.end.min(next_start);
         if fastpath && let Some(ref arc) = entry.shadow {
-            let new_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+            let new_epoch = SHADOW_EPOCH.0.load(Ordering::Acquire);
             let range_safe = address >= key.0 && end <= safe_end;
             tls_cache_insert(
                 new_epoch,
@@ -4218,7 +4271,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     let fastpath = crate::descriptor::host::gpu_fastpath_enabled();
-    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+    let cur_epoch = SHADOW_EPOCH.0.load(Ordering::Acquire);
     // Shared-read fast path: 99.99% of lookups hit an existing window.
     {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -4245,7 +4298,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (start, len) = resolve(&map);
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
-        let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+        let cur_epoch = SHADOW_EPOCH.0.load(Ordering::Acquire);
         if fastpath {
             tls_cache_insert(
                 cur_epoch,

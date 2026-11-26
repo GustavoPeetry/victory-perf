@@ -1882,6 +1882,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
         }
     }
     if freed > 0 {
+        crate::accounting::invalidate_budget_cache();
         tracing::info!(
             textures = freed,
             mb = freed_bytes >> 20,
@@ -2059,11 +2060,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// Ensure physical tiles are mapped for `first_mip..mips_total` when `this`
-/// is backed by a D3D12 sparse Reserved Resource. Returns `Some(effective_first)`
-/// for sparse resources (combining `first_mip` with title-committed mips when
-/// `first_mip == 0`), or `None` for normal committed textures.
+/// is backed by a D3D12 sparse Reserved Resource. Returns
+/// `Some((effective_first, newly_mapped))` for sparse resources (combining
+/// `first_mip` with title-committed mips when `first_mip == 0`), or `None` for
+/// normal committed textures.
 #[cfg(windows)]
-pub(crate) fn ensure_resident_mips(this: This, first_mip: u32, mips_total: u32) -> Option<u32> {
+pub(crate) fn ensure_resident_mips(
+    this: This,
+    first_mip: u32,
+    mips_total: u32,
+) -> Option<(u32, bool)> {
     if !crate::tiles::enabled() || this.is_null() {
         return None;
     }
@@ -2077,14 +2083,14 @@ pub(crate) fn ensure_resident_mips(this: This, first_mip: u32, mips_total: u32) 
     } else {
         first_mip
     };
-    sparse.ensure_resident(
+    let newly_mapped = sparse.ensure_resident(
         &host_ctx.queue,
         active_first,
         crate::host::started_submission(),
         crate::host::finished_submission(),
         crate::host::now_ms(),
-    );
-    Some(active_first)
+    ) > 0;
+    Some((active_first, newly_mapped))
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -2158,12 +2164,12 @@ fn host_texture(
     let d3d_desc = unsafe { *(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
     if crate::tiles::eligible(&host.device, &d3d_desc)
         && let Some((res, binding)) =
-            crate::tiles::SparseBinding::create(&host.device, &d3d_desc, initial_state, clear_ptr)
+            crate::tiles::SparseBinding::create(&host.device, &d3d_desc, initial_state, None)
     {
         crate::host::name(&res, || {
             format!(
                 "sparse texture {}x{} f{} mips {} flags {:#x}",
-                d.width, d.height, d.mip_levels, d.format, d.flags
+                d.width, d.height, d.format, d.mip_levels, d.flags
             )
         });
         return Some((res, Some(binding)));

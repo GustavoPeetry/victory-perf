@@ -15,7 +15,7 @@
 //! could tag a buffer that is not read back (it is then copied back as
 //! before: harmless).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// The title's read-back buffer creator (1.0.2.1).
@@ -107,6 +107,7 @@ pub struct ReadbackStats {
 /// `[start, end)` of title memory of the read-back buffers alive (let go
 /// in [`untag`]: a buffer made later in the same memory need not be one).
 static TAGGED: Mutex<crate::memcopy::RangeSet> = Mutex::new(crate::memcopy::RangeSet::new());
+static TAGGED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// The creator's code range, once the title image is known: `None` until
 /// then, `Some(None)` if it is not this build.
@@ -271,6 +272,7 @@ pub(crate) fn tag(start: u64, len: u64) {
     let mut t = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
     t.insert(start, start + len);
     let n = t.len();
+    TAGGED_COUNT.store(n, Ordering::Release);
     drop(t);
     crate::authority::register_range(
         start as usize,
@@ -291,6 +293,9 @@ pub(crate) fn tag(start: u64, len: u64) {
 /// Whether a read-back buffer lies in `[start, start + len)`, switch or
 /// not (`crate::rebar` keeps such memory where the CPU reads it fast).
 pub(crate) fn tagged_in(start: u64, len: u64) -> bool {
+    if TAGGED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
     TAGGED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -351,17 +356,17 @@ pub(crate) fn copy_back(start: u64, len: u64) -> bool {
 pub(crate) fn untag(start: u64, len: u64) {
     // Level 2 / semantic / trace modes also tag read-back buffers when legacy copy-back filtering is off.
     if enabled() || semantic_enabled() || trace_enabled() || crate::rebar::level() >= 2 {
-        TAGGED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(start, start + len);
+        let mut guard = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(start, start + len);
+        TAGGED_COUNT.store(guard.len(), Ordering::Release);
+        drop(guard);
         crate::authority::unregister_range(start as usize, len as usize);
     }
 }
 
 /// How many read-back buffers are alive.
 pub(crate) fn tagged() -> usize {
-    TAGGED.lock().unwrap_or_else(|e| e.into_inner()).len()
+    TAGGED_COUNT.load(Ordering::Acquire)
 }
 
 /// Return snapshot of REA-002 readback provenance & filtering telemetry.

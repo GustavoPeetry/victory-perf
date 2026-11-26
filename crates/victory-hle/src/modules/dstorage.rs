@@ -1104,8 +1104,15 @@ pub fn streaming_stats() -> StreamingStats {
     }
 }
 
-/// Cap on retained per-worker scratch vectors (64 MiB).
-const MAX_TL_SCRATCH_CAP: usize = 64 << 20;
+/// Cap on retained per-worker scratch vectors (4 MiB; larger transfers drop
+/// immediately so workers do not pin hundreds of MiB on 16 GiB hosts).
+const MAX_TL_SCRATCH_CAP: usize = 4 << 20;
+
+fn trim_scratch_vec(buf: &mut Vec<u8>) {
+    if buf.capacity() > MAX_TL_SCRATCH_CAP {
+        *buf = Vec::new();
+    }
+}
 
 fn with_scratch_vec<R>(
     cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u8>>>,
@@ -1126,9 +1133,7 @@ fn with_scratch_vec<R>(
             SCRATCH_BYTES_SAVED.fetch_add(len as u64, Ordering::Relaxed);
         }
         let out = f(&mut buf[..len]);
-        if buf.capacity() > MAX_TL_SCRATCH_CAP {
-            *buf = Vec::new();
-        }
+        trim_scratch_vec(buf);
         out
     })
 }
@@ -1150,7 +1155,8 @@ fn cached_low_ram_pressure() -> bool {
         ..Default::default()
     };
     let low = unsafe {
-        GlobalMemoryStatusEx(&mut mem) != 0 && mem.ullAvailPhys < LOW_RAM_FLOOR
+        GlobalMemoryStatusEx(&mut mem) != 0
+            && (mem.ullAvailPhys < LOW_RAM_FLOOR || mem.dwMemoryLoad >= 82)
     };
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some((std::time::Instant::now(), low));
@@ -1217,11 +1223,10 @@ fn into_destination(
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    // place through one view (`PageWindow::drop` translates the physical pages
+    // back to all mapped title VAs and notifies `victory_gpu::kernel_will_write`).
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         if async_streaming_enabled() {
-            let dst_addr = window.bytes().as_ptr() as usize;
-            victory_gpu::kernel_will_write(dst_addr, len);
             PAGE_DEST_NOTIFIES.fetch_add(1, Ordering::Relaxed);
         }
         return fill(window.bytes()).map(drop);
@@ -1975,5 +1980,21 @@ mod tests {
         assert_eq!(p1, p2, "thread-local scratch must reuse same backing buffer without reallocating");
         assert!(streaming_stats().scratch_reuses >= 1);
         println!("{OK}");
+    }
+
+    #[test]
+    fn tl_scratch_cap_releases_oversized_buffers() {
+        let mut small = Vec::with_capacity(2 << 20);
+        trim_scratch_vec(&mut small);
+        assert!(small.capacity() <= MAX_TL_SCRATCH_CAP);
+        assert!(small.capacity() >= 2 << 20);
+
+        let mut large = Vec::with_capacity(MAX_TL_SCRATCH_CAP + 4096);
+        trim_scratch_vec(&mut large);
+        assert_eq!(
+            large.capacity(),
+            0,
+            "oversized scratch buffers > 4 MiB must release backing memory immediately"
+        );
     }
 }

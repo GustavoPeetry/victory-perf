@@ -163,17 +163,17 @@ pub fn plan_for_topology(topo: CpuTopology, overrides: SchedulerOverrides) -> Wo
     }
 
     // Desktop-aware sizing tailored for 4C/8T (i3-13100F) through 16C+ systems:
-    // keep total runnable background threads well below saturating all physical cores
-    // alongside the title's main + worker threads and D3D12 submission thread.
+    // keep total runnable threads balanced so neither asset streaming nor shader
+    // compilation starves on 4C/8T while avoiding extra texprep lock contention.
     let auto_streaming = if physical <= 4 {
-        2
+        4
     } else {
-        (physical / 2).clamp(2, 4)
+        (physical / 2).clamp(4, 6)
     };
     let auto_shader = if physical <= 4 {
-        2
+        4
     } else {
-        physical.saturating_sub(2).clamp(2, 6)
+        physical.saturating_sub(2).clamp(4, 6)
     };
     let auto_shadow = if physical <= 4 {
         2
@@ -181,9 +181,9 @@ pub fn plan_for_topology(topo: CpuTopology, overrides: SchedulerOverrides) -> Wo
         (physical / 2).clamp(2, 6)
     };
     let auto_memcopy = if physical <= 4 {
-        2
+        1
     } else {
-        (physical / 2).clamp(2, 4)
+        (physical / 4).clamp(1, 3)
     };
 
     let streaming_workers = overrides
@@ -411,22 +411,26 @@ pub fn stats() -> SchedulerStats {
 #[cfg(windows)]
 fn apply_os_thread_hints(role: ThreadRole, worker_index: usize, plan: &WorkerPlan) {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadIdealProcessor, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
+        GetCurrentThread, SetThreadIdealProcessor, SetThreadPriority,
+        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
     };
 
     let prio = match role {
-        ThreadRole::RenderSubmit => THREAD_PRIORITY_ABOVE_NORMAL,
-        ThreadRole::StreamingIo | ThreadRole::ShaderCompile | ThreadRole::ShadowWorker => {
-            THREAD_PRIORITY_BELOW_NORMAL
+        ThreadRole::RenderSubmit | ThreadRole::StreamingIo | ThreadRole::ShadowWorker => {
+            THREAD_PRIORITY_NORMAL
         }
+        ThreadRole::ShaderCompile => THREAD_PRIORITY_BELOW_NORMAL,
         ThreadRole::BackgroundTelemetry => THREAD_PRIORITY_LOWEST,
     };
 
     unsafe {
         let th = GetCurrentThread();
         let _ = SetThreadPriority(th, prio);
-        if let Some(ideal) = pick_nth_set_bit(plan.active_mask, worker_index) {
+        if matches!(
+            role,
+            ThreadRole::ShaderCompile | ThreadRole::BackgroundTelemetry
+        ) && let Some(ideal) = pick_nth_set_bit(plan.active_mask, worker_index)
+        {
             let _ = SetThreadIdealProcessor(th, ideal as u32);
         }
     }
@@ -670,10 +674,10 @@ mod tests {
             },
         );
         assert!(plan.enabled);
-        assert_eq!(plan.streaming_workers, 2);
-        assert_eq!(plan.shader_workers, 2);
+        assert_eq!(plan.streaming_workers, 4);
+        assert_eq!(plan.shader_workers, 4);
         assert_eq!(plan.shadow_workers, 2);
-        assert_eq!(plan.memcopy_workers, 2);
+        assert_eq!(plan.memcopy_workers, 1);
         assert_eq!(plan.active_mask, 0xFF);
         assert!(plan.widen_single_core_masks);
     }

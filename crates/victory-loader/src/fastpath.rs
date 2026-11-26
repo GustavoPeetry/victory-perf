@@ -11,21 +11,19 @@
 //!    + `FlushInstructionCache`) and Page 1 holds `PAGE_RW` telemetry counters
 //!      updated via RIP-relative `lock add` / `lock inc`.
 //! 3. `clzero` loops run natively via `rep stosb` (ERMS/FSRM) with 0 exceptions
-//!    while preserving registers and `RFLAGS`; `monitorx`/`mwaitx` yield cleanly
-//!    via Windows `WaitOnAddress` instead of busy spinning or trapping.
+//!    while preserving registers and `RFLAGS`; `monitorx`/`mwaitx` execute inline
+//!    zero-sleep `pause` hints with 0 `#UD` traps, 0 Win32 calls, and 0 timer waits.
 
 use crate::console_insn_decode as decode;
 
-use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect, VirtualQuery,
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+    VirtualAlloc, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -63,9 +61,6 @@ static PATCHED_CLZERO_LOOPS: AtomicU64 = AtomicU64::new(0);
 static PATCHED_CLZERO_ALT_LOOPS: AtomicU64 = AtomicU64::new(0);
 static PATCHED_MONITORX: AtomicU64 = AtomicU64::new(0);
 static PATCHED_MWAITX: AtomicU64 = AtomicU64::new(0);
-static FAST_MONITORX_CALLS: AtomicU64 = AtomicU64::new(0);
-static FAST_MWAITX_CALLS: AtomicU64 = AtomicU64::new(0);
-static WAIT_ON_ADDRESS_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Telemetry snapshot exported via [`console_insn_stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,8 +90,8 @@ pub struct ConsoleInsnStats {
 struct SlabData {
     fast_clzero_calls: AtomicU64,
     fast_clzero_bytes: AtomicU64,
-    on_monitorx_fn: usize,
-    on_mwaitx_fn: usize,
+    fast_monitorx_calls: AtomicU64,
+    fast_mwaitx_calls: AtomicU64,
 }
 
 struct SlabRecord {
@@ -132,12 +127,16 @@ pub(crate) fn record_veh_insn(kind: &decode::ConsoleOnly) {
 pub fn console_insn_stats() -> ConsoleInsnStats {
     let mut fast_calls = 0u64;
     let mut fast_bytes = 0u64;
+    let mut fast_monitorx = 0u64;
+    let mut fast_mwaitx = 0u64;
     if let Ok(slabs) = SLABS.try_lock() {
         for s in slabs.iter() {
             // SAFETY: `s.data_page` is a leaked `PAGE_READWRITE` page holding `SlabData`.
             let data = unsafe { &*(s.data_page as *const SlabData) };
             fast_calls += data.fast_clzero_calls.load(Ordering::Relaxed);
             fast_bytes += data.fast_clzero_bytes.load(Ordering::Relaxed);
+            fast_monitorx += data.fast_monitorx_calls.load(Ordering::Relaxed);
+            fast_mwaitx += data.fast_mwaitx_calls.load(Ordering::Relaxed);
         }
     }
     ConsoleInsnStats {
@@ -157,101 +156,10 @@ pub fn console_insn_stats() -> ConsoleInsnStats {
         patched_mwaitx: PATCHED_MWAITX.load(Ordering::Relaxed),
         fast_clzero_calls: fast_calls,
         fast_clzero_bytes: fast_bytes,
-        fast_monitorx_calls: FAST_MONITORX_CALLS.load(Ordering::Relaxed),
-        fast_mwaitx_calls: FAST_MWAITX_CALLS.load(Ordering::Relaxed),
-        wait_on_address_calls: WAIT_ON_ADDRESS_CALLS.load(Ordering::Relaxed),
+        fast_monitorx_calls: fast_monitorx,
+        fast_mwaitx_calls: fast_mwaitx,
+        wait_on_address_calls: 0,
     }
-}
-
-type WaitOnAddressFn = unsafe extern "system" fn(
-    address: *const c_void,
-    compare_address: *const c_void,
-    address_size: usize,
-    dw_milliseconds: u32,
-) -> i32;
-
-fn wait_on_address_fn() -> Option<WaitOnAddressFn> {
-    static FN: OnceLock<Option<WaitOnAddressFn>> = OnceLock::new();
-    *FN.get_or_init(|| unsafe {
-        let kb = GetModuleHandleA(c"kernelbase.dll".as_ptr().cast());
-        if kb.is_null() {
-            return None;
-        }
-        let proc = GetProcAddress(kb, c"WaitOnAddress".as_ptr().cast())?;
-        Some(std::mem::transmute::<
-            unsafe extern "system" fn() -> isize,
-            WaitOnAddressFn,
-        >(proc))
-    })
-}
-
-thread_local! {
-    static MONITOR_STATE: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
-}
-
-fn is_readable_u64(va: usize) -> bool {
-    if !(0x1_0000..=0x0000_7FFF_FFFF_FFFF).contains(&va) {
-        return false;
-    }
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let got = unsafe {
-        VirtualQuery(
-            va as *const c_void,
-            &mut info,
-            size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    if got == 0 || info.State != MEM_COMMIT {
-        return false;
-    }
-    if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 {
-        return false;
-    }
-    (info.BaseAddress as usize).saturating_add(info.RegionSize) >= va + 8
-}
-
-extern "C" fn on_monitorx(va: usize) {
-    FAST_MONITORX_CALLS.fetch_add(1, Ordering::Relaxed);
-    let val = if is_readable_u64(va) {
-        // SAFETY: committed readable 8-byte slot verified immediately above.
-        unsafe { (va as *const u64).read_unaligned() }
-    } else {
-        0
-    };
-    MONITOR_STATE.with(|s| s.set((va, val)));
-}
-
-extern "C" fn on_mwaitx() {
-    FAST_MWAITX_CALLS.fetch_add(1, Ordering::Relaxed);
-    let (va, snap) = MONITOR_STATE.with(Cell::get);
-    if va != 0 && is_readable_u64(va) {
-        // SAFETY: committed readable slot verified above.
-        let current = unsafe { (va as *const u64).read_unaligned() };
-        if current == snap
-            && let Some(wait_fn) = wait_on_address_fn()
-        {
-            WAIT_ON_ADDRESS_CALLS.fetch_add(1, Ordering::Relaxed);
-            // Bounded 1 ms wait avoids indefinite sleep on missed updates while
-            // replacing 100% busy CPU spin loops on 4-core hardware.
-            let _ = unsafe {
-                wait_fn(
-                    va as *const c_void,
-                    (&raw const snap).cast::<c_void>(),
-                    8,
-                    1,
-                )
-            };
-            return;
-        }
-    }
-    std::thread::yield_now();
-}
-
-/// Expose synchronous wait helper directly for tests & diagnostics.
-#[cfg(test)]
-pub(crate) fn probe_wait_on_address_pair(va: *const u64) {
-    on_monitorx(va as usize);
-    on_mwaitx();
 }
 
 struct CodeEmitter {
@@ -448,63 +356,30 @@ impl CodeEmitter {
         Ok(entry)
     }
 
-    /// Emit ABI-preserving call thunk (`save RFLAGS + all volatile GPRs + XMM0..3`)
-    /// calling `SlabData[fn_field_off]` with `rcx = orig_rax`.
-    fn emit_call_thunk(
-        &mut self,
-        fn_field_off: usize,
-        post_mode: CallThunkPost,
-        return_va: usize,
-    ) -> Result<usize, ()> {
+    /// Emit zero-sleep native stub for `Monitorx` (`xor ecx, ecx; xor edx, edx; monitorx`).
+    fn emit_monitorx_stub(&mut self, return_va: usize) -> Result<usize, ()> {
         let entry = self.cur_va();
-        // Save RFLAGS and volatile GPRs:
-        self.extend(&[
-            0x9C, // pushfq
-            0x50, 0x51, 0x52, // push rax, rcx, rdx
-            0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, // push r8, r9, r10, r11
-            // Put monitored addr (`orig rax`) into rcx before aligning rsp:
-            0x48, 0x8B, 0x4C, 0x24, 0x30, // mov rcx, [rsp + 0x30]
-            // Preserve RBP and align stack to 16 bytes + 32-byte Win64 shadow space:
-            0x55, // push rbp
-            0x48, 0x89, 0xE5, // mov rbp, rsp
-            0x48, 0x83, 0xE4, 0xF0, // and rsp, -16
-            0x48, 0x83, 0xEC, 0x40, // sub rsp, 64 (32B shadow + room for xmm save)
-            0x0F, 0x11, 0x44, 0x24, 0x20, // movups [rsp + 0x20], xmm0
-            0x0F, 0x11, 0x4C, 0x24, 0x30, // movups [rsp + 0x30], xmm1
-        ]);
-        // call qword ptr [rip + SlabData.fn_field_off] (`FF 15 disp32`)
-        self.extend(&[0xFF, 0x15]);
-        let disp = self.emit_rel32_to(self.data_va + fn_field_off)?;
-        self.extend(&disp.to_le_bytes());
-
-        self.extend(&[
-            0x0F, 0x10, 0x44, 0x24, 0x20, // movups xmm0, [rsp + 0x20]
-            0x0F, 0x10, 0x4C, 0x24, 0x30, // movups xmm1, [rsp + 0x30]
-            0x48, 0x89, 0xEC, // mov rsp, rbp
-            0x5D, // pop rbp
-            0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, // pop r11..r8
-            0x5A, 0x59, 0x58, // pop rdx, rcx, rax
-            0x9D, // popfq
-        ]);
-        match post_mode {
-            CallThunkPost::Monitorx => {
-                // Reproduce overwritten `xor ecx, ecx; xor edx, edx`.
-                self.extend(&[0x31, 0xC9, 0x31, 0xD2]);
-            }
-            CallThunkPost::Mwaitx => {
-                // Reproduce overwritten `mov ecx, 2; xor eax, eax`.
-                self.extend(&[0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0]);
-            }
-        }
+        self.push(0x9C); // pushfq
+        self.emit_lock_inc_data(std::mem::offset_of!(SlabData, fast_monitorx_calls))?;
+        self.push(0x9D); // popfq
+        // Reproduce overwritten `xor ecx, ecx; xor edx, edx`.
+        self.extend(&[0x31, 0xC9, 0x31, 0xD2]);
         self.emit_jmp(return_va)?;
         Ok(entry)
     }
-}
 
-#[derive(Clone, Copy)]
-enum CallThunkPost {
-    Monitorx,
-    Mwaitx,
+    /// Emit zero-sleep inline `pause` stub for `Mwaitx` (`mov ecx, 2; xor eax, eax; mwaitx`).
+    fn emit_mwaitx_stub(&mut self, return_va: usize) -> Result<usize, ()> {
+        let entry = self.cur_va();
+        self.push(0x9C); // pushfq
+        self.emit_lock_inc_data(std::mem::offset_of!(SlabData, fast_mwaitx_calls))?;
+        self.push(0x9D); // popfq
+        self.extend(&[0xF3, 0x90]); // pause
+        // Reproduce overwritten `mov ecx, 2; xor eax, eax`.
+        self.extend(&[0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0]);
+        self.emit_jmp(return_va)?;
+        Ok(entry)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -596,8 +471,8 @@ unsafe fn alloc_nearby_slab(near_va: usize) -> Option<SlabRecord> {
             SlabData {
                 fast_clzero_calls: AtomicU64::new(0),
                 fast_clzero_bytes: AtomicU64::new(0),
-                on_monitorx_fn: on_monitorx as *const () as usize,
-                on_mwaitx_fn: on_mwaitx as *const () as usize,
+                fast_monitorx_calls: AtomicU64::new(0),
+                fast_mwaitx_calls: AtomicU64::new(0),
             },
         );
     }
@@ -714,21 +589,13 @@ unsafe fn emit_and_patch_sites(near_va: usize, sites: &[PlannedSite]) -> PatchSu
                 }
             }
             PlannedSite::Monitorx { patch_va } => {
-                if let Ok(stub) = emitter.emit_call_thunk(
-                    std::mem::offset_of!(SlabData, on_monitorx_fn),
-                    CallThunkPost::Monitorx,
-                    patch_va + 7,
-                ) {
+                if let Ok(stub) = emitter.emit_monitorx_stub(patch_va + 7) {
                     patches.push((patch_va, 7, stub));
                     summary.monitorx_sites += 1;
                 }
             }
             PlannedSite::Mwaitx { patch_va } => {
-                if let Ok(stub) = emitter.emit_call_thunk(
-                    std::mem::offset_of!(SlabData, on_mwaitx_fn),
-                    CallThunkPost::Mwaitx,
-                    patch_va + 10,
-                ) {
+                if let Ok(stub) = emitter.emit_mwaitx_stub(patch_va + 10) {
                     patches.push((patch_va, 10, stub));
                     summary.mwaitx_sites += 1;
                 }
@@ -999,31 +866,65 @@ mod tests {
     }
 
     #[test]
-    fn monitorx_mwaitx_wait_on_address_wakes_on_cross_thread_store() {
-        use std::sync::atomic::AtomicU64;
-        let slot = std::sync::Arc::new(AtomicU64::new(0x1111_2222_3333_4444));
-        let slot2 = slot.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            slot2.store(0xDEAD_BEEF_CAFE_BABE, Ordering::Release);
-            unsafe {
-                if let Some(kb) = GetModuleHandleA(c"kernelbase.dll".as_ptr().cast()).as_ref() {
-                    let h = kb as *const _ as _;
-                    if let Some(wake) = GetProcAddress(h, c"WakeByAddressAll".as_ptr().cast()) {
-                        let f: unsafe extern "system" fn(*const c_void) = std::mem::transmute(wake);
-                        f(slot2.as_ptr().cast());
-                    }
-                }
-            }
-        });
+    fn executable_native_monitorx_mwaitx_has_zero_sleep_latency() {
+        let code_buf = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!code_buf.is_null());
+        let code_va = code_buf as usize;
+        let func_bytes: [u8; 32] = [
+            0x57, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xF8, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA,
+            0x48, 0x8B, 0x17, 0xB9, 0x02, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x01, 0xFB, 0x48,
+            0x8B, 0x07, 0x5F, 0xC3,
+        ];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                func_bytes.as_ptr(),
+                code_buf.cast::<u8>(),
+                func_bytes.len(),
+            );
+        }
+        let sec_slice =
+            unsafe { std::slice::from_raw_parts(code_buf.cast::<u8>(), func_bytes.len()) };
+        let sites = find_sites_in_buffer(code_va, sec_slice);
+        let summary = unsafe { emit_and_patch_sites(code_va, &sites) };
+        assert_eq!(summary.monitorx_sites, 1);
+        assert_eq!(summary.mwaitx_sites, 1);
 
+        let mut old = 0u32;
+        unsafe {
+            assert_ne!(
+                VirtualProtect(code_buf, PAGE_SIZE, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
+            FlushInstructionCache(GetCurrentProcess(), code_buf, PAGE_SIZE);
+        }
+
+        let exec: unsafe extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(code_va) };
+        let watched = std::sync::atomic::AtomicU64::new(0x1122_3344_5566_7788);
         let before = console_insn_stats();
-        probe_wait_on_address_pair(slot.as_ptr());
-        handle.join().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let v = unsafe { exec(watched.as_ptr()) };
+            assert_eq!(v, 0x1122_3344_5566_7788);
+        }
+        let elapsed = started.elapsed();
         let after = console_insn_stats();
-        assert!(after.fast_monitorx_calls > before.fast_monitorx_calls);
-        assert!(after.fast_mwaitx_calls > before.fast_mwaitx_calls);
-        assert!(after.wait_on_address_calls > before.wait_on_address_calls);
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "1000 inline monitorx/mwaitx spins must complete without OS timer sleep (took {:?})",
+            elapsed
+        );
+        assert_eq!(after.emu_total, before.emu_total);
+        assert_eq!(after.wait_on_address_calls, 0);
+        assert!(after.fast_monitorx_calls - before.fast_monitorx_calls >= 1_000);
+        assert!(after.fast_mwaitx_calls - before.fast_mwaitx_calls >= 1_000);
     }
 
     #[test]
