@@ -2018,13 +2018,26 @@ impl HostHeap {
             let pin = crate::tiles::pin_descriptor_resource(&res);
             (res, pin)
         });
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some((old, _pin)) = std::mem::replace(slot, entry) {
-                crate::host::retire(old);
-            }
+        let retired = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get_mut(index as usize)
+                .and_then(|slot| std::mem::replace(slot, entry))
+        };
+        if let Some((old, pin)) = retired {
+            crate::host::retire((old, pin));
+        }
+    }
+
+    /// Buffer variant of [`keep`] that skips sparse texture pin lookup (`raw_at`/`raw_uav_at`).
+    fn keep_buffer(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let entry = resource.map(|res| (res, None));
+        let retired = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get_mut(index as usize)
+                .and_then(|slot| std::mem::replace(slot, entry))
+        };
+        if let Some((old, pin)) = retired {
+            crate::host::retire((old, pin));
         }
     }
 
@@ -2053,14 +2066,14 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep_buffer(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
-        self.keep(index, None);
+        self.keep_buffer(index, None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -2092,13 +2105,13 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep_buffer(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
-        self.keep(index, None);
+        self.keep_buffer(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,

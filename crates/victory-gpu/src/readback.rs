@@ -363,11 +363,42 @@ pub(crate) fn copy_back(start: u64, len: u64) -> bool {
     overlaps
 }
 
+/// Samples or audits GPU writes that bypassed copy-back under `VICTORY_REA_READBACK_VALIDATE`.
+pub(crate) fn validate_authority_skip(start: u64, len: u64, tagged: bool) {
+    if len == 0 || !validate_enabled() {
+        return;
+    }
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let full = *FULL.get_or_init(|| {
+        std::env::var("VICTORY_REA_READBACK_VALIDATE")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "2" || t.eq_ignore_ascii_case("full")
+            })
+    });
+    let sample = VALIDATE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if !full && !sample.is_multiple_of(128) {
+        return;
+    }
+    if tagged
+        || crate::authority::is_gpu_authoritative_conflict(start as usize, len as usize)
+            && tagged_in(start, len)
+    {
+        VALIDATE_WARNINGS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Removes one registration owned by a read-back buffer being let go.
 /// Its exact range matters: aliases may share a start but differ in size.
 pub(crate) fn untag(start: u64, len: u64) {
-    // Level 2 / semantic / trace modes also tag read-back buffers when legacy copy-back filtering is off.
-    if enabled() || semantic_enabled() || trace_enabled() || crate::rebar::level() >= 2 {
+    // Authority, level 2, semantic, and trace modes also tag read-back buffers when legacy filtering is off.
+    if enabled()
+        || semantic_enabled()
+        || trace_enabled()
+        || crate::authority::enabled()
+        || crate::rebar::level() >= 2
+    {
         let mut guard = TAGGED.lock().unwrap_or_else(|e| e.into_inner());
         guard.remove(start, start + len);
         TAGGED_COUNT.store(guard.len(), Ordering::Release);
@@ -409,7 +440,13 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             // Each configuration needs its own process: enabled() and level()
             // cache their environment variables in OnceLock.
-            for (copy_back, rebar) in [("0", "2"), ("1", "0"), ("1", "1"), ("1", "2")] {
+            for (copy_back, rebar, auth) in [
+                ("0", "2", "0"),
+                ("1", "0", "0"),
+                ("1", "1", "0"),
+                ("1", "2", "0"),
+                ("0", "0", "1"),
+            ] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -419,12 +456,13 @@ mod tests {
                     .env(CHILD, "1")
                     .env("VICTORY_COPY_BACK_ONLY_READBACK", copy_back)
                     .env("VICTORY_REBAR", rebar)
+                    .env("VICTORY_REA_GPU_AUTHORITY", auth)
                     .output()
                     .expect("run read-back lifetime test in a fresh process");
                 assert!(
                     output.status.success()
                         && String::from_utf8_lossy(&output.stdout).contains(PASSED),
-                    "copy_back={copy_back}, rebar={rebar}\nstdout:\n{}\nstderr:\n{}",
+                    "copy_back={copy_back}, rebar={rebar}, auth={auth}\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr),
                 );
@@ -432,7 +470,7 @@ mod tests {
             return;
         }
 
-        assert!(enabled() || crate::rebar::level() >= 2);
+        assert!(enabled() || crate::rebar::level() >= 2 || crate::authority::enabled());
         // Synthetic addresses only: tag() records ranges without dereferencing
         // title memory or invoking the Windows stack-based creator detector.
         const START: u64 = 0x1000_0000;

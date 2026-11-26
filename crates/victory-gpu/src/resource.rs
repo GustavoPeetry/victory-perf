@@ -2163,6 +2163,12 @@ pub(crate) fn ensure_resident_mips(
     let (host_tex, _) = hosted(this, false)?;
     let sparse = host_tex.sparse.as_ref()?;
     let host_ctx = crate::host::host()?;
+    let now_sub = crate::host::started_submission();
+    let now_ms = crate::host::now_ms();
+    if first_mip == 0 && mips_total < u32::MAX && sparse.covers_from(0) {
+        sparse.touch_only(0, now_sub, now_ms);
+        return Some((0, false));
+    }
     let active_first = if first_mip == 0 && mips_total < u32::MAX {
         crate::texture::committed_mip_floor_for(this, mips_total)
     } else if first_mip >= mips_total && mips_total != u32::MAX {
@@ -2170,12 +2176,16 @@ pub(crate) fn ensure_resident_mips(
     } else {
         first_mip
     };
+    if sparse.covers_from(active_first) {
+        sparse.touch_only(active_first, now_sub, now_ms);
+        return Some((active_first, false));
+    }
     let newly_mapped = sparse.ensure_resident(
         &host_ctx.queue,
         active_first,
-        crate::host::started_submission(),
+        now_sub,
         crate::host::finished_submission(),
-        crate::host::now_ms(),
+        now_ms,
     ) > 0;
     Some((active_first, newly_mapped))
 }

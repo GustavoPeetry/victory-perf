@@ -71,18 +71,46 @@ pub(crate) fn reset_subpages_4k(start: usize, end: usize) -> u64 {
                 let last_k = aligned_end / SUBPAGE;
                 let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
                 let seq = next_asking();
-                for kpage in first_k..last_k {
-                    let page = kpage / 16;
-                    let sub = kpage % 16;
+                let mut k = first_k;
+                while k < last_k {
+                    let page = k / 16;
+                    let sub_lo = k % 16;
+                    let page_end_k = ((page + 1) * 16).min(last_k);
+                    let sub_hi = sub_lo + (page_end_k - k);
                     if let Some(subs) = j.subpages.get_mut(&page) {
-                        subs[sub] = 0;
+                        subs[sub_lo..sub_hi].fill(0);
                     }
+                    k = page_end_k;
                 }
                 return seq;
             }
         }
     }
     next_asking()
+}
+
+/// Fast path for `note_gpu_write`: when title memory was already sampled/reset by
+/// the current submission (`ask_once`) and the shadow has no unharvested cold copies,
+/// advancing the asking counter suffices without a kernel `ResetWriteWatch` syscall
+/// or global `JOURNAL.write()` lock. When `cold_reset` is true, phantom demand-zero
+/// dirty bits from cold reads must still be cleared on `[start, end)`.
+#[inline]
+pub(crate) fn advance_gpu_owned_seq(start: usize, end: usize, cold_reset: bool) -> u64 {
+    if !cold_reset {
+        return next_asking();
+    }
+    reset_subpages_4k(start, end)
+}
+
+/// Stack-allocated read of the 16 per-4 KiB subpage write timestamps for `page`.
+#[inline]
+pub(crate) fn journal_page_4k(page: usize) -> [u64; 16] {
+    let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(&subs) = j.subpages.get(&page) {
+        subs
+    } else {
+        [j.written.get(&page).copied().unwrap_or(0); 16]
+    }
 }
 
 struct Journal {
@@ -268,27 +296,50 @@ pub(crate) fn ask_once_end() {
     }
 }
 
+#[inline]
+fn track_4k_subpages() -> bool {
+    crate::authority::enabled() || crate::shadow::has_active_gpu_owned()
+}
+
 fn record_4k_range(j: &mut Journal, at: usize, len: usize, now: u64) {
+    if !track_4k_subpages() {
+        return;
+    }
     let kfirst = at / KERNEL_PAGE;
     let klast = at.saturating_add(len).div_ceil(KERNEL_PAGE);
-    for kpage in kfirst..klast {
-        let page = kpage / 16;
-        let sub = kpage % 16;
-        j.subpages.entry(page).or_insert([0; 16])[sub] = now;
+    let mut k = kfirst;
+    while k < klast {
+        let page = k / 16;
+        let sub_lo = k % 16;
+        let page_end_k = ((page + 1) * 16).min(klast);
+        let sub_hi = sub_lo + (page_end_k - k);
+        let subs = j.subpages.entry(page).or_insert([0; 16]);
+        subs[sub_lo..sub_hi].fill(now);
+        k = page_end_k;
     }
 }
 
 fn record_4k_addrs(j: &mut Journal, new_pages: &[usize], new_4k: &[usize], now: u64) {
+    if !track_4k_subpages() {
+        return;
+    }
     if new_4k.is_empty() {
         for &page in new_pages {
             j.subpages.insert(page, [now; 16]);
         }
         return;
     }
-    for &kpage in new_4k {
-        let page = kpage / 16;
-        let sub = kpage % 16;
-        j.subpages.entry(page).or_insert([0; 16])[sub] = now;
+    let mut idx = 0;
+    while idx < new_4k.len() {
+        let k0 = new_4k[idx];
+        let page = k0 / 16;
+        let subs = j.subpages.entry(page).or_insert([0; 16]);
+        subs[k0 % 16] = now;
+        idx += 1;
+        while idx < new_4k.len() && new_4k[idx] / 16 == page {
+            subs[new_4k[idx] % 16] = now;
+            idx += 1;
+        }
     }
 }
 
@@ -383,16 +434,28 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    let mut new_pages = Vec::with_capacity(count);
-    let mut new_4k = Vec::with_capacity(count);
-    for k in 0..count {
+    let track_4k = track_4k_subpages();
+    let mut k = 0;
+    while k < count {
         let addr = j.found[k];
         let page = addr / PAGE;
-        new_pages.push(page);
-        new_4k.push(addr / KERNEL_PAGE);
         j.written.insert(page, now);
+        if track_4k {
+            let subs = j.subpages.entry(page).or_insert([0; 16]);
+            subs[(addr / KERNEL_PAGE) % 16] = now;
+            k += 1;
+            while k < count && j.found[k] / PAGE == page {
+                let kaddr = j.found[k];
+                subs[(kaddr / KERNEL_PAGE) % 16] = now;
+                k += 1;
+            }
+        } else {
+            k += 1;
+            while k < count && j.found[k] / PAGE == page {
+                k += 1;
+            }
+        }
     }
-    record_4k_addrs(j, &new_pages, &new_4k, now);
     true
 }
 
@@ -562,7 +625,9 @@ fn writes_kind_inner(
         } != 0;
         if !err && count > 0 {
             found_pages.extend(buf[..count].iter().map(|&at| at / PAGE));
-            found_4k.extend(buf[..count].iter().map(|&at| at / KERNEL_PAGE));
+            if track_4k_subpages() {
+                found_4k.extend(buf[..count].iter().map(|&at| at / KERNEL_PAGE));
+            }
         }
         err
     });

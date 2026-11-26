@@ -36,6 +36,26 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Reusable single-slice GPU->CPU readback context for `Host::fetch_buffer_slice`.
+struct FetchContext {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    fence_val: u64,
+    event: HANDLE,
+}
+
+impl Drop for FetchContext {
+    fn drop(&mut self) {
+        if !self.event.0.is_null() {
+            // SAFETY: owned Win32 event handle created by `CreateEventW`.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.event);
+            }
+        }
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) queue: ID3D12CommandQueue,
@@ -59,6 +79,8 @@ pub(crate) struct Host {
     adapter: Option<IDXGIAdapter3>,
     /// Asynchronous direct-queue hardware timestamp ring for calibrated GPU timing.
     timestamp_ring: Option<crate::render_graph::GpuTimestampRing>,
+    /// Pooled command allocator/list/fence/event for synchronous slice materialization.
+    fetch_ctx: Mutex<Option<FetchContext>>,
 }
 
 impl Host {
@@ -952,6 +974,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
             timestamp_ring,
+            fetch_ctx: Mutex::new(None),
         })
     }
 }
@@ -2491,6 +2514,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    written_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3607,8 +3631,8 @@ impl Host {
     }
 
     /// Synchronously downloads `[offset, offset + len)` from a VRAM buffer
-    /// into its CPU staging resource using an isolated fence so it is safe to
-    /// call even from within `Host::submit` without re-locking `submission`.
+    /// into its CPU staging resource using a pooled allocator/list/fence/event
+    /// so it is safe to call from within `Host::submit` without re-locking `submitted`.
     pub(crate) fn fetch_buffer_slice(
         &self,
         dst_staging: &ID3D12Resource,
@@ -3619,52 +3643,82 @@ impl Host {
         if len == 0 {
             return true;
         }
-        let Some((allocator, list)) = self.make_prelude() else {
-            return false;
-        };
-        // SAFETY: isolated allocator, list, fence, and Win32 event live across
+        let mut ctx_guard = self.fetch_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: pooled allocator, list, fence, and Win32 event live across
         // synchronous completion wait; buffers remain owned by the caller.
         unsafe {
-            let Ok(fence): windows::core::Result<ID3D12Fence> =
-                self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)
-            else {
+            if ctx_guard.is_none() {
+                let Ok(allocator): windows::core::Result<ID3D12CommandAllocator> = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                else {
+                    return false;
+                };
+                let Ok(list): windows::core::Result<ID3D12GraphicsCommandList> = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                else {
+                    return false;
+                };
+                let _ = list.Close();
+                let Ok(fence): windows::core::Result<ID3D12Fence> =
+                    self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                else {
+                    return false;
+                };
+                let event = windows_sys::Win32::System::Threading::CreateEventW(
+                    std::ptr::null(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                );
+                if event.is_null() {
+                    return false;
+                }
+                *ctx_guard = Some(FetchContext {
+                    allocator,
+                    list,
+                    fence,
+                    fence_val: 0,
+                    event: windows::Win32::Foundation::HANDLE(event),
+                });
+            }
+            let Some(ctx) = ctx_guard.as_mut() else {
                 return false;
             };
-            let event = windows_sys::Win32::System::Threading::CreateEventW(
-                std::ptr::null(),
-                0,
-                0,
-                std::ptr::null(),
-            );
-            if event.is_null() {
-                return false;
-            }
             let ok = (|| -> windows::core::Result<()> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                list.ResourceBarrier(&[transition(
+                ctx.allocator.Reset()?;
+                ctx.list.Reset(&ctx.allocator, None)?;
+                ctx.list.ResourceBarrier(&[transition(
                     src_card,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
-                list.CopyBufferRegion(dst_staging, offset, src_card, offset, len);
-                list.ResourceBarrier(&[transition(
+                ctx.list
+                    .CopyBufferRegion(dst_staging, offset, src_card, offset, len);
+                ctx.list.ResourceBarrier(&[transition(
                     src_card,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
                 )]);
-                list.Close()?;
-                let cmd: ID3D12CommandList = list.cast()?;
+                ctx.list.Close()?;
+                let cmd: ID3D12CommandList = ctx.list.cast()?;
+                ctx.fence_val += 1;
+                let target = ctx.fence_val;
                 let _queue_guard = crate::tiles::queue_lock();
                 self.queue.ExecuteCommandLists(&[Some(cmd)]);
-                self.queue.Signal(&fence, 1)?;
+                self.queue.Signal(&ctx.fence, target)?;
                 drop(_queue_guard);
-                fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE(event))?;
-                WaitForSingleObject(windows::Win32::Foundation::HANDLE(event), INFINITE);
+                if ctx.fence.GetCompletedValue() < target {
+                    ctx.fence.SetEventOnCompletion(target, ctx.event)?;
+                    WaitForSingleObject(ctx.event, 5_000);
+                }
                 Ok(())
             })()
             .is_ok();
-            windows_sys::Win32::Foundation::CloseHandle(event);
+            if !ok {
+                *ctx_guard = None;
+            }
             ok
         }
     }
@@ -4792,6 +4846,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.written_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5103,6 +5158,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                written_ranges: sent.written_ranges,
             }));
             items.extend(
                 sent.writes
@@ -5157,6 +5213,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                written_ranges: sent.written_ranges,
             }));
             items.extend(
                 sent.writes
@@ -5406,6 +5463,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let ask_started = std::time::Instant::now();
             let mut spans: std::collections::HashMap<usize, (usize, usize)> =
                 std::collections::HashMap::new();
             for list in runs {
@@ -5433,6 +5491,10 @@ impl Host {
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
+            crate::rea_telemetry::record_prep_phase_us(
+                crate::rea_telemetry::PrepPhase::AskOnce,
+                ask_started.elapsed().as_micros() as u64,
+            );
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
@@ -7101,6 +7163,10 @@ impl HostList {
                     if len > 0 {
                         wrote_pending.push((dst, len));
                     }
+                    crate::rea_telemetry::record_prep_phase_us(
+                        crate::rea_telemetry::PrepPhase::Copy,
+                        started.elapsed().as_micros() as u64,
+                    );
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -7111,6 +7177,10 @@ impl HostList {
                     }
                     crate::shadow::materialize_for_cpu_read(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::rea_telemetry::record_prep_phase_us(
+                        crate::rea_telemetry::PrepPhase::Fill,
+                        started.elapsed().as_micros() as u64,
+                    );
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -7156,17 +7226,21 @@ impl HostList {
                     // several copies are pending, flush all of them in parallel
                     // instead of serializing the big buffers one by one here.
                     batch.flush_for_write(shadow);
-                    #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
+                    let note_started = std::time::Instant::now();
                     if *copy_back {
                         shadow.writing(*address, *len);
                     } else {
                         shadow.note_gpu_write(*address, *len);
                     }
+                    let note_us = note_started.elapsed().as_micros() as u64;
+                    crate::rea_telemetry::record_prep_phase_us(
+                        crate::rea_telemetry::PrepPhase::NoteGpuWrite,
+                        note_us,
+                    );
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        add(C::SnapshotUs, note_us);
                     }
                     continue;
                 }

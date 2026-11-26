@@ -27,8 +27,8 @@ fn register_rea_telemetry() {
                 wait_yields: s.wait_yields,
                 wait_sleeps: s.wait_sleeps,
                 wait_early_wakes: s.wait_early_wakes,
-                wait_total_us: 0,
-                wait_sleep_us: 0,
+                wait_total_us: s.wait_total_us,
+                wait_sleep_us: s.wait_sleep_us,
                 emu_total: s.emu_total,
                 emu_zeroed_bytes: s.emu_zeroed_bytes,
             }

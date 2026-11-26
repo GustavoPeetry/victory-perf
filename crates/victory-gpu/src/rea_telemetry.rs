@@ -133,7 +133,6 @@ static PREP_PHASE_US: [AtomicU64; PREP_PHASE_COUNT] =
     [const { AtomicU64::new(0) }; PREP_PHASE_COUNT];
 
 /// Adds elapsed microseconds to a CPU preparation sub-phase accumulator.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn record_prep_phase_us(phase: PrepPhase, us: u64) {
     if us > 0 {

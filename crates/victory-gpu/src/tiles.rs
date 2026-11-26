@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
 use crate::accounting;
-use crate::authority::{self, AuthorityClass};
+use crate::authority;
 
 /// Standard D3D12 tile size is fixed at 64 KiB across all tiers.
 pub const TILE_SIZE: u64 = 65_536;
@@ -497,6 +497,9 @@ impl Drop for SparseDescriptorPin {
 /// Pins `resource` in descriptor-heap residency tracking if it was created as a
 /// sparse reserved resource.
 pub(crate) fn pin_descriptor_resource(resource: &ID3D12Resource) -> Option<SparseDescriptorPin> {
+    if !reclaim_enabled() || SPARSE_TEXTURES_ALIVE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
     let raw = resource.as_raw() as usize;
     let binding = {
         let map = BINDINGS.read().unwrap_or_else(|e| e.into_inner());
@@ -679,15 +682,24 @@ impl SparseBinding {
     }
 
     pub(crate) fn set_authority_va(&self, title_va: usize) {
-        if title_va != 0 {
-            self.authority_va.store(title_va, Ordering::Relaxed);
-            authority::register_range(
-                title_va,
-                self.virtual_bytes as usize,
-                AuthorityClass::SparseTiled,
-                true,
-            );
+        if title_va != 0 && self.authority_va.swap(title_va, Ordering::Relaxed) == 0 {
+            authority::note_sparse_texture_delta(1);
         }
+    }
+
+    #[inline]
+    pub(crate) fn covers_from(&self, first_mip: u32) -> bool {
+        let want = self.required_mask(first_mip);
+        (self.mapped_mips_mask.load(Ordering::Acquire) & want) == want
+    }
+
+    #[inline]
+    pub(crate) fn touch_only(&self, first_mip: u32, now_submission: u64, now_ms: u64) {
+        if reclaim_enabled() {
+            self.touch_mips(first_mip, now_submission, now_ms);
+        }
+        self.last_gpu_sub
+            .fetch_max(now_submission, Ordering::AcqRel);
     }
 
     pub(crate) fn mapped_bytes(&self) -> u64 {
@@ -1218,7 +1230,7 @@ impl Drop for SparseBinding {
         }
         let va = self.authority_va.swap(0, Ordering::Relaxed);
         if va != 0 {
-            authority::unregister_range(va, self.virtual_bytes as usize);
+            authority::note_sparse_texture_delta(-1);
         }
         let sub = crate::host::started_submission();
         self.retire_all(sub);

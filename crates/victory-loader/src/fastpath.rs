@@ -88,6 +88,8 @@ pub struct ConsoleInsnStats {
     pub wait_yields: u64,
     pub wait_sleeps: u64,
     pub wait_early_wakes: u64,
+    pub wait_total_us: u64,
+    pub wait_sleep_us: u64,
     pub wait_on_address_calls: u64,
 }
 
@@ -113,6 +115,8 @@ struct ThreadWaitCounters {
     yields: AtomicU64,
     sleeps: AtomicU64,
     early_wakes: AtomicU64,
+    total_us: AtomicU64,
+    sleep_us: AtomicU64,
 }
 
 impl ThreadWaitCounters {
@@ -123,9 +127,35 @@ impl ThreadWaitCounters {
             yields: AtomicU64::new(0),
             sleeps: AtomicU64::new(0),
             early_wakes: AtomicU64::new(0),
+            total_us: AtomicU64::new(0),
+            sleep_us: AtomicU64::new(0),
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MwaitxMode {
+    Progressive,
+    YieldOnly,
+    SpinOnly,
+}
+
+fn mwaitx_mode() -> MwaitxMode {
+    static MODE: OnceLock<MwaitxMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_REA_MWAITX_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some(v) if v.eq_ignore_ascii_case("yield") => MwaitxMode::YieldOnly,
+            Some(v) if v.eq_ignore_ascii_case("spin") => MwaitxMode::SpinOnly,
+            _ => MwaitxMode::Progressive,
+        }
+    })
+}
+
+const VALIDATED_PAGE_SLOTS: usize = 8;
 
 struct ThreadWaitState {
     counters: Arc<ThreadWaitCounters>,
@@ -134,10 +164,14 @@ struct ThreadWaitState {
     y_cnt: u64,
     s_cnt: u64,
     e_cnt: u64,
+    total_us_cnt: u64,
+    sleep_us_cnt: u64,
     monitored_addr: usize,
-    monitored_val: u64,
-    validated_page: usize,
-    validated_ok: bool,
+    monitored_line: [u64; 8],
+    page_cache: [(usize, bool); VALIDATED_PAGE_SLOTS],
+    page_cache_next: usize,
+    #[cfg(any(test, feature = "diagnostics"))]
+    virtual_query_calls: u64,
     unchanged_streak: u32,
 }
 
@@ -164,10 +198,14 @@ fn with_thread_wait<R>(f: impl FnOnce(&mut ThreadWaitState) -> R) -> R {
                 y_cnt: 0,
                 s_cnt: 0,
                 e_cnt: 0,
+                total_us_cnt: 0,
+                sleep_us_cnt: 0,
                 monitored_addr: 0,
-                monitored_val: 0,
-                validated_page: 0,
-                validated_ok: false,
+                monitored_line: [0; 8],
+                page_cache: [(0, false); VALIDATED_PAGE_SLOTS],
+                page_cache_next: 0,
+                #[cfg(any(test, feature = "diagnostics"))]
+                virtual_query_calls: 0,
                 unchanged_streak: 0,
             }
         });
@@ -175,17 +213,19 @@ fn with_thread_wait<R>(f: impl FnOnce(&mut ThreadWaitState) -> R) -> R {
     })
 }
 
-fn is_readable_word_addr(state: &mut ThreadWaitState, aligned_addr: usize) -> bool {
-    if aligned_addr < 0x1_0000 {
+fn is_readable_line_addr(state: &mut ThreadWaitState, line_base: usize) -> bool {
+    if line_base < 0x1_0000 {
         return false;
     }
-    let page = aligned_addr & !(PAGE_SIZE - 1);
-    let end_page = (aligned_addr + 7) & !(PAGE_SIZE - 1);
-    if page != end_page {
-        return false;
+    let page = line_base & !(PAGE_SIZE - 1);
+    for &(cached_page, cached_ok) in &state.page_cache {
+        if cached_page == page {
+            return cached_ok;
+        }
     }
-    if state.validated_page == page {
-        return state.validated_ok;
+    #[cfg(any(test, feature = "diagnostics"))]
+    {
+        state.virtual_query_calls = state.virtual_query_calls.saturating_add(1);
     }
     let mut mbi = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: `mbi` is initialized and `VirtualQuery` safely queries `page`.
@@ -201,34 +241,41 @@ fn is_readable_word_addr(state: &mut ThreadWaitState, aligned_addr: usize) -> bo
         && (mbi.Protect
             & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))
             != 0;
-    state.validated_page = page;
-    state.validated_ok = ok;
+    let slot = state.page_cache_next % VALIDATED_PAGE_SLOTS;
+    state.page_cache[slot] = (page, ok);
+    state.page_cache_next = state.page_cache_next.wrapping_add(1);
     ok
 }
 
-fn read_monitored_u64(state: &mut ThreadWaitState, addr: usize) -> Option<u64> {
-    let aligned = addr & !7;
-    if !is_readable_word_addr(state, aligned) {
+fn read_monitored_line(state: &mut ThreadWaitState, addr: usize) -> Option<[u64; 8]> {
+    let line_base = addr & !63;
+    if !is_readable_line_addr(state, line_base) {
         return None;
     }
-    // SAFETY: validated committed readable 8-byte aligned page inside process VA.
-    Some(unsafe { (*(aligned as *const AtomicU64)).load(Ordering::Acquire) })
+    let ptr = line_base as *const AtomicU64;
+    let mut line = [0u64; 8];
+    for (i, dst) in line.iter_mut().enumerate() {
+        // SAFETY: validated committed readable 64-byte aligned cache line inside a 4 KiB page.
+        *dst = unsafe { (*ptr.add(i)).load(Ordering::Acquire) };
+    }
+    Some(line)
 }
 
 unsafe extern "win64" fn on_monitorx_fast(addr: usize) {
     with_thread_wait(|st| {
         st.m_cnt = st.m_cnt.saturating_add(1);
         st.counters.monitorx.store(st.m_cnt, Ordering::Relaxed);
-        let new_val = read_monitored_u64(st, addr).unwrap_or(0);
-        if st.monitored_addr == addr && st.unchanged_streak > 0 && new_val != st.monitored_val {
+        let new_line = read_monitored_line(st, addr).unwrap_or([0; 8]);
+        let same_line = st.monitored_addr != 0 && (st.monitored_addr & !63) == (addr & !63);
+        if same_line && st.unchanged_streak > 0 && new_line != st.monitored_line {
             st.e_cnt = st.e_cnt.saturating_add(1);
             st.counters.early_wakes.store(st.e_cnt, Ordering::Relaxed);
             st.unchanged_streak = 0;
-        } else if st.monitored_addr != addr {
-            st.monitored_addr = addr;
+        } else if !same_line {
             st.unchanged_streak = 0;
         }
-        st.monitored_val = new_val;
+        st.monitored_addr = addr;
+        st.monitored_line = new_line;
     });
 }
 
@@ -240,21 +287,22 @@ unsafe extern "win64" fn on_mwaitx_fast() {
         Yield,
         SleepMs,
     }
+    let mode = mwaitx_mode();
     let action = with_thread_wait(|st| {
         st.w_cnt = st.w_cnt.saturating_add(1);
         st.counters.mwaitx.store(st.w_cnt, Ordering::Relaxed);
         let cur = if st.monitored_addr != 0 {
-            read_monitored_u64(st, st.monitored_addr)
+            read_monitored_line(st, st.monitored_addr)
         } else {
             None
         };
         match cur {
-            Some(v) if v != st.monitored_val => {
+            Some(line) if line != st.monitored_line => {
                 if st.unchanged_streak > 0 {
                     st.e_cnt = st.e_cnt.saturating_add(1);
                     st.counters.early_wakes.store(st.e_cnt, Ordering::Relaxed);
                 }
-                st.monitored_val = v;
+                st.monitored_line = line;
                 st.unchanged_streak = 0;
                 Action::EarlyWake(1)
             }
@@ -265,20 +313,38 @@ unsafe extern "win64" fn on_mwaitx_fast() {
             Some(_) => {
                 st.unchanged_streak = st.unchanged_streak.saturating_add(1);
                 let streak = st.unchanged_streak;
-                if streak <= 64 {
-                    Action::Pause((streak / 8).clamp(1, 8))
-                } else if streak <= 2048 {
-                    if streak.is_multiple_of(16) {
-                        st.y_cnt = st.y_cnt.saturating_add(1);
-                        st.counters.yields.store(st.y_cnt, Ordering::Relaxed);
-                        Action::Yield
-                    } else {
-                        Action::Pause(4)
+                match mode {
+                    MwaitxMode::SpinOnly => Action::Pause((streak / 8).clamp(1, 16)),
+                    MwaitxMode::YieldOnly => {
+                        if streak <= 64 {
+                            Action::Pause((streak / 8).clamp(1, 8))
+                        } else if streak.is_multiple_of(32) {
+                            st.y_cnt = st.y_cnt.saturating_add(1);
+                            st.counters.yields.store(st.y_cnt, Ordering::Relaxed);
+                            Action::Yield
+                        } else {
+                            Action::Pause(4)
+                        }
                     }
-                } else {
-                    st.s_cnt = st.s_cnt.saturating_add(1);
-                    st.counters.sleeps.store(st.s_cnt, Ordering::Relaxed);
-                    Action::SleepMs
+                    MwaitxMode::Progressive => {
+                        if streak <= 64 {
+                            Action::Pause((streak / 8).clamp(1, 8))
+                        } else if streak <= 4096 {
+                            if streak.is_multiple_of(32) {
+                                st.y_cnt = st.y_cnt.saturating_add(1);
+                                st.counters.yields.store(st.y_cnt, Ordering::Relaxed);
+                                Action::Yield
+                            } else {
+                                Action::Pause(4)
+                            }
+                        } else {
+                            st.s_cnt = st.s_cnt.saturating_add(1);
+                            st.counters.sleeps.store(st.s_cnt, Ordering::Relaxed);
+                            // Force at least one SwitchToThread yield-and-recheck before sleeping again.
+                            st.unchanged_streak = 4095;
+                            Action::SleepMs
+                        }
+                    }
                 }
             }
         }
@@ -292,37 +358,53 @@ unsafe extern "win64" fn on_mwaitx_fast() {
             }
         }
         Action::Yield => {
+            let t0 = std::time::Instant::now();
             // SAFETY: Win32 thread yield without losing monitored wakeup checks.
             unsafe {
                 SwitchToThread();
             }
+            let elapsed_us = t0.elapsed().as_micros() as u64;
             with_thread_wait(|st| {
-                if let Some(v) = (st.monitored_addr != 0)
-                    .then(|| read_monitored_u64(st, st.monitored_addr))
+                st.total_us_cnt = st.total_us_cnt.saturating_add(elapsed_us);
+                st.counters
+                    .total_us
+                    .store(st.total_us_cnt, Ordering::Relaxed);
+                if let Some(line) = (st.monitored_addr != 0)
+                    .then(|| read_monitored_line(st, st.monitored_addr))
                     .flatten()
-                    && v != st.monitored_val
+                    && line != st.monitored_line
                 {
                     st.e_cnt = st.e_cnt.saturating_add(1);
                     st.counters.early_wakes.store(st.e_cnt, Ordering::Relaxed);
-                    st.monitored_val = v;
+                    st.monitored_line = line;
                     st.unchanged_streak = 0;
                 }
             });
         }
         Action::SleepMs => {
-            // SAFETY: Bounded 1 ms wait only after 2,048 consecutive unchanged waits.
+            let t0 = std::time::Instant::now();
+            // SAFETY: Bounded 1 ms wait only after >4,096 consecutive unchanged spins.
             unsafe {
                 Sleep(1);
             }
+            let elapsed_us = t0.elapsed().as_micros() as u64;
             with_thread_wait(|st| {
-                if let Some(v) = (st.monitored_addr != 0)
-                    .then(|| read_monitored_u64(st, st.monitored_addr))
+                st.total_us_cnt = st.total_us_cnt.saturating_add(elapsed_us);
+                st.sleep_us_cnt = st.sleep_us_cnt.saturating_add(elapsed_us);
+                st.counters
+                    .total_us
+                    .store(st.total_us_cnt, Ordering::Relaxed);
+                st.counters
+                    .sleep_us
+                    .store(st.sleep_us_cnt, Ordering::Relaxed);
+                if let Some(line) = (st.monitored_addr != 0)
+                    .then(|| read_monitored_line(st, st.monitored_addr))
                     .flatten()
-                    && v != st.monitored_val
+                    && line != st.monitored_line
                 {
                     st.e_cnt = st.e_cnt.saturating_add(1);
                     st.counters.early_wakes.store(st.e_cnt, Ordering::Relaxed);
-                    st.monitored_val = v;
+                    st.monitored_line = line;
                     st.unchanged_streak = 0;
                 }
             });
@@ -368,6 +450,8 @@ pub fn console_insn_stats() -> ConsoleInsnStats {
     let mut wait_yields = 0u64;
     let mut wait_sleeps = 0u64;
     let mut wait_early_wakes = 0u64;
+    let mut wait_total_us = 0u64;
+    let mut wait_sleep_us = 0u64;
     if let Ok(slabs) = SLABS.try_lock() {
         for s in slabs.iter() {
             // SAFETY: `s.data_page` is a leaked `PAGE_READWRITE` page holding `SlabData`.
@@ -385,6 +469,8 @@ pub fn console_insn_stats() -> ConsoleInsnStats {
             wait_yields += w.yields.load(Ordering::Relaxed);
             wait_sleeps += w.sleeps.load(Ordering::Relaxed);
             wait_early_wakes += w.early_wakes.load(Ordering::Relaxed);
+            wait_total_us += w.total_us.load(Ordering::Relaxed);
+            wait_sleep_us += w.sleep_us.load(Ordering::Relaxed);
         }
     }
     ConsoleInsnStats {
@@ -409,6 +495,8 @@ pub fn console_insn_stats() -> ConsoleInsnStats {
         wait_yields,
         wait_sleeps,
         wait_early_wakes,
+        wait_total_us,
+        wait_sleep_us,
         wait_on_address_calls: 0,
     }
 }
@@ -1460,8 +1548,12 @@ mod tests {
         while !ready.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        // Let worker enter yield + sleep backoff tiers cleanly, then signal wakeup.
+        // Let worker enter yield + sleep backoff tiers cleanly, then signal an intermediate
+        // wakeup (`0 -> 1`) followed by the terminal signal (`1 -> 42`) so early-wake
+        // detection is observed deterministically regardless of timer-tick phase alignment.
         std::thread::sleep(std::time::Duration::from_millis(25));
+        flag.store(1, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let wake_t0 = std::time::Instant::now();
         flag.store(42, Ordering::Release);
         let (seen, spins) = worker.join().expect("worker joined");
@@ -1475,8 +1567,82 @@ mod tests {
         assert!(spins > 100);
 
         let after = console_insn_stats();
-        assert!(after.wait_yields > before.wait_yields);
-        assert!(after.wait_early_wakes > before.wait_early_wakes);
+        assert!(
+            after.wait_yields > before.wait_yields,
+            "yields did not advance: before={} after={} spins={spins}",
+            before.wait_yields,
+            after.wait_yields
+        );
+        assert!(
+            after.wait_early_wakes > before.wait_early_wakes,
+            "early_wakes did not advance: before={} after={} yields={} sleeps={} mwaitx={} spins={spins}",
+            before.wait_early_wakes,
+            after.wait_early_wakes,
+            after.wait_yields - before.wait_yields,
+            after.wait_sleeps - before.wait_sleeps,
+            after.fast_mwaitx_calls - before.fast_mwaitx_calls,
+        );
         assert_eq!(after.emu_total, before.emu_total);
+    }
+
+    #[test]
+    fn mwaitx_monitors_64b_cache_line_and_caches_eight_pages() {
+        #[repr(C, align(64))]
+        struct Line([AtomicU64; 8]);
+        let line = Line(std::array::from_fn(|_| AtomicU64::new(0)));
+        let base_addr = (&line.0[0] as *const AtomicU64) as usize;
+
+        // SAFETY: `base_addr` points to a valid aligned 64-byte stack struct.
+        unsafe {
+            on_monitorx_fast(base_addr);
+            // One unchanged poll sets unchanged_streak = 1 without waking early.
+            on_mwaitx_fast();
+        }
+        // Writing to +32 bytes (word 4) on the same 64B cache line must trigger early wake.
+        line.0[4].store(0xDEAD_BEEF, Ordering::Release);
+        let before = console_insn_stats();
+        unsafe {
+            on_mwaitx_fast();
+        }
+        let after = console_insn_stats();
+        assert_eq!(
+            after.wait_early_wakes,
+            before.wait_early_wakes + 1,
+            "neighboring word in 64B cache line must trigger immediate early wake"
+        );
+
+        // Allocate 6 separate 4 KiB pages and confirm repeated checks hit the 8-entry cache
+        // with zero additional VirtualQuery syscalls after initial warm-up.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                6 * PAGE_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!mem.is_null());
+        with_thread_wait(|st| {
+            for p in 0..6 {
+                assert!(is_readable_line_addr(st, (mem as usize) + p * PAGE_SIZE));
+            }
+            let after_warm = st.virtual_query_calls;
+            for _ in 0..1000 {
+                for p in 0..6 {
+                    assert!(is_readable_line_addr(st, (mem as usize) + p * PAGE_SIZE));
+                }
+            }
+            assert_eq!(
+                st.virtual_query_calls, after_warm,
+                "8-entry page cache must avoid VirtualQuery thrashing across <=8 alternating pages"
+            );
+        });
+        unsafe {
+            let _ = windows_sys::Win32::System::Memory::VirtualFree(
+                mem,
+                0,
+                windows_sys::Win32::System::Memory::MEM_RELEASE,
+            );
+        }
     }
 }
