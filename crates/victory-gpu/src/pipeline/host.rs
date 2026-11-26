@@ -658,7 +658,11 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let wave_lanes = stages
+                        .first()
+                        .and_then(|(shader, _)| shader.translated())
+                        .and_then(|translated| compute_wave_lanes(&translated.host.dxil));
+                    tracing::warn!(error = %e, ?shaders, ?wave_lanes, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -911,6 +915,39 @@ impl HostPipeline {
             },
         })
     }
+}
+
+fn compute_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
+    use victory_shader::{Container, FourCC};
+    let container = Container::parse(dxil).ok()?;
+    let psv = container.part(FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    let min = u32::from_le_bytes(info.get(16..20)?.try_into().ok()?);
+    let max = u32::from_le_bytes(info.get(20..24)?.try_into().ok()?);
+    (min != 0 && min <= max).then_some((min, max))
+}
+
+#[cfg(test)]
+#[test]
+fn compute_wave_lanes_respects_psv_runtime_info_bounds() {
+    let mut dxil = [0; 72];
+    dxil[..4].copy_from_slice(b"DXBC");
+    dxil[24..28].copy_from_slice(&72u32.to_le_bytes());
+    dxil[28..32].copy_from_slice(&1u32.to_le_bytes());
+    dxil[32..36].copy_from_slice(&36u32.to_le_bytes());
+    dxil[36..40].copy_from_slice(b"PSV0");
+    dxil[40..44].copy_from_slice(&28u32.to_le_bytes());
+    dxil[44..48].copy_from_slice(&24u32.to_le_bytes());
+    dxil[64..68].copy_from_slice(&64u32.to_le_bytes());
+    dxil[68..72].copy_from_slice(&64u32.to_le_bytes());
+    assert_eq!(compute_wave_lanes(&dxil), Some((64, 64)));
+    dxil[44..48].copy_from_slice(&20u32.to_le_bytes());
+    assert_eq!(compute_wave_lanes(&dxil), None);
+    dxil[44..48].copy_from_slice(&24u32.to_le_bytes());
+    dxil[64..68].fill(0);
+    dxil[68..72].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(compute_wave_lanes(&dxil), None);
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.
@@ -1303,7 +1340,10 @@ mod tests {
                 &single_color_target(format).describe(),
             )
         };
-        assert_ne!(key(DXGI_FORMAT_R10G10B10A2_UNORM), key(DXGI_FORMAT_R11G11B10_FLOAT));
+        assert_ne!(
+            key(DXGI_FORMAT_R10G10B10A2_UNORM),
+            key(DXGI_FORMAT_R11G11B10_FLOAT)
+        );
     }
 
     /// The two typed color formats observed in #44, with our own shaders.
@@ -1324,8 +1364,12 @@ mod tests {
         let [(name24, desc24), (name26, desc26)] =
             [DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R11G11B10_FLOAT].map(|format| {
                 let state = single_color_target(format);
-                let key =
-                    super::super::library::name("graphics", &root_bytes, &[&vs, &ps], &state.describe());
+                let key = super::super::library::name(
+                    "graphics",
+                    &root_bytes,
+                    &[&vs, &ps],
+                    &state.describe(),
+                );
                 let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                     // SAFETY: borrowed COM pointer; root outlives both descriptors.
                     pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1352,9 +1396,12 @@ mod tests {
             for (name, desc) in [(&name24, &desc24), (&name26, &desc26)] {
                 // SAFETY: valid descriptor, live root signature and shaders, null-terminated name.
                 unsafe {
-                    let pso: ID3D12PipelineState =
-                        device.CreateGraphicsPipelineState(desc).expect("create PSO");
-                    library.StorePipeline(PCWSTR(name.as_ptr()), &pso).expect("store PSO");
+                    let pso: ID3D12PipelineState = device
+                        .CreateGraphicsPipelineState(desc)
+                        .expect("create PSO");
+                    library
+                        .StorePipeline(PCWSTR(name.as_ptr()), &pso)
+                        .expect("store PSO");
                 }
             }
             // SAFETY: a private library and a buffer of the requested size.
