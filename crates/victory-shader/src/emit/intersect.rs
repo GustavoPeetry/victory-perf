@@ -50,6 +50,11 @@ enum NodeAt {
     Memory { handle: V, byte: V, low: V, high: V },
 }
 
+#[derive(Clone, Copy)]
+enum SortMode {
+    Static(bool),
+    Dynamic(V),
+}
 /// The ray operands, as floats.
 struct Ray {
     extent: V,
@@ -104,9 +109,9 @@ impl<'a> Lower<'a> {
             .map(|n| n.1)
             .ok_or("an untracked ray-tracing structure")?;
         let (sort, barycentrics) = match nodes {
-            BvhNodes::Resource => (true, true),
+            BvhNodes::Resource => (Some(true), true),
             BvhNodes::Memory { word1, word3 } => (
-                word1 & bvh::BOX_SORT != 0,
+                word1.map(|w| w & bvh::BOX_SORT != 0),
                 word3 & bvh::RETURN_BARYCENTRICS != 0,
             ),
         };
@@ -134,7 +139,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
-        let at = match nodes {
+        let (at, sort_mode) = match nodes {
             BvhNodes::Resource => {
                 let src = self
                     .descriptors
@@ -146,7 +151,10 @@ impl<'a> Lower<'a> {
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
-                NodeAt::Buffer { handle, byte }
+                (
+                    NodeAt::Buffer { handle, byte },
+                    SortMode::Static(sort.unwrap_or(true)),
+                )
             }
             BvhNodes::Memory { .. } => {
                 let Operand::Scalar { code, .. } = *rsrc else {
@@ -159,17 +167,29 @@ impl<'a> Lower<'a> {
                         .ok_or("an unread operand")?;
                     *w = self.i32_of(v)?;
                 }
+                let sort_mode = match sort {
+                    Some(b) => SortMode::Static(b),
+                    None => {
+                        let flag = self.s.m.i32(bvh::BOX_SORT);
+                        let masked = self.s.m.bin(c, Bin::And, words[1], flag);
+                        let z = self.s.m.i32(0);
+                        SortMode::Dynamic(self.s.m.cmp(c, pred::NE, masked, z))
+                    }
+                };
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
                 let (handle, byte) = self.bvh_memory(low, high, guard);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                }
+                (
+                    NodeAt::Memory {
+                        handle,
+                        byte,
+                        low,
+                        high,
+                    },
+                    sort_mode,
+                )
             }
         };
         let zero = self.s.m.i32(0);
@@ -189,7 +209,7 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = self.bvh_boxes(at, kind, &ray, sort_mode);
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
@@ -315,7 +335,7 @@ impl<'a> Lower<'a> {
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
-    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: SortMode) -> [V; 4] {
         let head = self.cur;
         let children = self.bvh_node_words(at, None, 0, 4);
         let k5 = self.s.m.i32(5);
@@ -406,7 +426,8 @@ impl<'a> Lower<'a> {
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
-        if sort {
+        let unsorted = ids;
+        if !matches!(sort, SortMode::Static(false)) {
             for (a, b) in [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)] {
                 let swap = self.s.m.cmp(c, pred::OLT, distances[b], distances[a]);
                 let (da, db) = (distances[a], distances[b]);
@@ -415,6 +436,11 @@ impl<'a> Lower<'a> {
                 let (ia, ib) = (ids[a], ids[b]);
                 ids[a] = self.s.m.select(c, swap, ib, ia);
                 ids[b] = self.s.m.select(c, swap, ia, ib);
+            }
+        }
+        if let SortMode::Dynamic(bit) = sort {
+            for k in 0..4 {
+                ids[k] = self.s.m.select(c, bit, ids[k], unsorted[k]);
             }
         }
         ids

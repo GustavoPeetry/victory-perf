@@ -153,6 +153,48 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     .map_err(|e| e.to_string())
 }
 
+/// `VICTORY_REA003_AMBIENT_NATIVE=1` (OFF by default): bypasses `VICTORY_AMBIENT_STUB`
+/// and runs the native diffuse-GI temporal resolve compute shader, falling back
+/// automatically to the ambient stand-in only if native translation fails.
+pub fn rea003_ambient_native() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_REA003_AMBIENT_NATIVE")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+    })
+}
+
+/// `VICTORY_REA003_SHADOWMASK_NATIVE=1` (OFF by default): bypasses `VICTORY_SHADOWMASK_STUB`
+/// and runs native `rtdirectionalshadows` compute shaders, falling back automatically
+/// to the shadow-mask stand-in only if native translation fails.
+pub fn rea003_shadowmask_native() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_REA003_SHADOWMASK_NATIVE")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+    })
+}
+
+#[cfg(any(windows, test))]
+fn hash_prefix_16(container: &[u8]) -> String {
+    blake3::hash(container).to_hex()[..16].to_owned()
+}
+
+#[cfg(any(windows, test))]
+fn should_bypass_stand_in(hash: &str, ambient_native: bool, shadowmask_native: bool) -> bool {
+    use victory_shader::emit::stand_in as s;
+    (ambient_native && s::AMBIENT_HASHES.contains(&hash))
+        || (shadowmask_native && s::SHADOWMASK_HASHES.contains(&hash))
+}
+
 /// Origin of a host shader container translation.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +207,10 @@ pub(crate) enum ShaderOrigin {
 /// it resolved from disk cache (`true`) plus native vs. stand-in provenance.
 #[cfg(windows)]
 fn host_shader_cached_inner(container: &[u8]) -> Result<(HostShader, bool, ShaderOrigin), String> {
-    if let Some((s, kind)) = stand_in_with_origin(container) {
+    let hash = hash_prefix_16(container);
+    let bypass_stand_in =
+        should_bypass_stand_in(&hash, rea003_ambient_native(), rea003_shadowmask_native());
+    if !bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container) {
         return Ok((s, false, ShaderOrigin::StandIn(kind)));
     }
     let translate = |c: &[u8]| {
@@ -188,15 +233,25 @@ fn host_shader_cached_inner(container: &[u8]) -> Result<(HostShader, bool, Shade
     };
     match r {
         Ok((shader, from_cache)) => Ok((shader, from_cache, ShaderOrigin::Native)),
-        Err(e) => exposure_stub(container)
-            .map(|s| {
-                (
-                    s,
-                    false,
-                    ShaderOrigin::StandIn(crate::render_graph::StandInKind::Exposure),
-                )
-            })
-            .ok_or(e),
+        Err(e) => {
+            if bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container) {
+                tracing::warn!(
+                    %hash,
+                    error = %e,
+                    "REA-003 native pass restoration failed translation; falling back safely to stand-in"
+                );
+                return Ok((s, false, ShaderOrigin::StandIn(kind)));
+            }
+            exposure_stub(container)
+                .map(|s| {
+                    (
+                        s,
+                        false,
+                        ShaderOrigin::StandIn(crate::render_graph::StandInKind::Exposure),
+                    )
+                })
+                .ok_or(e)
+        }
     }
 }
 
@@ -664,5 +719,23 @@ mod tests {
             );
         }
         assert!(!wave_wide_listed("0000000000000000"));
+    }
+
+    #[test]
+    fn rea003_native_flags_gate_stand_in_bypass_and_hash_prefix() {
+        assert_eq!(hash_prefix_16(b"victory-rea003").len(), 16);
+        let ambient = "34fb51b8a0312e82";
+        let shadowmask = "a1b20bc47e3c9597";
+        let unrelated = "0000000000000000";
+
+        assert!(!should_bypass_stand_in(ambient, false, false));
+        assert!(should_bypass_stand_in(ambient, true, false));
+        assert!(!should_bypass_stand_in(ambient, false, true));
+
+        assert!(!should_bypass_stand_in(shadowmask, false, false));
+        assert!(!should_bypass_stand_in(shadowmask, true, false));
+        assert!(should_bypass_stand_in(shadowmask, false, true));
+
+        assert!(!should_bypass_stand_in(unrelated, true, true));
     }
 }

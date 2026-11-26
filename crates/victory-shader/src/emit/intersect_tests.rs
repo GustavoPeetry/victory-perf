@@ -643,7 +643,7 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         assert_eq!(
             res.bvh[0].1,
             BvhNodes::Memory {
-                word1: 0x8000_0000,
+                word1: Some(0x8000_0000),
                 word3: 0x8900_03ff
             }
         );
@@ -655,6 +655,47 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+    }
+}
+
+#[test]
+fn a_dynamic_word1_bvh_descriptor_keeps_memory_nodes_and_validates() {
+    let mut words = program(true, WHOLE);
+    let pos = words
+        .iter()
+        .position(|&w| w == 0xBE99_0B81)
+        .expect("s_brev_b32 s25, 1");
+    words.splice(pos..=pos, [0x8819_FF00, 0x8000_0000]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+    assert_eq!(res.bvh.len(), 1);
+    assert_eq!(
+        res.bvh[0].1,
+        BvhNodes::Memory {
+            word1: None,
+            word3: 0x8900_03FF,
+        }
+    );
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lowers dynamic word1 through directory");
+    assert!(lowered.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(lowered.root_uavs.contains(&super::SLOT_FAULTS));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil;
+        v.validate(&mut copy).expect("DXIL validation failed");
     }
 }
 
