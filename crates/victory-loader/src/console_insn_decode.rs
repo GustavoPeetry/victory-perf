@@ -13,6 +13,10 @@ pub enum ConsoleOnly {
     Clzero,
     /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero `[rax..reg)`
     ClzeroLoop { end_reg: u8 },
+    /// Alternate `clzero` loop (observed at `0x144e8ab4c/ab6b/ab8a/abad` in build `1.0.2.1`):
+    /// `mov rax, <cur>; add <cur>, 0x40; clzero; cmp <cur>, <end>; jb -15` (15 bytes total,
+    /// faulting at `clzero` +7 bytes into the loop).
+    ClzeroAltLoop { cur_reg: u8, end_reg: u8 },
     /// `rdpru`: ecx = 0 MPERF / 1 APERF → edx:eax (a counter)
     Rdpru,
     /// `monitorx` / `mwaitx`: a wait the emulation skips
@@ -159,6 +163,66 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
 }
 
+/// Match a 15-byte alternate `clzero` loop window starting at `mov rax, <cur_reg>`:
+/// `mov rax, cur` (3B) + `add cur, 0x40` (4B) + `clzero` (3B) + `cmp cur, end` (3B) + `jb -15` (2B).
+/// Returns `(cur_reg, end_reg)` on exact match.
+pub fn decode_alt_clzero_loop(window: &[u8]) -> Option<(u8, u8)> {
+    if window.len() < 15 {
+        return None;
+    }
+    // 1. `mov rax, cur_reg`: `[48|4C] 89 <modrm>` with mod=3, rm=0 (`rax`).
+    let rex_mov = window[0];
+    if (rex_mov != 0x48 && rex_mov != 0x4C) || window[1] != 0x89 {
+        return None;
+    }
+    let m_mov = window[2];
+    if (m_mov >> 6) != 3 || (m_mov & 7) != 0 {
+        return None;
+    }
+    let cur_reg = ((m_mov >> 3) & 7) | if (rex_mov & 4) != 0 { 8 } else { 0 };
+
+    // 2. `add cur_reg, 0x40`: `[48|49] 83 <C0+cur&7> 40`.
+    let expect_rex_add = if cur_reg >= 8 { 0x49 } else { 0x48 };
+    if window[3] != expect_rex_add
+        || window[4] != 0x83
+        || window[5] != (0xC0 | (cur_reg & 7))
+        || window[6] != 0x40
+    {
+        return None;
+    }
+
+    // 3. `clzero`: `0F 01 FC`.
+    if window[7..10] != [0x0F, 0x01, 0xFC] {
+        return None;
+    }
+
+    // 4. `cmp cur_reg, end_reg`: `48..4F 39 <modrm>` with W=1, X=0, rm=cur_reg.
+    let rex_cmp = window[10];
+    if (rex_cmp & 0xFA) != 0x48 {
+        return None;
+    }
+    if ((rex_cmp & 1) != 0) != (cur_reg >= 8) {
+        return None;
+    }
+    if window[11] != 0x39 {
+        return None;
+    }
+    let m_cmp = window[12];
+    if (m_cmp >> 6) != 3 || (m_cmp & 7) != (cur_reg & 7) {
+        return None;
+    }
+    let end_reg = ((m_cmp >> 3) & 7) | if (rex_cmp & 4) != 0 { 8 } else { 0 };
+    if cur_reg == end_reg {
+        return None;
+    }
+
+    // 5. `jb -15`: `72 F1`.
+    if window[13..15] != [0x72, 0xF1] {
+        return None;
+    }
+    Some((cur_reg, end_reg))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -229,5 +293,22 @@ mod tests {
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24]), None);
         assert_eq!(decode(&[0x0F]), None);
+    }
+
+    #[test]
+    fn decodes_alt_clzero_loops_across_all_verified_register_pairs() {
+        // Real 15-byte loop structures verified from build 1.0.2.1 (`0x144e8ab4c/ab6b/ab8a/abad`).
+        let cases: &[([u8; 15], u8, u8)] = &[
+            ([0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1], 10, 11), // r10, r11
+            ([0x4C, 0x89, 0xC8, 0x49, 0x83, 0xC1, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xD1, 0x72, 0xF1], 9, 10),  // r9, r10
+            ([0x4C, 0x89, 0xC0, 0x49, 0x83, 0xC0, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xC8, 0x72, 0xF1], 8, 9),   // r8, r9
+            ([0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4C, 0x39, 0xC2, 0x72, 0xF1], 2, 8),   // rdx, r8
+        ];
+        for &(bytes, cur, end) in cases {
+            assert_eq!(decode_alt_clzero_loop(&bytes), Some((cur, end)), "{bytes:02x?}");
+        }
+        let mut bad = cases[0].0;
+        bad[14] = 0xF4; // wrong jb displacement
+        assert_eq!(decode_alt_clzero_loop(&bad), None);
     }
 }

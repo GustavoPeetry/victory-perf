@@ -5,10 +5,8 @@
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
 //! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
 
-#[path = "console_insn_decode.rs"]
-mod decode;
-
-use decode::ConsoleOnly;
+use crate::console_insn_decode as decode;
+use crate::console_insn_decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
@@ -53,6 +51,7 @@ fn readable(va: usize, bytes: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
+    crate::fastpath::record_veh_asked(1);
     found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
@@ -82,6 +81,7 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
+    crate::fastpath::record_veh_asked(1);
     if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
         return None;
     }
@@ -125,7 +125,20 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let (what, len) = match decode::decode(code) {
+        Some((ConsoleOnly::Clzero, _)) if crate::fastpath::enabled() && rip >= 7 && readable(rip - 7, 15) => {
+            // Check 15-byte ClzeroAltLoop centered on `clzero` at `rip` (`rip-7 .. rip+8`).
+            // SAFETY: readability of `[rip-7 .. rip+8)` verified immediately above.
+            let win = unsafe { std::slice::from_raw_parts((rip - 7) as *const u8, 15) };
+            if let Some((cur_reg, end_reg)) = decode::decode_alt_clzero_loop(win) {
+                (ConsoleOnly::ClzeroAltLoop { cur_reg, end_reg }, 8)
+            } else {
+                (ConsoleOnly::Clzero, 3)
+            }
+        }
+        Some(pair) => pair,
+        None => return 0,
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -161,6 +174,40 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // SAFETY: the 64-byte line is committed and writable.
             unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
+        ConsoleOnly::ClzeroAltLoop { cur_reg, end_reg } => {
+            let regs: [u64; 16] = [
+                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8,
+                ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+            ];
+            let end = regs[end_reg as usize & 15] as usize;
+            let start = ctx.Rax as usize;
+            if end > start && end - start < 2 << 30 {
+                let mut at = start;
+                while at < end {
+                    let Some(to) = writable_to(at, end) else { break };
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+                    at = to;
+                }
+                if at == start {
+                    return 0;
+                }
+                let bytes = (at - start) as u64;
+                ZEROED.fetch_add(bytes, Relaxed);
+                crate::fastpath::record_veh_zeroed(bytes);
+                if at < end {
+                    ctx.Rax = at as u64;
+                    return CONTINUE_EXECUTION;
+                }
+            }
+            let cur_slots: [&mut u64; 16] = [
+                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp,
+                &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi, &mut ctx.R8, &mut ctx.R9,
+                &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14,
+                &mut ctx.R15,
+            ];
+            *cur_slots[cur_reg as usize & 15] = end as u64;
+            ctx.Rax = end.saturating_sub(0x40) as u64;
+        }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
             let regs: [u64; 16] = [
@@ -182,7 +229,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 if at == start {
                     return 0;
                 }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
+                let bytes = (at - start) as u64;
+                ZEROED.fetch_add(bytes, Relaxed);
+                crate::fastpath::record_veh_zeroed(bytes);
                 if at < end {
                     // What follows is not writable: the loop goes on there (the same
                     // instruction again), where the real one faults too.
@@ -236,6 +285,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     }
     ctx.Rip += len as u64;
     // How often this runs at all (each one is an exception: a trip into Windows and back).
+    crate::fastpath::record_veh_insn(&what);
     let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
     if emulated >= 1 << 16 && emulated.is_power_of_two() {
         tracing::info!(

@@ -23,7 +23,11 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
+mod console_insn_decode;
 mod crash;
+#[cfg(windows)]
+mod fastpath;
 #[cfg(windows)]
 mod hooks;
 pub mod prepare;
@@ -39,6 +43,8 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub use fastpath::{ConsoleInsnStats, PatchSummary, console_insn_stats};
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,

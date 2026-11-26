@@ -99,6 +99,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             crate::hooks::OWN_UPSCALER_ENV
         );
     }
+    if crate::fastpath::enabled() {
+        // SAFETY: image just mapped and relocated, zero title threads started yet.
+        unsafe { crate::fastpath::patch_image(loaded.base()) };
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
