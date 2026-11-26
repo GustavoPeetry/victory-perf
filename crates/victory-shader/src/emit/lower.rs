@@ -25,7 +25,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 #[path = "rea003_recovery.rs"]
-mod rea003_recovery;
+pub(super) mod rea003_recovery;
 
 type Why = &'static str;
 
@@ -955,7 +955,7 @@ fn lds_meetings(
     all: &[bool],
 ) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
-    if super::rea003_shader_recovery()
+    if super::recover_family_allowed(super::RecoveryFamily::LdsBarrier)
         && p.blocks
             .iter()
             .take(n)
@@ -1007,7 +1007,10 @@ fn lds_meetings(
             }
             if name.starts_with("ds_read") {
                 reads[r] = true;
+            } else if name.starts_with("ds_write") {
+                writes[r] = true;
             } else {
+                reads[r] = true;
                 writes[r] = true;
             }
         }
@@ -1413,11 +1416,8 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()
-                        || (super::rea003_shader_recovery()
-                            && n == "v_cndmask_b32"
-                            && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
-                                if code != NULL && i.read(Reg::S(code)).is_some_and(|m| !x.st.masks.contains_key(&m)))))
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || rea003_recovery::is_const_mask_cndmask(x.st, i)
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
@@ -1444,6 +1444,7 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
+                        || rea003_recovery::is_const_mask_cndmask(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -7639,7 +7640,10 @@ impl<'a> Lower<'a> {
                         // Each host wave taken as a wave of its own normally refuses
                         // constant lane masks; under `VICTORY_REA003_SHADER_RECOVERY=1`,
                         // evaluate each thread's bit against its assigned console lane.
-                        if self.local && !super::rea003_shader_recovery() {
+                        if self.local
+                            && (!super::recover_family_allowed(super::RecoveryFamily::ConstMask)
+                                || self.exchange.is_none())
+                        {
                             return Err("a constant lane mask in a half-wave");
                         }
                         let m = mask.ok_or(UNTRACKED)?;
@@ -7804,8 +7808,13 @@ impl<'a> Lower<'a> {
                 let alike = match v.src.first() {
                     Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)).is_some_and(|x| {
                         self.uniform.contains(&x)
-                            || (super::rea003_shader_recovery()
-                                && rea003_recovery::is_wave_uniform_val(self.x.p, self.x.st, x))
+                            || (super::recover_family_allowed(super::RecoveryFamily::Readfirstlane)
+                                && rea003_recovery::is_wave_uniform_val(
+                                    self.x.p,
+                                    self.x.st,
+                                    self.exchange.as_ref().map(|e| e.2.as_slice()),
+                                    x,
+                                ))
                     }),
                     _ => true,
                 };

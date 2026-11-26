@@ -205,6 +205,10 @@ pub fn rea003_shader_opt() -> bool {
 }
 
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.get() {
+        return passes;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| {
         parse_shader_opt_with_rea003(
@@ -214,10 +218,128 @@ pub fn shader_opt() -> u32 {
     })
 }
 
+/// Selective recovery families gated by `VICTORY_REA003_SHADER_RECOVERY=1`
+/// and `VICTORY_REA003_SHADER_RECOVERY_ALLOW` / `_DENY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryFamily {
+    BufMeta,
+    ImgMeta,
+    Readfirstlane,
+    ConstMask,
+    LdsBarrier,
+    SingleWave64,
+}
+
+impl RecoveryFamily {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::BufMeta => "buf_meta",
+            Self::ImgMeta => "img_meta",
+            Self::Readfirstlane => "readfirstlane",
+            Self::ConstMask => "const_mask",
+            Self::LdsBarrier => "lds_barrier",
+            Self::SingleWave64 => "single_wave64",
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's override for [`rea003_shader_recovery`], scoped to the current thread.
     static TEST_REA003_SHADER_RECOVERY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_RECOVERY_ALLOW: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static TEST_RECOVERY_DENY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_token_list(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn env_token_list(var: &str) -> Option<Vec<String>> {
+    std::env::var(var)
+        .ok()
+        .map(|s| parse_token_list(&s))
+        .filter(|v| !v.is_empty())
+}
+
+fn hash_matches_token(hash: &str, token: &str) -> bool {
+    token.len() >= 6
+        && token.chars().all(|c| c.is_ascii_hexdigit())
+        && (hash.starts_with(token) || token.starts_with(hash))
+}
+
+pub(super) fn recover_family_allowed(family: RecoveryFamily) -> bool {
+    if !rea003_shader_recovery() {
+        return false;
+    }
+    let current_hash = CURRENT_SHADER_HASH.with(|h| h.borrow().clone());
+    let deny_tokens: Vec<String> = {
+        #[cfg(test)]
+        if let Some(raw) = TEST_RECOVERY_DENY.with(|d| d.borrow().clone()) {
+            parse_token_list(&raw)
+        } else {
+            static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            DENY.get_or_init(|| {
+                env_token_list("VICTORY_REA003_SHADER_RECOVERY_DENY").unwrap_or_default()
+            })
+            .clone()
+        }
+        #[cfg(not(test))]
+        {
+            static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            DENY.get_or_init(|| {
+                env_token_list("VICTORY_REA003_SHADER_RECOVERY_DENY").unwrap_or_default()
+            })
+            .clone()
+        }
+    };
+    let tok = family.token();
+    if deny_tokens.iter().any(|t| {
+        t == "all"
+            || t == tok
+            || current_hash
+                .as_deref()
+                .is_some_and(|h| hash_matches_token(h, t))
+    }) {
+        return false;
+    }
+
+    let allow_override: Option<Vec<String>> = {
+        #[cfg(test)]
+        if let Some(raw) = TEST_RECOVERY_ALLOW.with(|a| a.borrow().clone()) {
+            Some(parse_token_list(&raw))
+        } else {
+            static ALLOW: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+            ALLOW
+                .get_or_init(|| env_token_list("VICTORY_REA003_SHADER_RECOVERY_ALLOW"))
+                .clone()
+        }
+        #[cfg(not(test))]
+        {
+            static ALLOW: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+            ALLOW
+                .get_or_init(|| env_token_list("VICTORY_REA003_SHADER_RECOVERY_ALLOW"))
+                .clone()
+        }
+    };
+
+    match allow_override {
+        Some(tokens) => tokens.iter().any(|t| {
+            t == "all"
+                || t == tok
+                || current_hash
+                    .as_deref()
+                    .is_some_and(|h| hash_matches_token(h, t))
+        }),
+        None => matches!(
+            family,
+            RecoveryFamily::BufMeta | RecoveryFamily::Readfirstlane | RecoveryFamily::ConstMask
+        ),
+    }
 }
 
 /// `VICTORY_REA003_SHADER_RECOVERY=1` (OFF by default): enables selective
@@ -241,6 +363,32 @@ pub(super) fn with_rea003_shader_recovery<R>(on: bool, f: impl FnOnce() -> R) ->
     let was = TEST_REA003_SHADER_RECOVERY.replace(Some(on));
     let r = f();
     TEST_REA003_SHADER_RECOVERY.set(was);
+    r
+}
+
+#[cfg(test)]
+pub(super) fn with_rea003_recovery_lists<R>(
+    allow: Option<&str>,
+    deny: Option<&str>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let prev_allow = TEST_RECOVERY_ALLOW.with(|a| a.replace(allow.map(str::to_owned)));
+    let prev_deny = TEST_RECOVERY_DENY.with(|d| d.replace(deny.map(str::to_owned)));
+    let r = f();
+    TEST_RECOVERY_ALLOW.with(|a| {
+        let _ = a.replace(prev_allow);
+    });
+    TEST_RECOVERY_DENY.with(|d| {
+        let _ = d.replace(prev_deny);
+    });
+    r
+}
+
+#[cfg(test)]
+pub(super) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    let prev = TEST_SHADER_OPT.replace(Some(passes));
+    let r = f();
+    TEST_SHADER_OPT.set(prev);
     r
 }
 
@@ -507,6 +655,8 @@ pub fn translate_linked(
 thread_local! {
     /// Thread-local override for [`with_wave_wide`].
     static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Thread-local current shader hash prefix (lowercase hex) for [`with_shader_hash`].
+    static CURRENT_SHADER_HASH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Runs `f` with the wave-wide lowering of wave64 compute programs on 32-lane
@@ -516,6 +666,17 @@ pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let before = WAVE_WIDE_HERE.replace(on);
     let out = f();
     WAVE_WIDE_HERE.set(before);
+    out
+}
+
+/// Runs `f` with `hash_prefix` recorded as the active shader hash on the calling
+/// thread for selective `VICTORY_REA003_SHADER_RECOVERY_ALLOW` / `_DENY` matching.
+pub fn with_shader_hash<R>(hash_prefix: &str, f: impl FnOnce() -> R) -> R {
+    let before = CURRENT_SHADER_HASH.with(|h| h.replace(Some(hash_prefix.to_ascii_lowercase())));
+    let out = f();
+    CURRENT_SHADER_HASH.with(|h| {
+        let _ = h.replace(before);
+    });
     out
 }
 
@@ -637,11 +798,11 @@ fn emit_pruned(
             native.io,
             crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64
         );
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
-            || WAVE_WIDE_HERE.get()
-            || (rea003_shader_recovery()
-                && single_wave_64
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0"));
+        let explicit_wide_off = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "0");
+        let wide_on = !explicit_wide_off
+            && (std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+                || WAVE_WIDE_HERE.get()
+                || (single_wave_64 && recover_family_allowed(RecoveryFamily::SingleWave64)));
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

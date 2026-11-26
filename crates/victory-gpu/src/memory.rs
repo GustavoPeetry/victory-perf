@@ -44,7 +44,7 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
@@ -74,7 +74,12 @@ struct Memory {
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
-    refused: std::collections::HashSet<u64>,
+    refused: HashSet<u64>,
+    /// Directory updates staged until view heaps are populated and in-flight
+    /// relay submissions settle: `(page, slot_1_based, byte_offset)`.
+    pending_dir: Vec<(u64, u32, u32)>,
+    /// Pages already queued in `pending_dir`.
+    pending_pages: HashSet<u64>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -110,7 +115,9 @@ impl Memory {
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
-            refused: Default::default(),
+            refused: HashSet::new(),
+            pending_dir: Vec::new(),
+            pending_pages: HashSet::new(),
         })
     }
 
@@ -125,7 +132,7 @@ impl Memory {
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
+        if unsafe { entry.read() } != 0 || self.pending_pages.contains(&page) {
             return;
         }
         let start = page * PAGE;
@@ -164,14 +171,13 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                    let other_page = at / PAGE;
                     // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
-                            other.write_volatile(n as u32 + 1);
-                        }
+                    let other = unsafe { self.directory.1.add(other_page as usize * 2) };
+                    // SAFETY: as above; queued for ordered publish after view heaps populate.
+                    if unsafe { other.read() } == 0 && self.pending_pages.insert(other_page) {
+                        self.pending_dir
+                            .push((other_page, n as u32 + 1, (at - first) as u32));
                     }
                     at += PAGE;
                 }
@@ -186,11 +192,8 @@ impl Memory {
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
-        // The offset first: a shader that sees the number sees it too.
-        // SAFETY: inside the directory's mapping.
-        unsafe {
-            entry.add(1).write_volatile(offset as u32);
-            entry.write_volatile(n as u32 + 1);
+        if self.pending_pages.insert(page) {
+            self.pending_dir.push((page, n as u32 + 1, offset as u32));
         }
     }
 
@@ -231,6 +234,48 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+}
+
+/// Total descriptor slots reserved per view heap (`slot 0` null + `COPIES` copies = `1024`).
+const HEAP_RUN_SLOTS: u32 = COPIES + 1;
+
+/// Publishes directory updates in strict GPU visibility order: byte offset first,
+/// release memory fence, and 1-based copy slot index last.
+///
+/// # Safety
+/// `dir` must point to at least `(max_page + 1) * 2` writable `u32` elements.
+unsafe fn publish_directory_entries(dir: *mut u32, entries: &[(u64, u32, u32)]) {
+    for &(page, slot, offset) in entries {
+        // SAFETY: caller guarantees `page * 2 + 1` is in bounds of `dir`.
+        let entry = unsafe { dir.add(page as usize * 2) };
+        // SAFETY: write offset before publishing the non-zero slot index.
+        unsafe { entry.add(1).write_volatile(offset) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        // SAFETY: as above.
+        unsafe { entry.write_volatile(slot) };
+    }
+}
+
+fn populate_heap_views(m: &mut Memory, heap: &HostHeap, key: usize) -> Option<u32> {
+    let (base, made) = match m.heaps.get(&key) {
+        Some(&run) => run,
+        None => {
+            // Held for the heap's life: not given back with a list's slots.
+            // Initialize every slot (`0..=COPIES`, 1024 total) to a valid null
+            // descriptor so out-of-order or newly published slots never deref junk.
+            let base = heap.dynamic(HEAP_RUN_SLOTS)?;
+            for i in 0..HEAP_RUN_SLOTS {
+                heap.null_raw_uav_at(base + i);
+            }
+            (base, 0)
+        }
+    };
+    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+        let (_, len) = shadow.span();
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    }
+    m.heaps.insert(key, (base, m.copies.len() as u32));
+    Some(base)
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -276,20 +321,34 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
+    // Populate all new descriptor slots on the active view heap BEFORE making
+    // new directory pages visible to GPU shaders.
+    let mut base = populate_heap_views(m, heap, key)?;
+    let need_settle = !m.pending_dir.is_empty()
+        && (crate::shadow::relay() || crate::host::late())
+        && crate::host::started_submission() > crate::host::finished_submission();
+    if need_settle {
+        // Release `MEMORY` before settling in-flight relay submissions so no
+        // lock inversion can happen with host queue/fence waits.
+        drop(guard);
+        crate::host::settle_for_fence();
+        guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let m = guard.as_mut()?;
+        base = populate_heap_views(m, heap, key)?;
+        if !m.pending_dir.is_empty() {
+            let pending = std::mem::take(&mut m.pending_dir);
+            m.pending_pages.clear();
+            // SAFETY: directory indices are < `MEMORY_PAGES - 1`, heap views populated,
+            // and in-flight relay GPU submissions settled before directory publish.
+            unsafe { publish_directory_entries(m.directory.1, &pending) };
         }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    } else if !m.pending_dir.is_empty() {
+        let pending = std::mem::take(&mut m.pending_dir);
+        m.pending_pages.clear();
+        // SAFETY: directory indices are < `MEMORY_PAGES - 1` and heap views are populated.
+        unsafe { publish_directory_entries(m.directory.1, &pending) };
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let m = guard.as_ref()?;
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -316,4 +375,27 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heap_run_initializes_1024_slots_and_publishes_offset_before_slot() {
+        assert_eq!(HEAP_RUN_SLOTS, 1024);
+        assert_eq!(COPIES + 1, HEAP_RUN_SLOTS);
+
+        let mut dir = vec![0u32; 16];
+        let entries = [(1u64, 5u32, 0x1000u32), (3u64, 7u32, 0x2_0000u32)];
+        // SAFETY: `dir` holds 8 page pairs (16 dwords); max page index is 3.
+        unsafe { publish_directory_entries(dir.as_mut_ptr(), &entries) };
+
+        assert_eq!(dir[0], 0);
+        assert_eq!(dir[1], 0);
+        assert_eq!(dir[2], 5);
+        assert_eq!(dir[3], 0x1000);
+        assert_eq!(dir[6], 7);
+        assert_eq!(dir[7], 0x2_0000);
+    }
 }

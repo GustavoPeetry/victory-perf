@@ -2576,6 +2576,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        self.record_breadcrumb(list, crate::breadcrumbs::OpKind::Dispatch, [x, y, z]);
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -2599,6 +2600,33 @@ impl State {
         list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         record_exec(self.pipeline, false);
+    }
+
+    fn record_breadcrumb(
+        &self,
+        list: &HostList,
+        op_kind: crate::breadcrumbs::OpKind,
+        dispatch_dims: [u32; 3],
+    ) {
+        if !crate::breadcrumbs::enabled() {
+            return;
+        }
+        let bound_resources_count = self.compute.iter().chain(self.graphics.iter()).count() as u32;
+        crate::breadcrumbs::record_op(crate::breadcrumbs::GpuOpBreadcrumb {
+            seq: 0,
+            frame: crate::frame::current(),
+            queue: crate::breadcrumbs::QueueKind::Direct,
+            cmd_list_ptr: windows::core::Interface::as_raw(&list.list) as usize,
+            submission_id: 0,
+            fence_value: u64::MAX,
+            op_kind,
+            pipeline_hash: self.pipeline as u64,
+            shader_hashes: crate::pipeline::shader_hash_ids(self.pipeline as This),
+            dispatch_dims,
+            root_sig_hash: self.host_roots[0].max(self.host_roots[1]) as u64,
+            bound_resources_count,
+            resource_state_mask: self.depth_state,
+        });
     }
 
     /// `VICTORY_BARRIER_MERGE`: marks unordered writes pending on `list` if
@@ -2943,6 +2971,11 @@ impl State {
         let (step, count, at) = run.call();
         // Held only with a signature for the step (`execute_indirect`).
         if let Some(signature) = host_signature(run.first.kind, step) {
+            self.record_breadcrumb(
+                list,
+                crate::breadcrumbs::OpKind::ExecuteIndirect,
+                [count, step, run.first.kind],
+            );
             // SAFETY: an open list with everything set when the run started
             // and nothing recorded or set since; the scratch buffer is the
             // list's and holds the window clamped in `INDIRECT_ARGUMENT`.
@@ -2998,6 +3031,11 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    self.record_breadcrumb(
+                        list,
+                        crate::breadcrumbs::OpKind::DispatchMesh,
+                        [x, 1, 1],
+                    );
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
@@ -3408,6 +3446,11 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            self.record_breadcrumb(
+                list,
+                crate::breadcrumbs::OpKind::Draw,
+                [count, instances, 1],
+            );
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3514,6 +3557,11 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            self.record_breadcrumb(
+                list,
+                crate::breadcrumbs::OpKind::DrawIndexed,
+                [indices, instances, 1],
+            );
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list

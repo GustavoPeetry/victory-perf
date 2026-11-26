@@ -633,8 +633,8 @@ fn record_clamp_waits(
 
 /// Opt-in REA-003 GPU-driven indirect path (`VICTORY_REA003_GPU_DRIVEN=1`, off by default).
 ///
-/// When enabled (and `VICTORY_HOIST_CLAMPS` is unset), selects hoist mode `2`
-/// (hoisted advance clamp list paired with scoped shader-write barrier order).
+/// Keeps hoist mode `7` (scoped per-clamp barrier ordering) when enabled so
+/// mesh draws and budget counters never regress to mode `2`'s global barriers.
 pub fn rea003_gpu_driven() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -673,10 +673,8 @@ pub(crate) fn note_indirect_dispatch() {
     GPU_DRIVEN_INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn hoist_mode_for(explicit: Option<&str>, gpu_driven: bool) -> u8 {
-    explicit
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(if gpu_driven { 2 } else { 7 })
+fn hoist_mode_for(explicit: Option<&str>, _gpu_driven: bool) -> u8 {
+    explicit.and_then(|v| v.trim().parse().ok()).unwrap_or(7)
 }
 
 /// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
@@ -2917,7 +2915,7 @@ void work() {
         use super::{gpu_driven_stats, hoist_mode_for, note_indirect_dispatch, rea003_gpu_driven};
         assert!(!rea003_gpu_driven());
         assert_eq!(hoist_mode_for(None, false), 7);
-        assert_eq!(hoist_mode_for(None, true), 2);
+        assert_eq!(hoist_mode_for(None, true), 7);
         assert_eq!(hoist_mode_for(Some("0"), true), 0);
         assert_eq!(hoist_mode_for(Some("5"), false), 5);
         let before = gpu_driven_stats().indirect_dispatches;

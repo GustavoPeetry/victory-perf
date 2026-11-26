@@ -51,10 +51,70 @@ pub(crate) fn telemetry() -> [u64; 4] {
     ]
 }
 
+fn build_key_from<F>(limit: u32, caps_ids: Option<(u32, u32)>, env_lookup: F) -> [u8; 32]
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let mut hash = blake3::Hasher::new();
+    for source in victory_shader::sources()
+        .iter()
+        .copied()
+        .chain([include_str!("shader_cache.rs")])
+    {
+        hash.update(&(source.len() as u64).to_le_bytes());
+        hash.update(source.as_bytes());
+    }
+    hash.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hash.update(&[u8::from(cfg!(feature = "diagnostics"))]);
+    for n in [
+        limit,
+        victory_shader::emit::view_heap_limit(),
+        victory_shader::emit::host_max_wave(),
+        // Which group barriers wait is part of the translation too.
+        u32::from(victory_shader::emit::group_sync()),
+        // And which clean-up passes ran over the translated code.
+        victory_shader::emit::shader_opt(),
+    ] {
+        hash.update(&n.to_le_bytes());
+    }
+    if let Some((vendor_id, device_id)) = caps_ids {
+        hash.update(&vendor_id.to_le_bytes());
+        hash.update(&device_id.to_le_bytes());
+    }
+    // So are the switches that pick the form of a wave64 program and
+    // selective recovery/opt policies: without them here a run was served
+    // stale translations cached under different knobs or adapters.
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_WIDE_ONLY",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_WAVE_LOCAL",
+        "VICTORY_FIRSTLANE_OWN",
+        "VICTORY_F16_NEAREST",
+        "VICTORY_REA003_SHADER_RECOVERY",
+        "VICTORY_REA003_SHADER_RECOVERY_ALLOW",
+        "VICTORY_REA003_SHADER_RECOVERY_DENY",
+        "VICTORY_REA003_SHADER_OPT",
+        "VICTORY_REA003_AMBIENT_NATIVE",
+        "VICTORY_REA003_SHADOWMASK_NATIVE",
+        "VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT",
+        "VICTORY_REA003_DXR",
+    ] {
+        hash.update(name.as_bytes());
+        hash.update(b"=");
+        if let Some(value) = env_lookup(name) {
+            hash.update(value.as_encoded_bytes());
+        }
+        hash.update(&[0]);
+    }
+    hash.update(b"wave_wide_v2_rea0031\0");
+    *hash.finalize().as_bytes()
+}
+
 /// What identifies this translator: the BLAKE3 of its sources, of this
 /// file (the entries' encoding) and of the translation settings it runs
-/// with (the loop limit, which a diagnostics build can change at run time,
-/// and what the host's device said).
+/// with (the loop limit, adapter IDs, and shader recovery/wave switches).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -69,51 +129,8 @@ fn build() -> &'static [u8; 32] {
         // by host GPU): found before it goes into the key, so a translation
         // cached without the clamp is never served.
         crate::descriptor::host::probe_view_limit();
-        let mut hash = blake3::Hasher::new();
-        for source in victory_shader::sources()
-            .iter()
-            .copied()
-            .chain([include_str!("shader_cache.rs")])
-        {
-            hash.update(&(source.len() as u64).to_le_bytes());
-            hash.update(source.as_bytes());
-        }
-        hash.update(env!("CARGO_PKG_VERSION").as_bytes());
-        hash.update(&[u8::from(cfg!(feature = "diagnostics"))]);
-        for n in [
-            limit,
-            victory_shader::emit::view_heap_limit(),
-            victory_shader::emit::host_max_wave(),
-            // Which group barriers wait is part of the translation too.
-            u32::from(victory_shader::emit::group_sync()),
-            // And which clean-up passes ran over the translated code.
-            victory_shader::emit::shader_opt(),
-        ] {
-            hash.update(&n.to_le_bytes());
-        }
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was served
-        // the translations an earlier run had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_WIDE_ONLY",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_REA003_SHADER_RECOVERY",
-            "VICTORY_REA003_SHADER_OPT",
-            "VICTORY_REA003_AMBIENT_NATIVE",
-            "VICTORY_REA003_SHADOWMASK_NATIVE",
-        ] {
-            hash.update(name.as_bytes());
-            hash.update(b"=");
-            if let Some(value) = std::env::var_os(name) {
-                hash.update(value.as_encoded_bytes());
-            }
-            hash.update(&[0]);
-        }
-        hash.update(b"wave_wide_v1\0");
-        *hash.finalize().as_bytes()
+        let caps_ids = crate::caps::host_caps().map(|c| (c.vendor_id, c.device_id));
+        build_key_from(limit, caps_ids, |name| std::env::var_os(name))
     })
 }
 
@@ -147,8 +164,10 @@ fn wave_wide_listed(hash: &str) -> bool {
 #[cfg(windows)]
 fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     let hash = blake3::hash(c).to_hex();
-    victory_shader::emit::with_wave_wide(wave_wide_listed(&hash), || {
-        victory_shader::emit::translate(c)
+    victory_shader::emit::with_shader_hash(&hash[..16], || {
+        victory_shader::emit::with_wave_wide(wave_wide_listed(&hash), || {
+            victory_shader::emit::translate(c)
+        })
     })
     .map_err(|e| e.to_string())
 }
@@ -169,8 +188,9 @@ pub fn rea003_ambient_native() -> bool {
 }
 
 /// `VICTORY_REA003_SHADOWMASK_NATIVE=1` (OFF by default): bypasses `VICTORY_SHADOWMASK_STUB`
-/// and runs native `rtdirectionalshadows` compute shaders, falling back automatically
-/// to the shadow-mask stand-in only if native translation fails.
+/// and runs native `rtdirectionalshadows` compute shaders when `VICTORY_BVH_BUILDER=1`
+/// (or explicit override `VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT=1`), falling back
+/// automatically to the shadow-mask stand-in otherwise.
 pub fn rea003_shadowmask_native() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -181,6 +201,25 @@ pub fn rea003_shadowmask_native() -> bool {
                 t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
             })
     })
+}
+
+/// `VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT=1` (OFF by default): permits testing
+/// native shadowmask shaders even when `VICTORY_BVH_BUILDER=1` is not enabled.
+pub fn rea003_shadowmask_allow_unbuilt() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT")
+            .ok()
+            .is_some_and(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+    })
+}
+
+#[cfg(any(windows, test))]
+fn shadowmask_native_effective(requested: bool, builder_ran: bool, allow_unbuilt: bool) -> bool {
+    requested && (builder_ran || allow_unbuilt)
 }
 
 #[cfg(any(windows, test))]
@@ -208,9 +247,30 @@ pub(crate) enum ShaderOrigin {
 #[cfg(windows)]
 fn host_shader_cached_inner(container: &[u8]) -> Result<(HostShader, bool, ShaderOrigin), String> {
     let hash = hash_prefix_16(container);
+    let requested_shadowmask = rea003_shadowmask_native();
+    let effective_shadowmask = shadowmask_native_effective(
+        requested_shadowmask,
+        crate::pipeline::builder_runs(),
+        rea003_shadowmask_allow_unbuilt(),
+    );
+    if requested_shadowmask
+        && !effective_shadowmask
+        && victory_shader::emit::stand_in::SHADOWMASK_HASHES.contains(&hash.as_str())
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                %hash,
+                "VICTORY_REA003_SHADOWMASK_NATIVE=1 requires VICTORY_BVH_BUILDER=1 (or VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT=1); forcing safe shadowmask stand-in"
+            );
+        });
+        if let Some((s, kind)) = stand_in_with_origin(container, true) {
+            return Ok((s, false, ShaderOrigin::StandIn(kind)));
+        }
+    }
     let bypass_stand_in =
-        should_bypass_stand_in(&hash, rea003_ambient_native(), rea003_shadowmask_native());
-    if !bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container) {
+        should_bypass_stand_in(&hash, rea003_ambient_native(), effective_shadowmask);
+    if !bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container, false) {
         return Ok((s, false, ShaderOrigin::StandIn(kind)));
     }
     let translate = |c: &[u8]| {
@@ -234,7 +294,7 @@ fn host_shader_cached_inner(container: &[u8]) -> Result<(HostShader, bool, Shade
     match r {
         Ok((shader, from_cache)) => Ok((shader, from_cache, ShaderOrigin::Native)),
         Err(e) => {
-            if bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container) {
+            if bypass_stand_in && let Some((s, kind)) = stand_in_with_origin(container, true) {
                 tracing::warn!(
                     %hash,
                     error = %e,
@@ -279,6 +339,7 @@ pub(crate) fn host_shader_with_origin(
 #[cfg(windows)]
 fn stand_in_with_origin(
     container: &[u8],
+    force: bool,
 ) -> Option<(HostShader, crate::render_graph::StandInKind)> {
     use victory_shader::emit::stand_in as s;
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
@@ -299,7 +360,7 @@ fn stand_in_with_origin(
         ),
     ];
     for (name, kind, hashes, value, defaults) in kinds {
-        if std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
+        if !force && std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
             continue;
         }
         let listed = match std::env::var(format!("{name}_HASHES")) {
@@ -737,5 +798,37 @@ mod tests {
         assert!(should_bypass_stand_in(shadowmask, false, true));
 
         assert!(!should_bypass_stand_in(unrelated, true, true));
+    }
+
+    #[test]
+    fn build_key_changes_with_recovery_lists_wave_flags_and_adapter_ids() {
+        let base = build_key_from(4096, Some((0x10DE, 0x1F06)), |_| None);
+        let diff_adapter = build_key_from(4096, Some((0x10DE, 0x2684)), |_| None);
+        assert_ne!(
+            base, diff_adapter,
+            "adapter device_id must salt shader cache key"
+        );
+
+        for var in [
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_REA003_SHADER_RECOVERY_ALLOW",
+            "VICTORY_REA003_SHADER_RECOVERY_DENY",
+            "VICTORY_REA003_DXR",
+            "VICTORY_REA003_SHADOWMASK_ALLOW_UNBUILT",
+        ] {
+            let changed = build_key_from(4096, Some((0x10DE, 0x1F06)), |k| {
+                (k == var).then(|| std::ffi::OsString::from("test_val"))
+            });
+            assert_ne!(base, changed, "{var} must salt shader cache key");
+        }
+    }
+
+    #[test]
+    fn shadowmask_native_requires_bvh_builder_unless_explicitly_overridden() {
+        assert!(!shadowmask_native_effective(false, true, true));
+        assert!(!shadowmask_native_effective(true, false, false));
+        assert!(shadowmask_native_effective(true, true, false));
+        assert!(shadowmask_native_effective(true, false, true));
     }
 }

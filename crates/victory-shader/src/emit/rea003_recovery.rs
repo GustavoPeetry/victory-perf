@@ -13,16 +13,50 @@ use crate::native::{ResourceType, RootType};
 use crate::resource::{Address, Site, Source};
 use crate::structure::{LaneExit, Structured};
 
+/// Whether `i` is a `v_cndmask_b32` reading an untracked constant/scalar lane mask
+/// under `RecoveryFamily::ConstMask`.
+pub(super) fn is_const_mask_cndmask(st: &Structured, i: &Inst) -> bool {
+    super::super::recover_family_allowed(super::super::RecoveryFamily::ConstMask)
+        && i.name() == "v_cndmask_b32"
+        && matches!(
+            &i.fields,
+            Fields::Valu(v)
+                if matches!(
+                    v.src.get(2),
+                    Some(&Operand::Scalar { code, .. })
+                        if code != NULL
+                            && i.read(Reg::S(code))
+                                .is_some_and(|m| !st.masks.contains_key(&m))
+                )
+        )
+}
+
 /// Checks whether `root` is structurally uniform across active console waves
-/// (built only from scalar inputs, constants, uniform `ds_read_b32`, uniform
-/// `Phi`s, and non-lane-varying VALU instructions without reads of lane masks
-/// or VGPR inputs).
-pub(super) fn is_wave_uniform_val(p: &Program, st: &Structured, root: Value) -> bool {
+/// (built only from scalar inputs, constants, uniform-predecessor `Phi`s, uniform
+/// unguarded `ds_read_b32` without divergent LDS writes, and non-lane-conditional
+/// VALU instructions in `all`-lane blocks).
+pub(in super::super) fn is_wave_uniform_val(
+    p: &Program,
+    st: &Structured,
+    all: Option<&[bool]>,
+    root: Value,
+) -> bool {
+    let is_all = |b: usize| all.is_none_or(|a| a.get(b).copied().unwrap_or(false));
+    let has_divergent_lds_write = p.blocks.iter().enumerate().any(|(b, block)| {
+        !is_all(b)
+            && block.insts.iter().any(|i| {
+                let n = i.name();
+                matches!(i.fields, Fields::Ds { .. })
+                    && !n.starts_with("ds_read")
+                    && !n.starts_with("ds_swizzle")
+                    && !n.contains("permute")
+            })
+    });
     let mut def_inst: HashMap<Value, (usize, usize)> = HashMap::new();
-    let mut def_phi: HashMap<Value, &crate::ir::Phi> = HashMap::new();
+    let mut def_phi: HashMap<Value, (usize, &crate::ir::Phi)> = HashMap::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for phi in &block.phis {
-            def_phi.insert(phi.value, phi);
+            def_phi.insert(phi.value, (b, phi));
         }
         for (i, inst) in block.insts.iter().enumerate() {
             for &(_, w) in &inst.writes {
@@ -48,7 +82,11 @@ pub(super) fn is_wave_uniform_val(p: &Program, st: &Structured, root: Value) -> 
                 Reg::V(_) => return false,
             }
         }
-        if let Some(phi) = def_phi.get(&v) {
+        if let Some(&(phi_b, phi)) = def_phi.get(&v) {
+            let preds = &p.blocks[phi_b].preds;
+            if preds.is_empty() || !preds.iter().all(|&q| is_all(q)) {
+                return false;
+            }
             work.extend(phi.args.iter().copied());
             continue;
         }
@@ -71,10 +109,18 @@ pub(super) fn is_wave_uniform_val(p: &Program, st: &Structured, root: Value) -> 
                 }
             }
             Fields::Valu(vu)
-                if vu.dpp.is_none()
+                if is_all(b)
+                    && vu.dpp.is_none()
                     && vu.sdwa.is_none()
+                    && !name.starts_with("v_cndmask")
+                    && !name.starts_with("v_add_co")
+                    && !name.starts_with("v_sub_co")
+                    && !name.starts_with("v_subrev_co")
+                    && !name.starts_with("v_cmp")
+                    && !name.starts_with("v_readlane")
+                    && !name.starts_with("v_writelane")
+                    && !name.starts_with("v_permlane")
                     && !name.starts_with("v_mbcnt")
-                    && !name.starts_with("v_cmpx")
                     && (!name.contains("lane") || name == "v_readfirstlane_b32") =>
             {
                 for op in &vu.src {
@@ -104,7 +150,9 @@ pub(super) fn is_wave_uniform_val(p: &Program, st: &Structured, root: Value) -> 
                     }
                 }
             }
-            Fields::Ds { addr, .. } if name == "ds_read_b32" => {
+            Fields::Ds { addr, .. }
+                if name == "ds_read_b32" && is_all(b) && !has_divergent_lds_write =>
+            {
                 let Some(Operand::Vector { reg, .. }) = *addr else {
                     return false;
                 };
@@ -119,15 +167,18 @@ pub(super) fn is_wave_uniform_val(p: &Program, st: &Structured, root: Value) -> 
     true
 }
 
-/// Computes `lds_meetings` taking explicit `s_barrier` boundaries inside
-/// non-`all` blocks into account without ever placing synthetic barriers inside
-/// divergent control flow.
-pub(super) fn lds_meetings_with_barriers(
+/// Computes `lds_meetings` when uniform (`all[b]`) blocks contain explicit
+/// `s_barrier` instructions, strictly rejecting any shader that places
+/// `s_barrier` inside a divergent (`!all[b]`) block.
+pub(in super::super) fn lds_meetings_with_barriers(
     p: &Program,
     st: &Structured,
     all: &[bool],
 ) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
+    if (0..n).any(|b| !all[b] && p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier")) {
+        return None;
+    }
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
             LaneExit::Jump(t) => vec![t],
@@ -145,13 +196,8 @@ pub(super) fn lds_meetings_with_barriers(
             continue;
         }
         entry_node[b] = phase_count;
-        let barriers = p.blocks[b]
-            .insts
-            .iter()
-            .filter(|i| i.name() == "s_barrier")
-            .count();
-        exit_node[b] = phase_count + barriers;
-        phase_count += barriers + 1;
+        exit_node[b] = phase_count;
+        phase_count += 1;
     }
     let mut region: Vec<usize> = (0..phase_count).collect();
     fn find_p(region: &mut [usize], mut x: usize) -> usize {
@@ -181,23 +227,21 @@ pub(super) fn lds_meetings_with_barriers(
         if all[b] {
             continue;
         }
-        let mut phase = entry_node[b];
+        let r = find_p(&mut region, entry_node[b]);
         for i in &block.insts {
             let name = i.name();
-            if name == "s_barrier" {
-                phase += 1;
-                continue;
-            }
             if !matches!(i.fields, Fields::Ds { .. })
                 || name.starts_with("ds_swizzle")
                 || name.contains("permute")
             {
                 continue;
             }
-            let r = find_p(&mut region, phase);
             if name.starts_with("ds_read") {
                 reads[r] = true;
+            } else if name.starts_with("ds_write") {
+                writes[r] = true;
             } else {
+                reads[r] = true;
                 writes[r] = true;
             }
         }
@@ -305,7 +349,8 @@ impl<'a> Lower<'a> {
             return false;
         }
         let addr = self.view_address(site);
-        let records = if super::super::rea003_shader_recovery() {
+        let records = if super::super::recover_family_allowed(super::super::RecoveryFamily::BufMeta)
+        {
             let src = Source::Loaded {
                 load: site,
                 first: 0,
@@ -349,8 +394,8 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// Recovers a dynamic bindless 8-dword image descriptor read solely for
-    /// `SQ_IMG_RSRC` dimension/mip fields.
+    /// Recovers a bound 8-dword image descriptor read solely for `SQ_IMG_RSRC`
+    /// dimension/mip fields when explicit table usage confirms an image SRV/UAV.
     pub(super) fn recover_unread_image_descriptor(
         &mut self,
         inst: &Inst,
@@ -364,10 +409,10 @@ impl<'a> Lower<'a> {
             return Ok(false);
         };
         if count != 8
-            || !super::super::rea003_shader_recovery()
+            || !super::super::recover_family_allowed(super::super::RecoveryFamily::ImgMeta)
             || !matches!(
                 self.x.native.layout.get(a.param).map(|p| p.root),
-                Some(RootType::Table | RootType::ResourceHeap)
+                Some(RootType::Table)
             )
         {
             return Ok(false);
@@ -376,13 +421,13 @@ impl<'a> Lower<'a> {
             load: site,
             first: 0,
         };
-        let used = self.used_kind(&src);
-        if used.is_some_and(|u| {
-            matches!(u.kind, ResourceType::Cbv | ResourceType::Sampler) || u.dwords == 4
-        }) {
+        let Some(u) = self.used_kind(&src) else {
+            return Ok(false);
+        };
+        if u.dwords != 8 || !matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
             return Ok(false);
         }
-        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = u.kind == ResourceType::Uav;
         let u = if uav { 0x1000 } else { 0 };
         let h = self.handle(site, &src, false, (2 | u, 0x409))?;
         let words = self.pack_image_rsrc_words(h, 2, uav);

@@ -19,6 +19,8 @@
 pub mod accounting;
 pub mod authority;
 #[cfg(windows)]
+pub mod breadcrumbs;
+#[cfg(windows)]
 pub mod caps;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -77,6 +79,8 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(windows)]
+pub mod shader_exec_harness;
 #[cfg(windows)]
 pub mod shadow;
 pub mod signature;

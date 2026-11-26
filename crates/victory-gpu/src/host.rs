@@ -793,6 +793,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            let completed = unsafe { host.fence.GetCompletedValue() };
+            text.push_str(&crate::breadcrumbs::format_removal_report(completed));
             log_removal_context();
         }
         match host.log_messages() {
@@ -857,15 +859,23 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
+        // Diagnostics & recovery isolation: device-removed data (the command that
+        // faulted, the faulting address), enabled via `VICTORY_D3D12_DRED=1`.
         if dred_on() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            match D3D12GetDebugInterface(&mut dred) {
+                Ok(()) => {
+                    if let Some(dred) = dred {
+                        dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        tracing::info!(
+                            "D3D12 DRED auto-breadcrumbs & page-fault reporting enabled"
+                        );
+                    } else {
+                        tracing::warn!("D3D12 DRED interface returned None");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to configure D3D12 DRED"),
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -913,12 +923,20 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
         {
+            let hw_max = o1.WaveLaneCountMax;
+            let requested = std::env::var("VICTORY_HOST_MAX_WAVE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&w| w == 32 || w == 64);
+            let effective_max = requested.map_or(hw_max, |req| hw_max.min(req));
             tracing::info!(
                 min = o1.WaveLaneCountMin,
-                max = o1.WaveLaneCountMax,
+                max = hw_max,
+                requested_max = ?requested,
+                effective_max,
                 "host wave lanes"
             );
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            victory_shader::emit::set_host_max_wave(effective_max);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -1614,13 +1632,11 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (`VICTORY_D3D12_DRED` non-zero, available in
+/// both release and diagnostics builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v != "0"))
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -5451,6 +5467,7 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::breadcrumbs::note_submission_started(this_submission);
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -5558,14 +5575,27 @@ impl Host {
                 lists.push(Some(bracket.end_cmd.clone()));
             }
             *submitted += 1;
+            let fence_val = *submitted;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let _queue_guard = crate::tiles::queue_lock();
                 self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+                self.queue.Signal(&self.fence, fence_val)
             };
             drop(held_order);
             self.card_sent();
+            let ptrs: Vec<usize> = runs
+                .iter()
+                .map(|r| windows::core::Interface::as_raw(&r.list) as usize)
+                .collect();
+            crate::breadcrumbs::record_submit(
+                crate::breadcrumbs::QueueKind::Direct,
+                this_submission,
+                fence_val,
+                runs.len() as u32,
+                0,
+            );
+            crate::breadcrumbs::mark_submission_fence(&ptrs, this_submission, fence_val);
             if let Some(bracket) = &ts_bracket
                 && let Some(ring) = &self.timestamp_ring
             {
@@ -5633,8 +5663,26 @@ impl Host {
                     .ExecuteCommandLists(&[Some(bracket.begin_cmd.clone())]);
             }
         }
+        let run_ptrs: Vec<usize> = runs
+            .iter()
+            .map(|r| windows::core::Interface::as_raw(&r.list) as usize)
+            .collect();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let fence_val = *submitted;
+            let group_ptrs = if multi_group && runs.len() == groups.len() {
+                &run_ptrs[i..=i]
+            } else {
+                &run_ptrs[..]
+            };
+            crate::breadcrumbs::record_submit(
+                crate::breadcrumbs::QueueKind::Direct,
+                this_submission,
+                fence_val,
+                group.len() as u32,
+                0,
+            );
+            crate::breadcrumbs::mark_submission_fence(group_ptrs, this_submission, fence_val);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5643,8 +5691,8 @@ impl Host {
                     self.queue.ExecuteCommandLists(group);
                     self.card_sent();
                     self.queue
-                        .Signal(&self.fence, *submitted)
-                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+                        .Signal(&self.fence, fence_val)
+                        .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event))
                 };
                 match waited {
                     Ok(()) => {
@@ -5817,8 +5865,13 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        let completed_fence = unsafe { self.fence.GetCompletedValue() };
+        let crumb_report = crate::breadcrumbs::format_removal_report(completed_fence);
+        if !dred_on() {
+            return format!("; DRED disabled (set VICTORY_D3D12_DRED=1){crumb_report}");
+        }
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return crumb_report;
         };
         let mut text = String::new();
         let mut fault_va = None;
@@ -5860,7 +5913,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&format!("; no breadcrumbs ({e}){crumb_report}"));
                     return text;
                 }
             };
@@ -5916,6 +5969,7 @@ impl Host {
                 plain = p.pNext;
             }
         }
+        text.push_str(&crumb_report);
         text
     }
 

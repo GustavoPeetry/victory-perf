@@ -564,6 +564,19 @@ pub(crate) enum PipelineMiss {
     Other,
 }
 
+#[cfg(windows)]
+pub(crate) fn shader_hash_ids(this: This) -> [u64; 3] {
+    if this.is_null() {
+        return [0; 3];
+    }
+    let p = pipeline(this);
+    let mut out = [0u64; 3];
+    for (dst, s) in out.iter_mut().zip(p.shaders.iter()) {
+        *dst = u64::from_str_radix(&s.hash, 16).unwrap_or(0);
+    }
+    out
+}
+
 /// Classifies why `this` has no usable host pipeline without blocking.
 #[cfg(windows)]
 pub(crate) fn classify_miss(this: This) -> PipelineMiss {
