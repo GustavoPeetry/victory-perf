@@ -6981,6 +6981,7 @@ struct Presenter {
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
+    last_present: Option<std::time::Instant>,
     frames: u32,
     logged_frames: u64,
     #[cfg(feature = "diagnostics")]
@@ -6996,6 +6997,7 @@ impl Meter {
         let now = std::time::Instant::now();
         Meter {
             since: now,
+            last_present: None,
             frames: 0,
             logged_frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -7008,6 +7010,12 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_present.replace(now) {
+            crate::rea_telemetry::record_frame(
+                now.saturating_duration_since(prev).as_secs_f64() * 1000.0,
+            );
+        }
         static SUBMIT_ROLE: std::sync::Once = std::sync::Once::new();
         SUBMIT_ROLE.call_once(|| {
             victory_core::scheduler::apply_current_thread_role(
@@ -7201,6 +7209,7 @@ impl Meter {
             pipeline_telemetry_line();
             p2_diag_line();
             crate::dxr_proto::maybe_probe_host();
+            crate::rea_telemetry::log_window(fps, ms, cpu, gpu, back_ms, back_mb, draws);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -7821,7 +7830,6 @@ static BARRIERS_ELIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// Returns how many redundant resource barriers were elided or collapsed when
 /// `VICTORY_REA_GPU_FASTPATH=1` is active.
-#[allow(dead_code)]
 pub fn barrier_fastpath_stats() -> u64 {
     BARRIERS_ELIDED.load(Ordering::Relaxed)
 }

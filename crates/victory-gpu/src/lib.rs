@@ -53,6 +53,7 @@ pub mod queue;
 pub mod accounting;
 pub mod authority;
 #[cfg(windows)]
+pub mod rea_telemetry;
 pub mod readback;
 #[cfg(windows)]
 mod rebar;

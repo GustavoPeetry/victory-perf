@@ -9,6 +9,38 @@ use victory_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};
 
+fn register_rea_telemetry() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        victory_gpu::rea_telemetry::register_cpu_stats_provider(|| {
+            let s = victory_loader::console_insn_stats();
+            victory_gpu::rea_telemetry::CpuTelemetry {
+                fastpath_enabled: s.fastpath_enabled,
+                patched_clzero_loops: s.patched_clzero_loops,
+                patched_clzero_alt_loops: s.patched_clzero_alt_loops,
+                patched_monitorx: s.patched_monitorx,
+                patched_mwaitx: s.patched_mwaitx,
+                fast_clzero_calls: s.fast_clzero_calls,
+                fast_clzero_bytes: s.fast_clzero_bytes,
+                fast_monitorx_calls: s.fast_monitorx_calls,
+                fast_mwaitx_calls: s.fast_mwaitx_calls,
+                emu_total: s.emu_total,
+                emu_zeroed_bytes: s.emu_zeroed_bytes,
+            }
+        });
+        victory_gpu::rea_telemetry::register_streaming_stats_provider(|| {
+            let s = super::dstorage::streaming_stats();
+            victory_gpu::rea_telemetry::StreamingTelemetry {
+                enabled: s.enabled,
+                scratch_reuses: s.scratch_reuses,
+                scratch_bytes_saved: s.scratch_bytes_saved,
+                low_ram_throttles: s.low_ram_throttles,
+                page_dest_notifies: s.page_dest_notifies,
+            }
+        });
+    });
+}
+
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
 extern "system" fn create_device(
@@ -17,6 +49,7 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
+    register_rea_telemetry();
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
@@ -43,6 +76,7 @@ pub use victory_gpu::precompile;
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
+    register_rea_telemetry();
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));

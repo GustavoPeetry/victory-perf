@@ -783,7 +783,6 @@ pub fn gpu_fastpath_enabled() -> bool {
 
 /// Returns `(allocations, wrap_hits, refusals)` across dynamic descriptor slot
 /// allocations.
-#[allow(dead_code)]
 pub fn dynamic_slot_stats() -> (u64, u64, u64) {
     (
         DYNAMIC_ALLOCS.load(std::sync::atomic::Ordering::Relaxed),
