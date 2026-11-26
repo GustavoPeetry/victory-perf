@@ -58,14 +58,18 @@ struct Metrics {
     reserved_textures_bytes: AlignedCounter,
     mapped_tile_bytes: AlignedCounter,
     tile_pool_allocated_bytes: AlignedCounter,
+    staging_bytes: AlignedCounter,
     shadow_ram_bytes: AlignedCounter,
     shadow_vram_bytes: AlignedCounter,
     upload_ring_bytes: AlignedCounter,
     reclaimable_bytes: AlignedCounter,
+    retired_pending_count: AlignedCounter,
     committed_texture_count: AlignedCounter,
     sparse_texture_count: AlignedCounter,
     dxgi_queries_actual: AlignedCounter,
     dxgi_queries_cached: AlignedCounter,
+    dxgi_nonlocal_used_bytes: AlignedCounter,
+    dxgi_nonlocal_budget_bytes: AlignedCounter,
     audit_runs: AlignedCounter,
     audit_mismatches: AlignedCounter,
     last_audit_drift_bytes: AlignedCounter,
@@ -78,14 +82,18 @@ impl Metrics {
             reserved_textures_bytes: AlignedCounter::new(),
             mapped_tile_bytes: AlignedCounter::new(),
             tile_pool_allocated_bytes: AlignedCounter::new(),
+            staging_bytes: AlignedCounter::new(),
             shadow_ram_bytes: AlignedCounter::new(),
             shadow_vram_bytes: AlignedCounter::new(),
             upload_ring_bytes: AlignedCounter::new(),
             reclaimable_bytes: AlignedCounter::new(),
+            retired_pending_count: AlignedCounter::new(),
             committed_texture_count: AlignedCounter::new(),
             sparse_texture_count: AlignedCounter::new(),
             dxgi_queries_actual: AlignedCounter::new(),
             dxgi_queries_cached: AlignedCounter::new(),
+            dxgi_nonlocal_used_bytes: AlignedCounter::new(),
+            dxgi_nonlocal_budget_bytes: AlignedCounter::new(),
             audit_runs: AlignedCounter::new(),
             audit_mismatches: AlignedCounter::new(),
             last_audit_drift_bytes: AlignedCounter::new(),
@@ -102,8 +110,7 @@ struct CachedBudget {
 }
 
 static BUDGET_CACHE: Mutex<Option<CachedBudget>> = Mutex::new(None);
-static BUDGET_UNFLUSHED_LOCAL_DELTA: AlignedSignedCounter =
-    AlignedSignedCounter(AtomicI64::new(0));
+static BUDGET_UNFLUSHED_LOCAL_DELTA: AlignedSignedCounter = AlignedSignedCounter(AtomicI64::new(0));
 const DEFAULT_BUDGET_TTL: Duration = Duration::from_millis(15);
 const MAX_UNFLUSHED_BUDGET_DELTA: i64 = 16 << 20;
 
@@ -116,14 +123,18 @@ pub struct AccountingSnapshot {
     pub reserved_textures_bytes: u64,
     pub mapped_tile_bytes: u64,
     pub tile_pool_allocated_bytes: u64,
+    pub staging_bytes: u64,
     pub shadow_ram_bytes: u64,
     pub shadow_vram_bytes: u64,
     pub upload_ring_bytes: u64,
     pub reclaimable_bytes: u64,
+    pub retired_pending_count: u64,
     pub committed_texture_count: u64,
     pub sparse_texture_count: u64,
     pub dxgi_queries_actual: u64,
     pub dxgi_queries_cached: u64,
+    pub dxgi_nonlocal_used_bytes: u64,
+    pub dxgi_nonlocal_budget_bytes: u64,
     pub audit_runs: u64,
     pub audit_mismatches: u64,
     pub last_audit_drift_bytes: u64,
@@ -255,6 +266,28 @@ pub fn on_upload_ring_delta(delta_bytes: i64) {
     }
 }
 
+/// Update staging pool footprint in host-visible memory.
+pub fn on_staging_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.staging_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS
+            .staging_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
+    }
+}
+
+/// Adjust count of pending host resources queued for retirement behind fences.
+pub fn on_retired_pending_delta(delta: i64) {
+    if delta >= 0 {
+        METRICS.retired_pending_count.add(delta as u64);
+    } else {
+        METRICS
+            .retired_pending_count
+            .sub_saturating(delta.unsigned_abs());
+    }
+}
+
 /// Adjust bytes marked reclaimable under VRAM pressure.
 pub fn on_reclaimable_delta(delta_bytes: i64) {
     if delta_bytes >= 0 {
@@ -264,6 +297,18 @@ pub fn on_reclaimable_delta(delta_bytes: i64) {
             .reclaimable_bytes
             .sub_saturating(delta_bytes.unsigned_abs());
     }
+}
+
+#[inline]
+fn record_nonlocal_video_memory(values: [u64; 4]) {
+    METRICS
+        .dxgi_nonlocal_budget_bytes
+        .0
+        .store(values[2], Ordering::Relaxed);
+    METRICS
+        .dxgi_nonlocal_used_bytes
+        .0
+        .store(values[3], Ordering::Relaxed);
 }
 
 /// Return cached `[local_budget, local_usage, nonlocal_budget, nonlocal_usage]`
@@ -288,6 +333,7 @@ where
     BUDGET_UNFLUSHED_LOCAL_DELTA.0.store(0, Ordering::Release);
     let values = query_fn()?;
     METRICS.dxgi_queries_actual.add(1);
+    record_nonlocal_video_memory(values);
     if let Ok(mut guard) = BUDGET_CACHE.lock() {
         *guard = Some(CachedBudget {
             captured_at: Instant::now(),
@@ -303,7 +349,9 @@ pub(crate) fn video_memory_budget(host: &crate::host::Host) -> Option<[u64; 4]> 
     if enabled() {
         cached_video_memory_with(DEFAULT_BUDGET_TTL, || host.video_memory())
     } else {
-        host.video_memory()
+        let values = host.video_memory()?;
+        record_nonlocal_video_memory(values);
+        Some(values)
     }
 }
 
@@ -353,14 +401,18 @@ pub fn snapshot() -> AccountingSnapshot {
         reserved_textures_bytes: METRICS.reserved_textures_bytes.load(),
         mapped_tile_bytes: METRICS.mapped_tile_bytes.load(),
         tile_pool_allocated_bytes: METRICS.tile_pool_allocated_bytes.load(),
+        staging_bytes: METRICS.staging_bytes.load(),
         shadow_ram_bytes: METRICS.shadow_ram_bytes.load(),
         shadow_vram_bytes: METRICS.shadow_vram_bytes.load(),
         upload_ring_bytes: METRICS.upload_ring_bytes.load(),
         reclaimable_bytes: METRICS.reclaimable_bytes.load(),
+        retired_pending_count: METRICS.retired_pending_count.load(),
         committed_texture_count: METRICS.committed_texture_count.load(),
         sparse_texture_count: METRICS.sparse_texture_count.load(),
         dxgi_queries_actual: METRICS.dxgi_queries_actual.load(),
         dxgi_queries_cached: METRICS.dxgi_queries_cached.load(),
+        dxgi_nonlocal_used_bytes: METRICS.dxgi_nonlocal_used_bytes.load(),
+        dxgi_nonlocal_budget_bytes: METRICS.dxgi_nonlocal_budget_bytes.load(),
         audit_runs: METRICS.audit_runs.load(),
         audit_mismatches: METRICS.audit_mismatches.load(),
         last_audit_drift_bytes: METRICS.last_audit_drift_bytes.load(),
@@ -444,7 +496,10 @@ mod tests {
             Some([7000 << 20, 4000 << 20, 8000 << 20, 3000 << 20])
         });
         assert_eq!(calls, 1);
-        assert_eq!(first, Some([7000 << 20, 4000 << 20, 8000 << 20, 3000 << 20]));
+        assert_eq!(
+            first,
+            Some([7000 << 20, 4000 << 20, 8000 << 20, 3000 << 20])
+        );
 
         on_texture_created(4 << 20, 0, false);
         let adjusted = cached_video_memory_with(Duration::from_secs(10), || {

@@ -3583,6 +3583,7 @@ impl State {
             _ => false,
         };
         if !matches_kind {
+            crate::render_graph::record_dropped_indirect_only();
             why(&format!(
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
@@ -3591,6 +3592,7 @@ impl State {
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
+            crate::render_graph::record_dropped_indirect_only();
             why("arguments outside title buffers");
             return false;
         };
@@ -3598,6 +3600,7 @@ impl State {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
+                    crate::render_graph::record_dropped_indirect_only();
                     why("count outside title buffers");
                     return false;
                 }
@@ -3608,10 +3611,12 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
+            crate::render_graph::record_dropped_indirect_only();
             why("no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            crate::render_graph::record_dropped_indirect_only();
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
@@ -3810,6 +3815,7 @@ impl State {
                         )
                     };
                     let Some(bounded) = bounded else {
+                        crate::render_graph::record_dropped_indirect_only();
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");
                         return false;
                     };
@@ -3849,6 +3855,7 @@ impl State {
             {
                 crate::indirect::done(list, &bounded);
             }
+            crate::render_graph::record_dropped_indirect_only();
             why("prepare failed");
             return false;
         }

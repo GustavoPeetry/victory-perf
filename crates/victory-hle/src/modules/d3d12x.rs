@@ -27,8 +27,18 @@ fn register_rea_telemetry() {
                 wait_yields: s.wait_yields,
                 wait_sleeps: s.wait_sleeps,
                 wait_early_wakes: s.wait_early_wakes,
+                wait_total_us: 0,
+                wait_sleep_us: 0,
                 emu_total: s.emu_total,
                 emu_zeroed_bytes: s.emu_zeroed_bytes,
+            }
+        });
+        victory_gpu::rea_telemetry::register_ffx_stats_provider(|| {
+            let (mode, creates, dispatches) = super::ffx::telemetry_stats();
+            victory_gpu::rea_telemetry::FfxHleTelemetry {
+                mode: mode.as_str(),
+                create_calls: creates,
+                dispatch_calls: dispatches,
             }
         });
         victory_gpu::rea_telemetry::register_streaming_stats_provider(|| {

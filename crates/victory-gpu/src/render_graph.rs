@@ -94,6 +94,9 @@ static DROPPED_NULL: AtomicU64 = AtomicU64::new(0);
 static DROPPED_PENDING: AtomicU64 = AtomicU64::new(0);
 static DROPPED_FAILED: AtomicU64 = AtomicU64::new(0);
 static DROPPED_OTHER: AtomicU64 = AtomicU64::new(0);
+static DROPPED_INDIRECT_ONLY: AtomicU64 = AtomicU64::new(0);
+static SUBMITTED_DRAWS: AtomicU64 = AtomicU64::new(0);
+static SUBMITTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Classifies a pipeline's [`PassKind`] and stand-in status from host metadata.
 pub(crate) fn classify_pipeline(
@@ -162,6 +165,11 @@ pub(crate) fn record_pipeline_exec(
     indirect: bool,
 ) {
     PASS_COUNTS[pass as usize].fetch_add(1, Ordering::Relaxed);
+    if is_compute {
+        SUBMITTED_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SUBMITTED_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
     if indirect {
         let bucket = if is_compute {
             PassKind::IndirectDispatch
@@ -203,22 +211,38 @@ pub(crate) fn record_dropped_pso(miss: PipelineMiss) {
     }
 }
 
+/// Records one dropped indirect draw/dispatch caused by non-PSO reasons
+/// (argument bounds, missing signature, or mesh skip).
+pub(crate) fn record_dropped_indirect_only() {
+    DROPPED_INDIRECT_ONLY.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Snapshot of calibrated GPU timing, stand-in activity, and pass breakdowns
 /// over one telemetry reporting window.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RenderGraphSnapshot {
+    pub(crate) window_frames: u64,
     pub(crate) gpu_time_status: GpuTimeStatus,
+    pub(crate) gpu_hw_total_ms: f64,
     pub(crate) gpu_hw_ms: f64,
+    pub(crate) gpu_hw_ms_per_frame: f64,
+    pub(crate) gpu_hw_ms_per_sample: f64,
     pub(crate) gpu_hw_samples: u64,
     pub(crate) gpu_timestamp_freq_hz: u64,
     pub(crate) standin_draws: f64,
+    pub(crate) standin_window_total: u64,
     pub(crate) standin_ambient: u64,
     pub(crate) standin_shadowmask: u64,
     pub(crate) standin_exposure: u64,
     pub(crate) dropped_pso_draws: f64,
+    pub(crate) dropped_window_total: u64,
     pub(crate) dropped_null: u64,
     pub(crate) dropped_pending: u64,
     pub(crate) dropped_failed: u64,
+    pub(crate) dropped_other: u64,
+    pub(crate) dropped_indirect_only: u64,
+    pub(crate) submitted_draws: u64,
+    pub(crate) submitted_dispatches: u64,
     pub(crate) graphics_color: u64,
     pub(crate) depth_prepass: u64,
     pub(crate) mesh_geometry: u64,
@@ -232,22 +256,35 @@ impl RenderGraphSnapshot {
     /// Formats calibrated timestamp, stand-in, PSO drop, and pass counters as JSON object fields.
     pub(crate) fn json_fields(&self) -> String {
         format!(
-            "\"gpu_time_status\":\"{}\",\"gpu_hw_ms\":{:.3},\"gpu_hw_samples\":{},\"gpu_ts_freq_hz\":{},\
-             \"standin_draws\":{:.2},\"standin_ambient\":{},\"standin_shadowmask\":{},\"standin_exposure\":{},\
-             \"dropped_pso_draws\":{:.2},\"dropped_null\":{},\"dropped_pending\":{},\"dropped_failed\":{},\
+            "\"window_frames\":{},\"gpu_time_status\":\"{}\",\"gpu_hw_total_ms\":{:.3},\
+             \"gpu_hw_ms\":{:.3},\"gpu_hw_ms_per_frame\":{:.3},\"gpu_hw_ms_per_sample\":{:.3},\
+             \"gpu_hw_samples\":{},\"gpu_ts_freq_hz\":{},\
+             \"standin_draws\":{:.2},\"standin_window_total\":{},\"standin_ambient\":{},\"standin_shadowmask\":{},\"standin_exposure\":{},\
+             \"dropped_pso_draws\":{:.2},\"dropped_window_total\":{},\"dropped_null\":{},\"dropped_pending\":{},\"dropped_failed\":{},\"dropped_other\":{},\"dropped_indirect_only\":{},\
+             \"submitted_draws\":{},\"submitted_dispatches\":{},\
              \"rg_gfx\":{},\"rg_depth\":{},\"rg_mesh\":{},\"rg_rect\":{},\"rg_cs\":{},\"rg_ind_draw\":{},\"rg_ind_disp\":{}",
+            self.window_frames,
             self.gpu_time_status.as_str(),
+            self.gpu_hw_total_ms,
             self.gpu_hw_ms,
+            self.gpu_hw_ms_per_frame,
+            self.gpu_hw_ms_per_sample,
             self.gpu_hw_samples,
             self.gpu_timestamp_freq_hz,
             self.standin_draws,
+            self.standin_window_total,
             self.standin_ambient,
             self.standin_shadowmask,
             self.standin_exposure,
             self.dropped_pso_draws,
+            self.dropped_window_total,
             self.dropped_null,
             self.dropped_pending,
             self.dropped_failed,
+            self.dropped_other,
+            self.dropped_indirect_only,
+            self.submitted_draws,
+            self.submitted_dispatches,
             self.graphics_color,
             self.depth_prepass,
             self.mesh_geometry,
@@ -259,9 +296,10 @@ impl RenderGraphSnapshot {
     }
 }
 
-/// Atomically swaps per-window render-graph counters and computes averages for `frames`.
-pub(crate) fn take_window_snapshot(frames: f64, wait_gpu_ms: f64) -> RenderGraphSnapshot {
-    let frames = frames.max(1.0);
+/// Atomically swaps per-window render-graph counters and computes averages for `window_frames`.
+pub(crate) fn take_window_snapshot(window_frames: f64, wait_gpu_ms: f64) -> RenderGraphSnapshot {
+    let frames = window_frames.max(1.0);
+    let window_frames_u64 = frames.round() as u64;
     let hw_us = HW_TIME_US.swap(0, Ordering::Relaxed);
     let hw_samples = HW_SAMPLES.swap(0, Ordering::Relaxed);
     let _hw_ticks = HW_RAW_TICKS.swap(0, Ordering::Relaxed);
@@ -271,16 +309,27 @@ pub(crate) fn take_window_snapshot(frames: f64, wait_gpu_ms: f64) -> RenderGraph
     let gpu_time_status =
         classify_gpu_time_status(hw_samples, wait_gpu_ms, submitted, ring_available);
 
+    let gpu_hw_total_ms = hw_us as f64 / 1000.0;
+    let gpu_hw_ms = gpu_hw_total_ms / frames;
+    let gpu_hw_ms_per_sample = if hw_samples > 0 {
+        gpu_hw_total_ms / hw_samples as f64
+    } else {
+        0.0
+    };
+
     let standin_ambient = STANDIN_AMBIENT.swap(0, Ordering::Relaxed);
     let standin_shadowmask = STANDIN_SHADOWMASK.swap(0, Ordering::Relaxed);
     let standin_exposure = STANDIN_EXPOSURE.swap(0, Ordering::Relaxed);
-    let standin_total = standin_ambient + standin_shadowmask + standin_exposure;
+    let standin_window_total = standin_ambient + standin_shadowmask + standin_exposure;
 
     let dropped_null = DROPPED_NULL.swap(0, Ordering::Relaxed);
     let dropped_pending = DROPPED_PENDING.swap(0, Ordering::Relaxed);
     let dropped_failed = DROPPED_FAILED.swap(0, Ordering::Relaxed);
     let dropped_other = DROPPED_OTHER.swap(0, Ordering::Relaxed);
-    let dropped_total = dropped_null + dropped_pending + dropped_failed + dropped_other;
+    let dropped_window_total = dropped_null + dropped_pending + dropped_failed + dropped_other;
+    let dropped_indirect_only = DROPPED_INDIRECT_ONLY.swap(0, Ordering::Relaxed);
+    let submitted_draws = SUBMITTED_DRAWS.swap(0, Ordering::Relaxed);
+    let submitted_dispatches = SUBMITTED_DISPATCHES.swap(0, Ordering::Relaxed);
 
     let graphics_color = PASS_COUNTS[PassKind::GraphicsColor as usize].swap(0, Ordering::Relaxed);
     let depth_prepass = PASS_COUNTS[PassKind::DepthPrepass as usize].swap(0, Ordering::Relaxed);
@@ -295,18 +344,28 @@ pub(crate) fn take_window_snapshot(frames: f64, wait_gpu_ms: f64) -> RenderGraph
     let _ = PASS_COUNTS[PassKind::StandInExposure as usize].swap(0, Ordering::Relaxed);
 
     RenderGraphSnapshot {
+        window_frames: window_frames_u64,
         gpu_time_status,
-        gpu_hw_ms: hw_us as f64 / 1000.0 / frames,
+        gpu_hw_total_ms,
+        gpu_hw_ms,
+        gpu_hw_ms_per_frame: gpu_hw_ms,
+        gpu_hw_ms_per_sample,
         gpu_hw_samples: hw_samples,
         gpu_timestamp_freq_hz,
-        standin_draws: standin_total as f64 / frames,
+        standin_draws: standin_window_total as f64 / frames,
+        standin_window_total,
         standin_ambient,
         standin_shadowmask,
         standin_exposure,
-        dropped_pso_draws: dropped_total as f64 / frames,
+        dropped_pso_draws: dropped_window_total as f64 / frames,
+        dropped_window_total,
         dropped_null,
         dropped_pending,
         dropped_failed,
+        dropped_other,
+        dropped_indirect_only,
+        submitted_draws,
+        submitted_dispatches,
         graphics_color,
         depth_prepass,
         mesh_geometry,
@@ -659,17 +718,44 @@ pub(crate) mod tests {
         );
         record_dropped_pso(PipelineMiss::Pending);
         record_dropped_pso(PipelineMiss::Failed);
+        record_dropped_pso(PipelineMiss::Other);
+        record_dropped_indirect_only();
 
-        let snap = take_window_snapshot(2.0, 18.0);
+        let snap = take_window_snapshot(10.0, 18.0);
+        assert_eq!(snap.window_frames, 10);
         assert_eq!(snap.gpu_time_status, GpuTimeStatus::WaitClockOnly);
         assert_eq!(snap.standin_ambient, 1);
         assert_eq!(snap.standin_shadowmask, 1);
-        assert!((snap.standin_draws - 1.0).abs() < 1e-6);
+        assert_eq!(snap.standin_window_total, 2);
+        assert!((snap.standin_draws - 0.2).abs() < 1e-6);
         assert_eq!(snap.mesh_geometry, 1);
         assert_eq!(snap.indirect_dispatch, 1);
+        assert_eq!(snap.submitted_draws, 2);
+        assert_eq!(snap.submitted_dispatches, 1);
         assert_eq!(snap.dropped_pending, 1);
         assert_eq!(snap.dropped_failed, 1);
-        assert!((snap.dropped_pso_draws - 1.0).abs() < 1e-6);
+        assert_eq!(snap.dropped_other, 1);
+        assert_eq!(
+            snap.dropped_window_total,
+            snap.dropped_null + snap.dropped_pending + snap.dropped_failed + snap.dropped_other
+        );
+        assert_eq!(snap.dropped_indirect_only, 1);
+        assert!((snap.dropped_pso_draws - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gpu_hw_ms_uses_window_frames_not_one_second_divisor() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_window_snapshot(1.0, 0.0);
+        set_ring_available(true);
+        HW_TIME_US.store(50_000, Ordering::Relaxed);
+        HW_SAMPLES.store(5, Ordering::Relaxed);
+        let snap = take_window_snapshot(10.0, 0.0);
+        assert_eq!(snap.window_frames, 10);
+        assert!((snap.gpu_hw_total_ms - 50.0).abs() < 1e-6);
+        assert!((snap.gpu_hw_ms - 5.0).abs() < 1e-6);
+        assert!((snap.gpu_hw_ms_per_frame - 5.0).abs() < 1e-6);
+        assert!((snap.gpu_hw_ms_per_sample - 10.0).abs() < 1e-6);
     }
 
     #[test]

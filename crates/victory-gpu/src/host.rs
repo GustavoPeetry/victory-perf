@@ -934,6 +934,7 @@ fn create() -> windows::core::Result<Host> {
             .inspect_err(|e| tracing::warn!(error = %e, "hardware GPU timestamp ring unavailable"))
             .ok();
         crate::render_graph::set_ring_available(timestamp_ring.is_some());
+        crate::rea_telemetry::log_effective_config();
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -2323,6 +2324,16 @@ fn relay_exact() -> bool {
     // since the walls of the first room were found drawn in every run with
     // this set and in fewer than half without it).
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
+}
+
+pub(crate) fn relay_level() -> u8 {
+    if !relay() {
+        0
+    } else if relay_exact() {
+        2
+    } else {
+        1
+    }
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -4686,8 +4697,9 @@ impl Host {
                         .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
                         .collect();
                     fail(format_args!(
-                        "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY=1) of {} lists{}{}",
+                        "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY={}) of {} lists{}{}",
                         flights.len(),
+                        relay_level(),
                         runs.len(),
                         self.removal_data(&runs),
                         last_notes(&runs)
@@ -7845,6 +7857,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+            let window_secs = self.logged.elapsed().as_secs_f64();
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
@@ -7937,8 +7950,19 @@ impl Meter {
             if let Some(h) = host() {
                 h.poll_gpu_timestamps();
             }
-            let rg = crate::render_graph::take_window_snapshot(frames, gpu);
-            crate::rea_telemetry::log_window(fps, ms, cpu, gpu, back_ms, back_mb, draws, &rg);
+            let rg = crate::render_graph::take_window_snapshot(logged_frames, gpu);
+            crate::rea_telemetry::log_window(
+                fps,
+                ms,
+                cpu,
+                gpu,
+                back_ms,
+                back_mb,
+                draws,
+                logged_frames,
+                window_secs,
+                &rg,
+            );
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

@@ -291,6 +291,10 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
         if duplicated {
             command.env(RELAUNCHED_FROM, (me as usize).to_string());
         }
+        command.env(
+            "VICTORY_RUN_ID",
+            format!("relaunch-from-pid{}", std::process::id()),
+        );
         command.spawn()
     });
     match spawned {

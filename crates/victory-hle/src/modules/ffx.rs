@@ -26,6 +26,23 @@ impl FfxHleMode {
             _ => Self::Original,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Fsr3 => "fsr3",
+            Self::Dlss => "dlss",
+        }
+    }
+}
+
+/// Snapshot of opt-in FidelityFX HLE export mode and call counts.
+pub fn telemetry_stats() -> (FfxHleMode, u64, u64) {
+    (
+        FfxHleMode::from_env(),
+        FFX_CREATE_CALLS.load(Ordering::Relaxed),
+        FFX_DISPATCH_CALLS.load(Ordering::Relaxed),
+    )
 }
 
 /// Clean-room stub returning abstract REA-003 FFX interface revision when enabled.
