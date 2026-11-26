@@ -57,6 +57,17 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Asynchronous direct-queue hardware timestamp ring for calibrated GPU timing.
+    timestamp_ring: Option<crate::render_graph::GpuTimestampRing>,
+}
+
+impl Host {
+    /// Resolves any completed hardware GPU timestamp brackets up to the current fence.
+    pub(crate) fn poll_gpu_timestamps(&self) {
+        if let Some(ring) = &self.timestamp_ring {
+            ring.resolve_completed(&self.fence);
+        }
+    }
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -909,6 +920,10 @@ fn create() -> windows::core::Result<Host> {
         });
         let _ = crate::caps::init_host_caps(&device, adapter.as_ref());
         crate::rebar::probe(&device, card_budget);
+        let timestamp_ring = crate::render_graph::GpuTimestampRing::new(&device, &queue)
+            .inspect_err(|e| tracing::warn!(error = %e, "hardware GPU timestamp ring unavailable"))
+            .ok();
+        crate::render_graph::set_ring_available(timestamp_ring.is_some());
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -925,6 +940,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            timestamp_ring,
         })
     }
 }
@@ -4720,6 +4736,7 @@ impl Host {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
+            self.poll_gpu_timestamps();
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5271,6 +5288,7 @@ impl Host {
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
+                self.poll_gpu_timestamps();
             }
             line().landed.extend(landed);
         }
@@ -5429,8 +5447,18 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // SAFETY: plain query on Fence before recording a timestamp bracket.
+        let completed_fence = unsafe { self.fence.GetCompletedValue() };
+        let ts_bracket = self
+            .timestamp_ring
+            .as_ref()
+            .and_then(|ring| ring.prepare_bracket(this_submission, completed_fence));
         let prepared = std::time::Instant::now();
         if late {
+            if let Some(bracket) = &ts_bracket {
+                lists.insert(0, Some(bracket.begin_cmd.clone()));
+                lists.push(Some(bracket.end_cmd.clone()));
+            }
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -5440,6 +5468,15 @@ impl Host {
             };
             drop(held_order);
             self.card_sent();
+            if let Some(bracket) = &ts_bracket
+                && let Some(ring) = &self.timestamp_ring
+            {
+                if signalled.is_ok() {
+                    ring.commit_bracket(bracket.slot_idx, *submitted);
+                } else {
+                    ring.abort_bracket(bracket.slot_idx);
+                }
+            }
             if let Err(e) = signalled {
                 fail(format_args!(
                     "a submission sent ahead could not be followed by a signal ({e})"
@@ -5468,9 +5505,17 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        #[cfg(feature = "diagnostics")]
+        let multi_group = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let multi_group = false;
+        if !multi_group && let Some(bracket) = &ts_bracket {
+            lists.insert(0, Some(bracket.begin_cmd.clone()));
+            lists.push(Some(bracket.end_cmd.clone()));
+        }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if multi_group {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -5482,6 +5527,14 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        if multi_group && let Some(bracket) = &ts_bracket {
+            // SAFETY: single closed begin-timestamp command list on the direct queue.
+            unsafe {
+                let _queue_guard = crate::tiles::queue_lock();
+                self.queue
+                    .ExecuteCommandLists(&[Some(bracket.begin_cmd.clone())]);
+            }
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -5538,6 +5591,28 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        if let Some(bracket) = &ts_bracket
+            && let Some(ring) = &self.timestamp_ring
+        {
+            if multi_group {
+                *submitted += 1;
+                // SAFETY: closed end-timestamp list on the direct queue, waited before resolve.
+                unsafe {
+                    let _queue_guard = crate::tiles::queue_lock();
+                    self.queue
+                        .ExecuteCommandLists(&[Some(bracket.end_cmd.clone())]);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    if waited.is_ok() {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
+                }
+            }
+            ring.commit_bracket(bracket.slot_idx, *submitted);
+            ring.resolve_completed(&self.fence);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -7833,7 +7908,11 @@ impl Meter {
             pipeline_telemetry_line();
             p2_diag_line();
             crate::dxr_proto::maybe_probe_host();
-            crate::rea_telemetry::log_window(fps, ms, cpu, gpu, back_ms, back_mb, draws);
+            if let Some(h) = host() {
+                h.poll_gpu_timestamps();
+            }
+            let rg = crate::render_graph::take_window_snapshot(frames, gpu);
+            crate::rea_telemetry::log_window(fps, ms, cpu, gpu, back_ms, back_mb, draws, &rg);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

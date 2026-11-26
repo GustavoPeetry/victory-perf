@@ -215,7 +215,8 @@ pub(crate) fn append_json_line_to(path: &Path, line: &str) -> Result<(), String>
     writeln!(file, "{line}").map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// Emits the expanded 5-second REA-002 telemetry summary and optional NDJSON line.
+/// Emits the expanded 5-second REA-002 / REA-003 telemetry summary and optional NDJSON line.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn log_window(
     fps: f64,
     avg_ms: f64,
@@ -224,6 +225,7 @@ pub(crate) fn log_window(
     back_ms: f64,
     back_mb: f64,
     draws: f64,
+    rg: &crate::render_graph::RenderGraphSnapshot,
 ) {
     let seq = WINDOWS_LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
     let pacing = pacing_snapshot();
@@ -256,11 +258,15 @@ pub(crate) fn log_window(
     let saved_mb = stream.scratch_bytes_saved as f64 / (1024.0 * 1024.0);
     let ring_mb = upload.ring_bytes_suballoc as f64 / (1024.0 * 1024.0);
     let cq_mb = upload.copy_queue_bytes as f64 / (1024.0 * 1024.0);
+    let gpu_status = rg.gpu_time_status.as_str();
 
     tracing::info!(
         "REA-002 telemetry: seq={seq} fps={fps:.1} avg_ms={avg_ms:.2} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} low1_fps={:.1} \
          stalls_100={} stalls_250={} stalls_500={} stalls_1000={} cpu_prep_ms={cpu_prep_ms:.2} gpu_ms={gpu_ms:.2} \
+         gpu_time_status={gpu_status} gpu_hw_ms={:.2} gpu_hw_samples={} \
          back_ms={back_ms:.2} back_mb={back_mb:.2} draws={draws:.0} \
+         standin_draws={:.1} standin_brk={}/{}/{} dropped_pso_draws={:.1} dropped_brk={}/{}/{} \
+         rg_passes=gfx:{}/depth:{}/mesh:{}/rect:{}/cs:{}/idraw:{}/idisp:{} \
          vram_used_mb={vram_used_mb} vram_budget_mb={vram_budget_mb} acc_comm_mb={acc_comm_mb} acc_res_mb={acc_res_mb} \
          sparse_mapped_mb={} sparse_virt_mb={} sparse_pool_mb={} sparse_reclaimed_tiles={} reclaim_mb={reclaim_mb} \
          shadow_ram_mb={shadow_ram_mb} shadow_vram_mb={shadow_vram_mb} \
@@ -282,6 +288,23 @@ pub(crate) fn log_window(
         pacing.stalls_250ms,
         pacing.stalls_500ms,
         pacing.stalls_1000ms,
+        rg.gpu_hw_ms,
+        rg.gpu_hw_samples,
+        rg.standin_draws,
+        rg.standin_ambient,
+        rg.standin_shadowmask,
+        rg.standin_exposure,
+        rg.dropped_pso_draws,
+        rg.dropped_null,
+        rg.dropped_pending,
+        rg.dropped_failed,
+        rg.graphics_color,
+        rg.depth_prepass,
+        rg.mesh_geometry,
+        rg.rect_pass,
+        rg.compute,
+        rg.indirect_draw,
+        rg.indirect_dispatch,
         sparse.physical_mapped_mb,
         sparse.virtual_reserved_mb,
         sparse.pool_capacity_mb,
@@ -339,7 +362,8 @@ pub(crate) fn log_window(
         let json = format!(
             "{{\"seq\":{seq},\"fps\":{fps:.3},\"avg_ms\":{avg_ms:.3},\"p50_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},\"low1_fps\":{:.3},\
              \"stalls_100ms\":{},\"stalls_250ms\":{},\"stalls_500ms\":{},\"stalls_1000ms\":{},\
-             \"cpu_prep_ms\":{cpu_prep_ms:.3},\"gpu_ms\":{gpu_ms:.3},\"back_ms\":{back_ms:.3},\"back_mb\":{back_mb:.3},\"draws\":{draws:.2},\
+             \"cpu_prep_ms\":{cpu_prep_ms:.3},\"gpu_ms\":{gpu_ms:.3},{},\
+             \"back_ms\":{back_ms:.3},\"back_mb\":{back_mb:.3},\"draws\":{draws:.2},\
              \"vram_used_mb\":{vram_used_mb},\"vram_budget_mb\":{vram_budget_mb},\"acc_comm_mb\":{acc_comm_mb},\"acc_res_mb\":{acc_res_mb},\
              \"sparse_mapped_mb\":{},\"sparse_virt_mb\":{},\"sparse_reclaimed_tiles\":{},\"shadow_ram_mb\":{shadow_ram_mb},\"shadow_vram_mb\":{shadow_vram_mb},\
              \"dxgi_act\":{},\"dxgi_hit\":{},\"audit_runs\":{},\"audit_mismatches\":{},\
@@ -358,6 +382,7 @@ pub(crate) fn log_window(
             pacing.stalls_250ms,
             pacing.stalls_500ms,
             pacing.stalls_1000ms,
+            rg.json_fields(),
             sparse.physical_mapped_mb,
             sparse.virtual_reserved_mb,
             sparse.tiles_reclaimed_total,
@@ -440,5 +465,27 @@ mod tests {
         let contents = std::fs::read_to_string(&temp_file).unwrap();
         assert!(contents.contains("{\"ok\":true}"));
         let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn json_window_includes_gpu_time_status_and_render_graph_fields() {
+        let _g = crate::render_graph::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = crate::render_graph::take_window_snapshot(1.0, 0.0);
+        crate::render_graph::set_ring_available(true);
+        crate::render_graph::record_pipeline_exec(
+            crate::render_graph::PassKind::StandInAmbient,
+            Some(crate::render_graph::StandInKind::Ambient),
+            false,
+            false,
+        );
+        crate::render_graph::record_dropped_pso(crate::pipeline::PipelineMiss::Failed);
+        let rg = crate::render_graph::take_window_snapshot(2.0, 0.0);
+        let json = format!("{{{}}}", rg.json_fields());
+        assert!(json.contains("\"gpu_time_status\":\"unavailable\""));
+        assert!(json.contains("\"standin_ambient\":1"));
+        assert!(json.contains("\"dropped_failed\":1"));
+        assert!(json.contains("\"gpu_hw_ms\":0.000"));
     }
 }

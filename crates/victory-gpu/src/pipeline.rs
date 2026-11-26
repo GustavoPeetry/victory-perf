@@ -76,7 +76,8 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
-static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static KEPT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
@@ -122,6 +123,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    pub(crate) origin: crate::shader_cache::ShaderOrigin,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
@@ -154,7 +156,10 @@ impl Shader {
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    KEPT[3].fetch_add(
+                        t.host.dxil.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -184,7 +189,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = victory_shader::container_programs(&c).unwrap_or_default();
-    let host = crate::shader_cache::host_shader(container)?;
+    let (host, origin) = crate::shader_cache::host_shader_with_origin(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let writes = stores || programs.iter().any(image_stores);
     let used = programs
@@ -197,7 +202,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, writes })
+    Ok(Translated {
+        host,
+        origin,
+        used,
+        stores,
+        writes,
+    })
 }
 
 /// Whether a console program has an image store or atomic (it writes a
@@ -210,7 +221,8 @@ fn image_stores(program: &victory_shader::NativeProgram) -> bool {
     };
     code.iter().any(|i| {
         matches!(i.encoding, Encoding::Mimg)
-            && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
+            && i.name()
+                .is_none_or(|n| n.contains("store") || n.contains("atomic"))
     })
 }
 
@@ -277,7 +289,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -292,7 +305,10 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none"
+        );
     }
 }
 
@@ -434,6 +450,7 @@ pub(crate) fn translate_linked(
                 ms,
                 Translated {
                     host: ms_host,
+                    origin: ms_orig.origin,
                     used: ms_orig.used.clone(),
                     stores: ms_orig.stores,
                     writes: ms_orig.writes,
@@ -446,6 +463,7 @@ pub(crate) fn translate_linked(
                         p,
                         Translated {
                             host,
+                            origin: ps_orig.origin,
                             used: ps_orig.used.clone(),
                             stores: ps_orig.stores,
                             writes: ps_orig.writes,
@@ -647,7 +665,10 @@ pub(crate) fn note_drop(this: This) {
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).

@@ -149,18 +149,20 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     .map_err(|e| e.to_string())
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    host_shader_cached(container).map(|(shader, _)| shader)
+/// Origin of a host shader container translation.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShaderOrigin {
+    Native,
+    StandIn(crate::render_graph::StandInKind),
 }
 
-/// Like [`host_shader`], also reporting whether the translation came from the
-/// disk cache (`true`) or was freshly translated (`false`).
+/// Translates `container` (via disk cache when available) and reports whether
+/// it resolved from disk cache (`true`) plus native vs. stand-in provenance.
 #[cfg(windows)]
-pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool), String> {
-    if let Some(s) = stand_in(container) {
-        return Ok((s, false));
+fn host_shader_cached_inner(container: &[u8]) -> Result<(HostShader, bool, ShaderOrigin), String> {
+    if let Some((s, kind)) = stand_in_with_origin(container) {
+        return Ok((s, false, ShaderOrigin::StandIn(kind)));
     }
     let translate = |c: &[u8]| {
         let started = std::time::Instant::now();
@@ -181,9 +183,33 @@ pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool),
         None => translate(container).map(|shader| (shader, false)),
     };
     match r {
-        Err(e) => exposure_stub(container).map(|s| (s, false)).ok_or(e),
-        ok => ok,
+        Ok((shader, from_cache)) => Ok((shader, from_cache, ShaderOrigin::Native)),
+        Err(e) => exposure_stub(container)
+            .map(|s| {
+                (
+                    s,
+                    false,
+                    ShaderOrigin::StandIn(crate::render_graph::StandInKind::Exposure),
+                )
+            })
+            .ok_or(e),
     }
+}
+
+/// Like [`host_shader`], also reporting whether the translation came from the
+/// disk cache (`true`) or was freshly translated (`false`).
+#[cfg(windows)]
+pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool), String> {
+    host_shader_cached_inner(container).map(|(shader, from_cache, _)| (shader, from_cache))
+}
+
+/// Translates `container` (via disk cache when available) and reports native vs.
+/// stand-in provenance.
+#[cfg(windows)]
+pub(crate) fn host_shader_with_origin(
+    container: &[u8],
+) -> Result<(HostShader, ShaderOrigin), String> {
+    host_shader_cached_inner(container).map(|(shader, _, origin)| (shader, origin))
 }
 
 /// Optional stand-ins from `victory_shader::emit::stand_in`:
@@ -192,14 +218,28 @@ pub(crate) fn host_shader_cached(container: &[u8]) -> Result<(HostShader, bool),
 /// - `VICTORY_SHADOWMASK_STUB=1`: replaces RT distant shadow passes with 1.0
 ///   (lit) (`VICTORY_SHADOWMASK_STUB_VALUE`, default 1.0).
 #[cfg(windows)]
-fn stand_in(container: &[u8]) -> Option<HostShader> {
+fn stand_in_with_origin(
+    container: &[u8],
+) -> Option<(HostShader, crate::render_graph::StandInKind)> {
     use victory_shader::emit::stand_in as s;
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
     let kinds = [
-        ("VICTORY_AMBIENT_STUB", s::AMBIENT_HASHES, s::AMBIENT_VALUE, s::ambient_slots(&hash)),
-        ("VICTORY_SHADOWMASK_STUB", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE, s::SHADOWMASK_SLOTS),
+        (
+            "VICTORY_AMBIENT_STUB",
+            crate::render_graph::StandInKind::Ambient,
+            s::AMBIENT_HASHES,
+            s::AMBIENT_VALUE,
+            s::ambient_slots(&hash),
+        ),
+        (
+            "VICTORY_SHADOWMASK_STUB",
+            crate::render_graph::StandInKind::ShadowMask,
+            s::SHADOWMASK_HASHES,
+            s::SHADOWMASK_VALUE,
+            s::SHADOWMASK_SLOTS,
+        ),
     ];
-    for (name, hashes, value, defaults) in kinds {
+    for (name, kind, hashes, value, defaults) in kinds {
         if std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
             continue;
         }
@@ -229,7 +269,7 @@ fn stand_in(container: &[u8]) -> Option<HostShader> {
                     outputs = ?plan.seen,
                     "pass replaced by a stand-in writing each output in its own encoding"
                 );
-                return Some(shader);
+                return Some((shader, kind));
             }
             Err(e) => {
                 tracing::warn!(%hash, stand_in = name, error = %e, "stand-in does not translate");
@@ -614,7 +654,10 @@ mod tests {
             vec!["5dc3b25986622949".to_owned(), "369cbe906ea72764".to_owned()]
         );
         for hash in WAVE_WIDE_DEFAULT {
-            assert!(wave_wide_listed(hash), "missing default wave-wide hash {hash}");
+            assert!(
+                wave_wide_listed(hash),
+                "missing default wave-wide hash {hash}"
+            );
         }
         assert!(!wave_wide_listed("0000000000000000"));
     }

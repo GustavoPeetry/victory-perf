@@ -15,10 +15,13 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
-mod capture;
+#[cfg(windows)]
+pub mod accounting;
+pub mod authority;
 #[cfg(windows)]
 pub mod caps;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -52,13 +55,12 @@ mod primitive;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
-pub mod accounting;
-pub mod authority;
-#[cfg(windows)]
 pub mod rea_telemetry;
 pub mod readback;
 #[cfg(windows)]
 mod rebar;
+#[cfg(windows)]
+pub mod render_graph;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -69,11 +71,11 @@ pub mod shader_cache;
 pub mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod texture;
+#[cfg(windows)]
 pub mod tiles;
 #[cfg(windows)]
 pub mod upload_ring;
-#[cfg(windows)]
-mod texture;
 #[cfg(windows)]
 mod watch;
 

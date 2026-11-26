@@ -304,11 +304,32 @@ impl Stage {
     }
 }
 
+fn pipeline_pass_classification(
+    compute: bool,
+    mesh: bool,
+    rects: bool,
+    num_render_targets: u32,
+    stages: &[Stage],
+) -> (
+    crate::render_graph::PassKind,
+    Option<crate::render_graph::StandInKind>,
+) {
+    let standin = stages.iter().find_map(|s| match s.translated().origin {
+        crate::shader_cache::ShaderOrigin::StandIn(kind) => Some(kind),
+        crate::shader_cache::ShaderOrigin::Native => None,
+    });
+    let pass_kind =
+        crate::render_graph::classify_pipeline(compute, mesh, rects, num_render_targets, standin);
+    (pass_kind, standin)
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) pass_kind: crate::render_graph::PassKind,
+    pub(crate) standin: Option<crate::render_graph::StandInKind>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -644,9 +665,12 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let (pass_kind, standin) = pipeline_pass_classification(true, false, false, 0, &bound);
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                pass_kind,
+                standin,
                 pso,
                 root,
                 stages: bound,
@@ -705,9 +729,18 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let (pass_kind, standin) = pipeline_pass_classification(
+                false,
+                true,
+                false,
+                g.targets.NumRenderTargets,
+                &bound,
+            );
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                pass_kind,
+                standin,
                 pso,
                 root,
                 stages: bound,
@@ -826,9 +859,18 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let (pass_kind, standin) = pipeline_pass_classification(
+            false,
+            false,
+            rect_gs.is_some(),
+            g.targets.NumRenderTargets,
+            &bound,
+        );
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            pass_kind,
+            standin,
             pso,
             root,
             stages: bound,
