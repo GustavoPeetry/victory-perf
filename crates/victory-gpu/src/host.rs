@@ -847,6 +847,7 @@ fn create() -> windows::core::Result<Host> {
             let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
             a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).ok().map(|()| own.Budget)
         });
+        let _ = crate::caps::init_host_caps(&device, adapter.as_ref());
         crate::rebar::probe(&device, card_budget);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
