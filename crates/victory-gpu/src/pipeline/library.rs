@@ -514,7 +514,10 @@ fn preserve_rejected(dir: &std::path::Path) -> std::io::Result<Option<std::path:
     let dst = if !primary.exists() {
         primary
     } else {
-        dir.join(format!("host-pipelines.rejected.{}.bin", std::process::id()))
+        dir.join(format!(
+            "host-pipelines.rejected.{}.bin",
+            std::process::id()
+        ))
     };
     std::fs::rename(&src, &dst)?;
     Ok(Some(dst))
@@ -634,7 +637,10 @@ fn create_counted(
 ) -> windows::core::Result<ID3D12PipelineState> {
     let compile_started = std::time::Instant::now();
     let res = create();
-    DRIVER_COMPILE_US.fetch_add(compile_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    DRIVER_COMPILE_US.fetch_add(
+        compile_started.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
     match res {
         Ok(pso) => {
             MADE.fetch_add(1, Ordering::Relaxed);
@@ -928,13 +934,17 @@ mod tests {
         let lib = dir.path().join(LIBRARY_FILE);
         let rejected = dir.path().join(REJECTED_FILE);
         std::fs::write(&lib, b"bad-lib-1").unwrap();
-        let first = preserve_rejected(dir.path()).unwrap().expect("preserved primary");
+        let first = preserve_rejected(dir.path())
+            .unwrap()
+            .expect("preserved primary");
         assert_eq!(first, rejected);
         assert!(!lib.exists());
         assert_eq!(std::fs::read(&rejected).unwrap(), b"bad-lib-1");
         // Second rejection preserves without overwriting the first backup.
         std::fs::write(&lib, b"bad-lib-2").unwrap();
-        let second = preserve_rejected(dir.path()).unwrap().expect("preserved secondary");
+        let second = preserve_rejected(dir.path())
+            .unwrap()
+            .expect("preserved secondary");
         assert_ne!(second, rejected);
         assert!(!lib.exists());
         assert_eq!(std::fs::read(&rejected).unwrap(), b"bad-lib-1");

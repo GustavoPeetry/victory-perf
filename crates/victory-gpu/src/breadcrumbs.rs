@@ -250,6 +250,13 @@ pub fn format_removal_report(completed_fence: u64) -> String {
     let suspects: Vec<String> = entries
         .iter()
         .filter(|e| e.fence_value == u64::MAX || e.fence_value > completed_fence)
+        .take(4)
+        .map(format_entry)
+        .collect();
+    let recent_suspects: Vec<String> = entries
+        .iter()
+        .rev()
+        .filter(|e| e.fence_value == u64::MAX || e.fence_value > completed_fence)
         .take(6)
         .map(format_entry)
         .collect();
@@ -264,8 +271,16 @@ pub fn format_removal_report(completed_fence: u64) -> String {
     } else {
         suspects.join(" | ")
     };
+    let recent_str = if recent_suspects.is_empty() {
+        entries
+            .last()
+            .map(format_entry)
+            .unwrap_or_else(|| "none".to_owned())
+    } else {
+        recent_suspects.join(" | ")
+    };
     format!(
-        "; gpu_breadcrumbs: completed_fence={completed_fence}; last_completed=[{last_done_str}]; suspect_inflight=[{suspects_str}]"
+        "; gpu_breadcrumbs: completed_fence={completed_fence}; last_completed=[{last_done_str}]; suspect_inflight=[{suspects_str}]; recent_inflight=[{recent_str}]"
     )
 }
 
