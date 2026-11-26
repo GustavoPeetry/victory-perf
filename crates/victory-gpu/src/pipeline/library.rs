@@ -728,13 +728,21 @@ pub(crate) fn save(now: bool) {
     let (Some(dir), Some(library)) = (DIR.get(), library()) else {
         return;
     };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Own the staging files through publication. Periodic callers must not
+    // wait behind serialization, but an orderly exit must wait.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(lock) => lock,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -744,7 +752,7 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let (bytes, write_early) = {
+    let (bytes, added, write_early) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -768,17 +776,20 @@ pub(crate) fn save(now: bool) {
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
             size
         };
-        (bytes, used_changed)
+        (bytes, added, used_changed)
     };
     let library_written = if bytes > 0 {
         replace_library(dir, &tmp)
     } else {
         Ok(())
     };
+    if library_written.is_err() {
+        library.added.fetch_add(added, Ordering::Relaxed);
+    }
     if bytes > 0 && library_written.is_ok() {
+        SAVED.store(bytes as u64, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -822,7 +833,12 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            if write_early {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -872,6 +888,13 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
+/// VICTORY_PIPELINE_HISTORY=0 skips scheduling history without disabling the
+/// driver pipeline library.
+fn saved_pipeline_history() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HISTORY").is_none_or(|v| v != "0"))
+}
+
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
@@ -892,11 +915,14 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    saved_pipeline_history() && used().as_ref().is_some_and(|s| s.contains(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
+    if !saved_pipeline_history() {
+        return;
+    }
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
