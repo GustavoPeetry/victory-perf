@@ -1322,10 +1322,11 @@ mod tests {
 
     fn single_color_target(format: DXGI_FORMAT) -> GraphicsState {
         let mut state = GraphicsState {
-            targets: targets(&[format]),
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ..GraphicsState::default()
         };
+        state.targets.NumRenderTargets = 1;
+        state.targets.RTFormats[0] = format;
         state.depth.DepthEnable = false.into();
         state
     }
@@ -1375,7 +1376,7 @@ mod tests {
                     pRootSignature: unsafe { std::mem::transmute_copy(&root) },
                     VS: code(&vs),
                     PS: code(&ps),
-                    BlendState: host_blend(&state.blend, &state.targets),
+                    BlendState: state.blend,
                     SampleMask: state.sample_mask,
                     RasterizerState: state.rasterizer,
                     DepthStencilState: state.depth,
