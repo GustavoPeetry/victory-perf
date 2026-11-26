@@ -386,6 +386,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     };
     UNIMPLEMENTED_PIPELINE_CALLS[slot_idx].fetch_add(1, Ordering::Relaxed);
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if SLOT == 0x218 {
+        crate::dxr_proto::on_slot_0x218_call(calls, desc);
+    }
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };

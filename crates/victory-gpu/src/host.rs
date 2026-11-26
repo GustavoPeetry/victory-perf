@@ -7200,6 +7200,7 @@ impl Meter {
             indirect_line(logged_frames);
             pipeline_telemetry_line();
             p2_diag_line();
+            crate::dxr_proto::maybe_probe_host();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
