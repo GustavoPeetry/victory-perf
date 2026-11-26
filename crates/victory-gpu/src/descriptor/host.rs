@@ -768,6 +768,49 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+static GPU_FASTPATH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static DYNAMIC_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYNAMIC_WRAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYNAMIC_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `VICTORY_REA_GPU_FASTPATH=1` is active for complementary GPU/host
+/// fast paths (TLS shadow cache, dynamic slot sizing/stats, barrier dedup).
+pub fn gpu_fastpath_enabled() -> bool {
+    *GPU_FASTPATH.get_or_init(|| {
+        std::env::var_os("VICTORY_REA_GPU_FASTPATH").is_some_and(|v| v == "1")
+    })
+}
+
+/// Returns `(allocations, wrap_hits, refusals)` across dynamic descriptor slot
+/// allocations.
+#[allow(dead_code)]
+pub fn dynamic_slot_stats() -> (u64, u64, u64) {
+    (
+        DYNAMIC_ALLOCS.load(std::sync::atomic::Ordering::Relaxed),
+        DYNAMIC_WRAP_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        DYNAMIC_REFUSALS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn configured_dynamic_slots(null: u32) -> u32 {
+    if !gpu_fastpath_enabled() {
+        return DYNAMIC;
+    }
+    let Some(raw) = std::env::var("VICTORY_DYNAMIC_SLOTS").ok() else {
+        return DYNAMIC;
+    };
+    let Ok(parsed) = raw.trim().parse::<u32>() else {
+        return DYNAMIC;
+    };
+    let max_cap = if null == 0 {
+        1 << 19
+    } else {
+        (null / 2).clamp(65_536.min(null), 1 << 19)
+    };
+    let min_cap = 65_536.min(max_cap);
+    parsed.clamp(min_cap, max_cap).max(1)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -788,7 +831,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -800,6 +842,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { configured_dynamic_slots(null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -836,7 +879,7 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // The null slot every index past the heap reads is the heap's last,
         // past the dynamic slots (`probe_view_limit`): all of them are free.
-        let taken = vec![false; DYNAMIC as usize];
+        let taken = vec![false; extra as usize];
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -872,7 +915,7 @@ impl HostHeap {
             pending_unmake: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
+            free: std::sync::atomic::AtomicU32::new(extra.saturating_sub(1)),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::new(std::array::from_fn(|_| std::collections::HashSet::new())),
@@ -987,12 +1030,14 @@ impl HostHeap {
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed)
             && FAILED[1].load(std::sync::atomic::Ordering::Relaxed) < WALKS;
         let n = n as usize;
+        let cap = self.dynamic as usize;
+        let start_next = *next as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        let starts = (start_next..cap).chain(0..start_next);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { cap } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1009,6 +1054,7 @@ impl HostHeap {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
                 FAILED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            DYNAMIC_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1023,7 +1069,11 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        DYNAMIC_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if first < start_next {
+            DYNAMIC_WRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        *next = ((first + n) % cap) as u32;
         Some(self.count + first as u32)
     }
 
@@ -3730,5 +3780,51 @@ mod tests {
         assert!(heap.mirror(7, 0, false).is_none());
         assert_eq!(take_oob_stats(), (2, 1, 7, 10));
         assert_eq!(take_oob_stats(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn dynamic_slots_wrap_around_and_track_refusals() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let (a0, w0, r0) = super::dynamic_slot_stats();
+        let first = heap.dynamic(heap.dynamic - 101).unwrap();
+        let tail = heap.dynamic(60).unwrap();
+        assert_eq!((first, tail), (4, 4 + heap.dynamic - 101));
+        assert_eq!(heap.dynamic(50), None);
+        heap.release(first, 50);
+        // Cursor sat near the tail; allocating 50 wraps to the freed prefix.
+        assert_eq!(heap.dynamic(50), Some(4));
+        let (a1, w1, r1) = super::dynamic_slot_stats();
+        assert!(a1 >= a0 + 3);
+        assert!(w1 > w0);
+        assert!(r1 > r0);
+    }
+
+    #[test]
+    fn dynamic_slots_respect_env_override_when_fastpath_enabled() {
+        const CHILD_ENV: &str = "VICTORY_REA_CHILD_DYNAMIC_SLOTS_TEST";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert!(super::gpu_fastpath_enabled());
+            let Some(heap) = HostHeap::new(false, 4) else {
+                return;
+            };
+            assert_eq!(heap.dynamic, 65_536);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("descriptor::host::tests::dynamic_slots_respect_env_override_when_fastpath_enabled")
+            .env(CHILD_ENV, "1")
+            .env("VICTORY_REA_GPU_FASTPATH", "1")
+            .env("VICTORY_DYNAMIC_SLOTS", "65536")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

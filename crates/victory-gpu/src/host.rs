@@ -5795,6 +5795,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
+        dedup_barriers(&mut to_copy);
+        dedup_barriers(&mut barriers);
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
         if barriers.is_empty() && syncs.is_empty() && !gathered {
@@ -6019,6 +6021,7 @@ impl HostList {
             *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
         let buffer = buffer.clone();
+        dedup_barriers(&mut barriers);
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers.
             unsafe { self.list.ResourceBarrier(&barriers) };
@@ -6031,7 +6034,7 @@ impl HostList {
     pub(crate) fn clamp_end(&self) {
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
-        let barriers: Vec<_> = chunks.all[..used]
+        let mut barriers: Vec<_> = chunks.all[..used]
             .iter_mut()
             .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             .map(|(buffer, state)| {
@@ -6043,6 +6046,7 @@ impl HostList {
                 )
             })
             .collect();
+        dedup_barriers(&mut barriers);
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers.
             unsafe { self.list.ResourceBarrier(&barriers) };
@@ -6058,6 +6062,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.pooled_uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7811,6 +7816,79 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+static BARRIERS_ELIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns how many redundant resource barriers were elided or collapsed when
+/// `VICTORY_REA_GPU_FASTPATH=1` is active.
+#[allow(dead_code)]
+pub fn barrier_fastpath_stats() -> u64 {
+    BARRIERS_ELIDED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn dedup_barriers(barriers: &mut Vec<D3D12_RESOURCE_BARRIER>) -> usize {
+    if !crate::descriptor::host::gpu_fastpath_enabled() || barriers.is_empty() {
+        return 0;
+    }
+    dedup_barriers_inner(barriers, true)
+}
+
+fn dedup_barriers_inner(barriers: &mut Vec<D3D12_RESOURCE_BARRIER>, record_stats: bool) -> usize {
+    const {
+        assert!(!std::mem::needs_drop::<D3D12_RESOURCE_BARRIER>());
+    }
+    if barriers.is_empty() {
+        return 0;
+    }
+    let orig = barriers.len();
+    let mut write = 0usize;
+    for read in 0..orig {
+        // SAFETY: `D3D12_RESOURCE_BARRIER` union variants are all `ManuallyDrop`,
+        // so bitwise reading/writing never duplicates or drops COM references.
+        let b = unsafe { std::ptr::read(&barriers[read]) };
+        if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+            // SAFETY: active union variant is Transition when Type == TRANSITION.
+            let t = unsafe { &*b.Anonymous.Transition };
+            if t.StateBefore == t.StateAfter {
+                continue;
+            }
+            let res_ptr = t.pResource.as_ref().map(windows::core::Interface::as_raw);
+            if write > 0 {
+                let prev = &mut barriers[write - 1];
+                if prev.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+                    && prev.Flags == b.Flags
+                    && b.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+                {
+                    // SAFETY: active union variant is Transition.
+                    let pt = unsafe { &mut *prev.Anonymous.Transition };
+                    let prev_ptr = pt.pResource.as_ref().map(windows::core::Interface::as_raw);
+                    if prev_ptr == res_ptr
+                        && prev_ptr.is_some()
+                        && pt.Subresource == t.Subresource
+                        && pt.StateAfter == t.StateBefore
+                    {
+                        if pt.StateBefore == t.StateAfter {
+                            // Opposite consecutive transitions `a -> b` and `b -> a` cancel out.
+                            write -= 1;
+                        } else {
+                            pt.StateAfter = t.StateAfter;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        // SAFETY: `write <= read < orig`.
+        unsafe { std::ptr::write(&mut barriers[write], b) };
+        write += 1;
+    }
+    barriers.truncate(write);
+    let elided = orig - write;
+    if record_stats && elided > 0 {
+        BARRIERS_ELIDED.fetch_add(elided as u64, Ordering::Relaxed);
+    }
+    elided
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -8062,5 +8140,105 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn dedup_barriers_removes_noop_and_collapses_consecutive() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        };
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        let Some((buf_a, _)) = host.shared_buffer(256) else {
+            return;
+        };
+        let Some((buf_b, _)) = host.shared_buffer(256) else {
+            return;
+        };
+        let mut barriers = vec![
+            super::transition(
+                &buf_a,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COMMON,
+            ),
+            super::transition(
+                &buf_a,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+            super::transition(
+                &buf_a,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            ),
+            super::transition(
+                &buf_b,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+            super::transition(
+                &buf_b,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            ),
+        ];
+        // Off by default: untouched.
+        assert_eq!(super::dedup_barriers(&mut barriers), 0);
+        assert_eq!(barriers.len(), 5);
+
+        let elided = super::dedup_barriers_inner(&mut barriers, false);
+        assert_eq!(elided, 4);
+        assert_eq!(barriers.len(), 1);
+        let t = unsafe { &*barriers[0].Anonymous.Transition };
+        assert_eq!(t.StateBefore, D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(t.StateAfter, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+
+    #[test]
+    fn dedup_barriers_env_flag_elides_in_child() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+        };
+        const CHILD_ENV: &str = "VICTORY_REA_CHILD_BARRIER_DEDUP_TEST";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let Some(host) = super::host() else {
+                return;
+            };
+            let Some((buf, _)) = host.shared_buffer(256) else {
+                return;
+            };
+            let mut barriers = vec![
+                super::transition(
+                    &buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+                super::transition(
+                    &buf,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+            ];
+            let elided = super::dedup_barriers(&mut barriers);
+            assert_eq!(elided, 2);
+            assert!(barriers.is_empty());
+            assert!(super::barrier_fastpath_stats() >= 2);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("host::tests::dedup_barriers_env_flag_elides_in_child")
+            .env(CHILD_ENV, "1")
+            .env("VICTORY_REA_GPU_FASTPATH", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

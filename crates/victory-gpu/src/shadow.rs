@@ -2224,7 +2224,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let taken: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !taken.is_empty() {
+            bump_shadow_epoch();
+        }
+        taken
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3525,20 +3529,152 @@ fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize)
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+static SHADOW_EPOCH: AtomicU64 = AtomicU64::new(1);
+static SHADOW_TLS_HITS: AtomicU64 = AtomicU64::new(0);
+static SHADOW_TLS_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn bump_shadow_epoch() {
+    SHADOW_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// Returns `(hits, misses)` for the per-thread shadow lookup cache
+/// (`VICTORY_REA_GPU_FASTPATH=1`).
+pub fn tls_cache_stats() -> (u64, u64) {
+    (
+        SHADOW_TLS_HITS.load(Ordering::Relaxed),
+        SHADOW_TLS_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+#[derive(Clone, Default)]
+struct TlsShadowEntry {
+    epoch: u64,
+    safe_start: u64,
+    safe_end: u64,
+    exact_addr: u64,
+    exact_end: u64,
+    any: bool,
+    is_window: bool,
+    range_safe: bool,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+struct TlsShadowCache {
+    entries: [TlsShadowEntry; 16],
+    next: usize,
+}
+
+impl Default for TlsShadowCache {
+    fn default() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| TlsShadowEntry::default()),
+            next: 0,
+        }
+    }
+}
+
+thread_local! {
+    static TLS_SHADOW_CACHE: std::cell::RefCell<TlsShadowCache> =
+        std::cell::RefCell::new(TlsShadowCache::default());
+}
+
+fn tls_cache_lookup(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+    let found = TLS_SHADOW_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for idx in 0..cache.entries.len() {
+            let e = &cache.entries[idx];
+            if e.epoch != cur_epoch {
+                continue;
+            }
+            let matched = if e.range_safe && !e.is_window {
+                address >= e.safe_start && end <= e.safe_end
+            } else {
+                address == e.exact_addr && end == e.exact_end && (!e.is_window || e.any == any)
+            };
+            if matched {
+                if let Some(arc) = e.shadow.upgrade() {
+                    if idx > 0 {
+                        cache.entries[..=idx].rotate_right(1);
+                    }
+                    return Some(arc);
+                }
+                cache.entries[idx].epoch = 0;
+                return None;
+            }
+        }
+        None
+    });
+    match found {
+        Some(arc) => {
+            SHADOW_TLS_HITS.fetch_add(1, Ordering::Relaxed);
+            if arc.window {
+                arc.used.store(crate::host::moment(), Ordering::Relaxed);
+                arc.asked[0].fetch_min(address, Ordering::Relaxed);
+                arc.asked[1].fetch_max(end, Ordering::Relaxed);
+                if unsized_ask {
+                    arc.unsized_asks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Some(arc)
+        }
+        None => {
+            SHADOW_TLS_MISSES.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tls_cache_insert(
+    epoch: u64,
+    safe_start: u64,
+    safe_end: u64,
+    exact_addr: u64,
+    exact_end: u64,
+    any: bool,
+    is_window: bool,
+    range_safe: bool,
+    shadow: &Arc<Shadow>,
+) {
+    TLS_SHADOW_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let slot = cache.next % cache.entries.len();
+        cache.next = slot + 1;
+        cache.entries[slot] = TlsShadowEntry {
+            epoch,
+            safe_start,
+            safe_end,
+            exact_addr,
+            exact_end,
+            any,
+            is_window,
+            range_safe,
+            shadow: Arc::downgrade(shadow),
+        };
+    });
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers_write().insert(
+    let mut map = buffers_write();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    bump_shadow_epoch();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_write().remove(&(start, resource));
+    let mut map = buffers_write();
+    if map.remove(&(start, resource)).is_some() {
+        bump_shadow_epoch();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3567,15 +3703,24 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        let removed: Vec<_> = keys.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !removed.is_empty() {
+            bump_shadow_epoch();
+        }
+        gone.extend(removed);
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers_write();
+        let mut took = false;
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
+                took = true;
             }
+        }
+        if took {
+            bump_shadow_epoch();
         }
     }
     let n = gone.len() as u64;
@@ -3632,6 +3777,11 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    let fastpath = crate::descriptor::host::gpu_fastpath_enabled();
+    if fastpath && let Some(cached) = tls_cache_lookup(address, end, len <= 1, any) {
+        return Some(cached);
+    }
+    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
     // Shared-read fast path: 99.99% of calls either hit an already-created
     // buffer shadow or miss into `loose()`, so parallel recording threads never
     // serialize on an exclusive lock.
@@ -3647,8 +3797,29 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 drop(map);
                 return loose(address, end, len <= 1, any);
             }
-            Some((_, entry)) if entry.shadow.is_some() => {
-                return entry.shadow.clone();
+            Some((k, entry)) if entry.shadow.is_some() => {
+                let res = entry.shadow.clone();
+                if fastpath && let Some(ref arc) = res {
+                    let next_start = map
+                        .range((std::ops::Bound::Excluded(*k), std::ops::Bound::Unbounded))
+                        .next()
+                        .map(|(nk, _)| nk.0)
+                        .unwrap_or(u64::MAX);
+                    let safe_end = entry.end.min(next_start);
+                    let range_safe = address >= k.0 && end <= safe_end;
+                    tls_cache_insert(
+                        cur_epoch,
+                        k.0,
+                        safe_end,
+                        address,
+                        end,
+                        any,
+                        false,
+                        range_safe,
+                        arc,
+                    );
+                }
+                return res;
             }
             Some(_) => {}
         }
@@ -3664,6 +3835,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    let next_start = map
+        .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+        .next()
+        .map(|(nk, _)| nk.0)
+        .unwrap_or(u64::MAX);
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3677,10 +3853,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && len >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            bump_shadow_epoch();
             return entry.shadow.clone();
         }
         if !big && let Some(shadow) = rebar_copy(crate::rebar::Kind::Buffer, key.0, len, size, false) {
             entry.shadow = Some(shadow);
+            bump_shadow_epoch();
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -3736,6 +3914,23 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
+        bump_shadow_epoch();
+        let safe_end = entry.end.min(next_start);
+        if fastpath && let Some(ref arc) = entry.shadow {
+            let new_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+            let range_safe = address >= key.0 && end <= safe_end;
+            tls_cache_insert(
+                new_epoch,
+                key.0,
+                safe_end,
+                address,
+                end,
+                any,
+                false,
+                range_safe,
+                arc,
+            );
+        }
     }
     entry.shadow.clone()
 }
@@ -3948,12 +4143,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let fastpath = crate::descriptor::host::gpu_fastpath_enabled();
+    let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
     // Shared-read fast path: 99.99% of lookups hit an existing window.
     {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         let (start, len) = resolve(&map);
         if let Some(shadow) = map.get(&(start, len)) {
             note(shadow);
+            if fastpath {
+                tls_cache_insert(
+                    cur_epoch,
+                    start,
+                    start + len,
+                    address,
+                    end,
+                    any,
+                    true,
+                    false,
+                    shadow,
+                );
+            }
             return Some(shadow.clone());
         }
     }
@@ -3961,6 +4171,20 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (start, len) = resolve(&map);
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
+        let cur_epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+        if fastpath {
+            tls_cache_insert(
+                cur_epoch,
+                start,
+                start + len,
+                address,
+                end,
+                any,
+                true,
+                false,
+                shadow,
+            );
+        }
         return Some(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
@@ -3969,11 +4193,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        bump_shadow_epoch();
         return Some(shadow);
     }
     if let Some(shadow) = rebar_copy(crate::rebar::Kind::Window, start, len, len, true) {
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        bump_shadow_epoch();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4012,6 +4238,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    bump_shadow_epoch();
     Some(shadow)
 }
 
@@ -4203,6 +4430,59 @@ mod window_tests {
         assert_eq!(
             super::LIVE_CLASS[2].load(std::sync::atomic::Ordering::Relaxed),
             base
+        );
+    }
+
+    #[test]
+    fn tls_lookup_cache_hits_and_invalidates_on_epoch() {
+        const CHILD_ENV: &str = "VICTORY_REA_CHILD_TLS_SHADOW_TEST";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert!(crate::descriptor::host::gpu_fastpath_enabled());
+            if crate::host::host().is_none() {
+                return;
+            }
+            let base_addr = 0x7000_0000_0000u64;
+            super::register(101, base_addr, 4096);
+            // Seed entry.shadow directly to avoid touching unmapped guest VA.
+            {
+                let host = crate::host::host().unwrap();
+                let (buffer, data) = host.shared_buffer(4096).unwrap();
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let s = std::sync::Arc::new(super::Shadow::new(buffer, data, gpu, base_addr, 4096));
+                let mut map = super::buffers_write();
+                map.get_mut(&(base_addr, 101)).unwrap().shadow = Some(s);
+                super::bump_shadow_epoch();
+            }
+
+            let (h0, m0) = super::tls_cache_stats();
+            let a = super::lookup(base_addr, 64, false).unwrap();
+            let b = super::lookup(base_addr + 256, 64, false).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&a, &b));
+            let (h1, m1) = super::tls_cache_stats();
+            assert!(m1 > m0, "first lookup must miss TLS");
+            assert!(h1 > h0, "subrange offset lookup must hit TLS");
+
+            // Epoch bump on register/unregister invalidates TLS cache.
+            super::register(102, base_addr + 0x10_000, 4096);
+            let _ = super::lookup(base_addr + 128, 64, false).unwrap();
+            let (_h2, m2) = super::tls_cache_stats();
+            assert!(m2 > m1, "epoch change must invalidate TLS cache");
+            super::unregister(102, base_addr + 0x10_000);
+            super::unregister(101, base_addr);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("shadow::tests::tls_lookup_cache_hits_and_invalidates_on_epoch")
+            .env(CHILD_ENV, "1")
+            .env("VICTORY_REA_GPU_FASTPATH", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
