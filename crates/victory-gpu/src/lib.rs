@@ -49,6 +49,9 @@ mod primitive;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
+pub mod accounting;
+pub mod authority;
+#[cfg(windows)]
 mod readback;
 #[cfg(windows)]
 mod rebar;

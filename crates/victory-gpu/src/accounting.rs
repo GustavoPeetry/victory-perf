@@ -1,0 +1,382 @@
+//! O(1) incremental memory accounting and cached DXGI budget queries.
+//!
+//! Replaces full-table scans across all ~18k live textures every 5s when
+//! `VICTORY_REA_INCREMENTAL_ACCOUNTING=1` is set. Can optionally cross-check
+//! incremental totals against full enumeration under `VICTORY_REA_ACCOUNTING_AUDIT=1`.
+
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+#[repr(align(64))]
+struct AlignedCounter(AtomicU64);
+
+impl AlignedCounter {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    #[inline]
+    fn load(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn add(&self, n: u64) {
+        if n != 0 {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn sub_saturating(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut cur = self.0.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(n);
+            match self
+                .0
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+/// Texture accounting categories mirrored into [`AccountingSnapshot`].
+pub const KIND_SLOT_COUNT: usize = 8;
+
+struct Metrics {
+    committed_textures_bytes: AlignedCounter,
+    reserved_textures_bytes: AlignedCounter,
+    mapped_tile_bytes: AlignedCounter,
+    tile_pool_allocated_bytes: AlignedCounter,
+    shadow_ram_bytes: AlignedCounter,
+    shadow_vram_bytes: AlignedCounter,
+    upload_ring_bytes: AlignedCounter,
+    reclaimable_bytes: AlignedCounter,
+    committed_texture_count: AlignedCounter,
+    sparse_texture_count: AlignedCounter,
+    dxgi_queries_actual: AlignedCounter,
+    dxgi_queries_cached: AlignedCounter,
+    audit_runs: AlignedCounter,
+    audit_mismatches: AlignedCounter,
+    last_audit_drift_bytes: AlignedCounter,
+}
+
+impl Metrics {
+    const fn new() -> Self {
+        Self {
+            committed_textures_bytes: AlignedCounter::new(),
+            reserved_textures_bytes: AlignedCounter::new(),
+            mapped_tile_bytes: AlignedCounter::new(),
+            tile_pool_allocated_bytes: AlignedCounter::new(),
+            shadow_ram_bytes: AlignedCounter::new(),
+            shadow_vram_bytes: AlignedCounter::new(),
+            upload_ring_bytes: AlignedCounter::new(),
+            reclaimable_bytes: AlignedCounter::new(),
+            committed_texture_count: AlignedCounter::new(),
+            sparse_texture_count: AlignedCounter::new(),
+            dxgi_queries_actual: AlignedCounter::new(),
+            dxgi_queries_cached: AlignedCounter::new(),
+            audit_runs: AlignedCounter::new(),
+            audit_mismatches: AlignedCounter::new(),
+            last_audit_drift_bytes: AlignedCounter::new(),
+        }
+    }
+}
+
+static METRICS: Metrics = Metrics::new();
+
+#[derive(Clone, Copy)]
+struct CachedBudget {
+    captured_at: Instant,
+    values: [u64; 4],
+}
+
+static BUDGET_CACHE: Mutex<Option<CachedBudget>> = Mutex::new(None);
+#[allow(dead_code)] // Wired into host/shadow budget callers in Front C
+const DEFAULT_BUDGET_TTL: Duration = Duration::from_millis(50);
+
+/// Point-in-time O(1) snapshot of tracked host memory pools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountingSnapshot {
+    pub enabled: bool,
+    pub audit_enabled: bool,
+    pub committed_textures_bytes: u64,
+    pub reserved_textures_bytes: u64,
+    pub mapped_tile_bytes: u64,
+    pub tile_pool_allocated_bytes: u64,
+    pub shadow_ram_bytes: u64,
+    pub shadow_vram_bytes: u64,
+    pub upload_ring_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub committed_texture_count: u64,
+    pub sparse_texture_count: u64,
+    pub dxgi_queries_actual: u64,
+    pub dxgi_queries_cached: u64,
+    pub audit_runs: u64,
+    pub audit_mismatches: u64,
+    pub last_audit_drift_bytes: u64,
+}
+
+fn parse_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `VICTORY_REA_INCREMENTAL_ACCOUNTING=1` is enabled.
+pub fn enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let on = parse_flag("VICTORY_REA_INCREMENTAL_ACCOUNTING");
+        if on {
+            tracing::info!("REA-002 incremental memory accounting enabled");
+        }
+        on
+    })
+}
+
+/// Whether `VICTORY_REA_ACCOUNTING_AUDIT=1` verification against full scans is active.
+pub fn audit_enabled() -> bool {
+    static AUDIT: OnceLock<bool> = OnceLock::new();
+    *AUDIT.get_or_init(|| parse_flag("VICTORY_REA_ACCOUNTING_AUDIT"))
+}
+
+/// Track creation of a committed host texture (`committed_bytes > 0`) or
+/// sparse reserved host texture (`reserved_bytes > 0`).
+pub fn on_texture_created(committed_bytes: u64, reserved_bytes: u64, is_sparse: bool) {
+    METRICS.committed_textures_bytes.add(committed_bytes);
+    METRICS.reserved_textures_bytes.add(reserved_bytes);
+    if is_sparse {
+        METRICS.sparse_texture_count.add(1);
+    } else {
+        METRICS.committed_texture_count.add(1);
+    }
+}
+
+/// Track destruction of a host texture.
+pub fn on_texture_destroyed(committed_bytes: u64, reserved_bytes: u64, is_sparse: bool) {
+    METRICS
+        .committed_textures_bytes
+        .sub_saturating(committed_bytes);
+    METRICS
+        .reserved_textures_bytes
+        .sub_saturating(reserved_bytes);
+    if is_sparse {
+        METRICS.sparse_texture_count.sub_saturating(1);
+    } else {
+        METRICS.committed_texture_count.sub_saturating(1);
+    }
+}
+
+/// Adjust mapped sparse tile bytes (`delta > 0` on map, `< 0` on unmap/free).
+pub fn on_sparse_tiles_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.mapped_tile_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS.mapped_tile_bytes.sub_saturating(delta_bytes.unsigned_abs());
+    }
+}
+
+/// Adjust sparse tile pool backing heap bytes in VRAM.
+pub fn on_tile_pool_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.tile_pool_allocated_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS
+            .tile_pool_allocated_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
+    }
+}
+
+/// Adjust CPU RAM and GPU VRAM attributed to shadow copies / card mirrors.
+pub fn on_shadow_delta(ram_delta: i64, vram_delta: i64) {
+    if ram_delta >= 0 {
+        METRICS.shadow_ram_bytes.add(ram_delta as u64);
+    } else {
+        METRICS.shadow_ram_bytes.sub_saturating(ram_delta.unsigned_abs());
+    }
+    if vram_delta >= 0 {
+        METRICS.shadow_vram_bytes.add(vram_delta as u64);
+    } else {
+        METRICS.shadow_vram_bytes.sub_saturating(vram_delta.unsigned_abs());
+    }
+}
+
+/// Update pooled upload ring footprint in host-visible staging memory.
+pub fn on_upload_ring_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.upload_ring_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS.upload_ring_bytes.sub_saturating(delta_bytes.unsigned_abs());
+    }
+}
+
+/// Adjust bytes marked reclaimable under VRAM pressure.
+pub fn on_reclaimable_delta(delta_bytes: i64) {
+    if delta_bytes >= 0 {
+        METRICS.reclaimable_bytes.add(delta_bytes as u64);
+    } else {
+        METRICS
+            .reclaimable_bytes
+            .sub_saturating(delta_bytes.unsigned_abs());
+    }
+}
+
+/// Return cached `[local_usage, local_budget, nonlocal_usage, nonlocal_budget]`
+/// when within TTL, or run `query_fn` and cache its result.
+pub fn cached_video_memory_with<F>(ttl: Duration, query_fn: F) -> Option<[u64; 4]>
+where
+    F: FnOnce() -> Option<[u64; 4]>,
+{
+    if let Ok(guard) = BUDGET_CACHE.lock()
+        && let Some(cached) = *guard
+        && cached.captured_at.elapsed() < ttl
+    {
+        METRICS.dxgi_queries_cached.add(1);
+        return Some(cached.values);
+    }
+
+    let values = query_fn()?;
+    METRICS.dxgi_queries_actual.add(1);
+    if let Ok(mut guard) = BUDGET_CACHE.lock() {
+        *guard = Some(CachedBudget {
+            captured_at: Instant::now(),
+            values,
+        });
+    }
+    Some(values)
+}
+
+/// Query DXGI adapter video memory through [`cached_video_memory_with`] (50 ms TTL)
+/// when incremental accounting is enabled, or query directly otherwise.
+#[allow(dead_code)] // Wired into host/shadow budget callers in Front C
+pub(crate) fn video_memory_budget(host: &crate::host::Host) -> Option<[u64; 4]> {
+    if enabled() {
+        cached_video_memory_with(DEFAULT_BUDGET_TTL, || host.video_memory())
+    } else {
+        host.video_memory()
+    }
+}
+
+/// Force-invalidate the DXGI budget cache (e.g. immediately after large evictions).
+pub fn invalidate_budget_cache() {
+    if let Ok(mut guard) = BUDGET_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+/// Compare incremental live texture totals against an independent full-walk enumeration.
+pub fn record_audit(enumerated_committed_bytes: u64, enumerated_mapped_bytes: u64, tolerance: u64) -> u64 {
+    METRICS.audit_runs.add(1);
+    let expected = enumerated_committed_bytes.saturating_add(enumerated_mapped_bytes);
+    let tracked = METRICS
+        .committed_textures_bytes
+        .load()
+        .saturating_add(METRICS.mapped_tile_bytes.load());
+    let drift = tracked.abs_diff(expected);
+    METRICS.last_audit_drift_bytes.0.store(drift, Ordering::Relaxed);
+    if drift > tolerance {
+        METRICS.audit_mismatches.add(1);
+        tracing::warn!(
+            tracked,
+            expected,
+            drift,
+            "REA-002 accounting audit detected drift"
+        );
+    }
+    drift
+}
+
+/// O(1) read of all incremental accounting counters.
+pub fn snapshot() -> AccountingSnapshot {
+    AccountingSnapshot {
+        enabled: enabled(),
+        audit_enabled: audit_enabled(),
+        committed_textures_bytes: METRICS.committed_textures_bytes.load(),
+        reserved_textures_bytes: METRICS.reserved_textures_bytes.load(),
+        mapped_tile_bytes: METRICS.mapped_tile_bytes.load(),
+        tile_pool_allocated_bytes: METRICS.tile_pool_allocated_bytes.load(),
+        shadow_ram_bytes: METRICS.shadow_ram_bytes.load(),
+        shadow_vram_bytes: METRICS.shadow_vram_bytes.load(),
+        upload_ring_bytes: METRICS.upload_ring_bytes.load(),
+        reclaimable_bytes: METRICS.reclaimable_bytes.load(),
+        committed_texture_count: METRICS.committed_texture_count.load(),
+        sparse_texture_count: METRICS.sparse_texture_count.load(),
+        dxgi_queries_actual: METRICS.dxgi_queries_actual.load(),
+        dxgi_queries_cached: METRICS.dxgi_queries_cached.load(),
+        audit_runs: METRICS.audit_runs.load(),
+        audit_mismatches: METRICS.audit_mismatches.load(),
+        last_audit_drift_bytes: METRICS.last_audit_drift_bytes.load(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_deltas_saturate_and_audit_matches() {
+        let base = snapshot();
+
+        on_texture_created(4096, 65536, true);
+        on_sparse_tiles_delta(65536);
+        on_tile_pool_delta(131072);
+        on_shadow_delta(1024, 2048);
+
+        let mid = snapshot();
+        assert_eq!(mid.committed_textures_bytes, base.committed_textures_bytes + 4096);
+        assert_eq!(mid.reserved_textures_bytes, base.reserved_textures_bytes + 65536);
+        assert_eq!(mid.mapped_tile_bytes, base.mapped_tile_bytes + 65536);
+        assert_eq!(mid.tile_pool_allocated_bytes, base.tile_pool_allocated_bytes + 131072);
+        assert_eq!(mid.shadow_ram_bytes, base.shadow_ram_bytes + 1024);
+        assert_eq!(mid.shadow_vram_bytes, base.shadow_vram_bytes + 2048);
+
+        let drift = record_audit(mid.committed_textures_bytes, mid.mapped_tile_bytes, 0);
+        assert_eq!(drift, 0);
+
+        on_shadow_delta(-1024, -2048);
+        on_tile_pool_delta(-131072);
+        on_sparse_tiles_delta(-65536);
+        on_texture_destroyed(4096, 65536, true);
+
+        let end = snapshot();
+        assert_eq!(end.committed_textures_bytes, base.committed_textures_bytes);
+        assert_eq!(end.reserved_textures_bytes, base.reserved_textures_bytes);
+        assert_eq!(end.mapped_tile_bytes, base.mapped_tile_bytes);
+        assert_eq!(end.shadow_ram_bytes, base.shadow_ram_bytes);
+        assert_eq!(end.shadow_vram_bytes, base.shadow_vram_bytes);
+    }
+
+    #[test]
+    fn budget_cache_deduplicates_queries_within_ttl() {
+        invalidate_budget_cache();
+        let before = snapshot();
+        let mut calls = 0usize;
+        let first = cached_video_memory_with(Duration::from_secs(10), || {
+            calls += 1;
+            Some([100, 200, 300, 400])
+        });
+        let second = cached_video_memory_with(Duration::from_secs(10), || {
+            calls += 1;
+            Some([999, 999, 999, 999])
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(first, Some([100, 200, 300, 400]));
+        assert_eq!(second, Some([100, 200, 300, 400]));
+        let after = snapshot();
+        assert_eq!(after.dxgi_queries_actual, before.dxgi_queries_actual + 1);
+        assert_eq!(after.dxgi_queries_cached, before.dxgi_queries_cached + 1);
+        invalidate_budget_cache();
+    }
+}
