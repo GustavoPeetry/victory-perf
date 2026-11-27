@@ -1,0 +1,96 @@
+name: Hardware & Regression Report
+description: Report a crash, device removal, visual bug, or performance regression with reproducible hardware, cache, and switch details.
+title: "[Report]: "
+labels: ["triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Asset policy (`docs/asset-policy.md`):** Keep reports strictly text-only.
+        Do **not** attach screenshots, frame captures, shader dumps, memory dumps,
+        title executables, or commercial game title names.
+        See [docs/diagnostics-and-benchmarking.md](https://github.com/vitutu1/victory-perf/blob/main/docs/diagnostics-and-benchmarking.md)
+        for how to collect release or `--profile diag --features diagnostics` logs.
+
+  - type: input
+    id: commit_sha
+    attributes:
+      label: Commit SHA (and base/known-good SHA if regression)
+      description: Output of `git rev-parse HEAD` (plus the last known-good commit if bisecting).
+      placeholder: "e.g. 52a60947 (regression vs. ffed22d)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware & OS Environment
+      description: Include CPU, GPU model + VRAM, system RAM + pagefile size, GPU driver version, ReBAR status, and Windows version.
+      placeholder: |
+        CPU: ...
+        GPU: ... (VRAM: ... GB, ReBAR: enabled/disabled)
+        Driver: ...
+        RAM / Pagefile: ... GB / ... GB
+        OS: Windows 11 ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build_profile
+    attributes:
+      label: Build Profile
+      options:
+        - "--release (target/release/victory.exe)"
+        - "--profile diag --features diagnostics (target/diag/victory.exe)"
+        - "Debug build"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cache_state
+    attributes:
+      label: Shader & Pipeline Cache State
+      options:
+        - "Cold (empty shaders & pipelines caches)"
+        - "DXIL-warm (ran `victory precompile`)"
+        - "DXIL + compute PSO-warm (ran `victory precompile --pipelines`)"
+        - "PSO-warm (2nd+ live run with `host pipeline library loaded`)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: launch_command
+    attributes:
+      label: Exact Console Profile & `VICTORY_*` Environment Switches
+      description: List every `VICTORY_*` override set (or state "all defaults").
+      placeholder: |
+        Command: victory.exe run --console series-s --execute <path-to-exe>
+        Switches: VICTORY_AMBIENT_STUB=1, VICTORY_SHADOWMASK_STUB=1, ...
+    validations:
+      required: true
+
+  - type: input
+    id: checkpoint_and_stability
+    attributes:
+      label: Scene / Checkpoint & Session Stability Duration
+      description: Generic scene name (no title names), approximate duration before stop/crash, and minimum available RAM if logged.
+      placeholder: "e.g. Opening corridor (~10k draws), exited after 12 min (device removed)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed vs. Expected Behavior
+      description: Describe FPS/ms breakdown (`preparing / GPU / copy-back / GPU busy %`), dropped draws, visual defects, or crash symptoms.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Text-Only Log Excerpts (`stderr` / `crashes.log`)
+      description: Paste relevant lines (e.g. `host wave lanes`, `host pipeline library loaded`, `shaders from the cache and translated so far`, 5 s frame lines, DRED output, or `crashes.log` stack trace). Do not upload proprietary assets or screenshots.
+      render: text
+    validations:
+      required: false
